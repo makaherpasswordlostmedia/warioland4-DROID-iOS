@@ -1097,20 +1097,6 @@ void LoadSoundRoomTrackGraphics(s32 index)
     }
 }
 
-#ifndef NONMATCHING
-ASM_INCLUDE("asm/disasm_sound_room_func_8087DB0.s");
-#else
-/* Best current WIP C for DrawSoundRoomSprites (asm still named func_8087DB0,
- * real symbol is DrawSoundRoomSprites): 20 / 94300 (99.98%), EXACT size
- * match 0x804. Verified against real project context via
- * decomp_work/DrawSoundRoomSprites/score_any.sh src/sound_room.c
- * DrawSoundRoomSprites asm/disasm_sound_room_func_8087DB0.s us.
- * Full history/notes: decomp_work/DrawSoundRoomSprites/README.md */
-
-/* Best current WIP C for DrawSoundRoomSprites (asm still named func_8087DB0,
- * real symbol is DrawSoundRoomSprites): 16885 / 94300 (82.09%), size 0x7bc
- * vs target 0x804 (72 bytes short). Verified against real project context.
- * Full history/notes: decomp_work/DrawSoundRoomSprites/README.md */
 
 void DrawSoundRoomSprites(void)
 {
@@ -1247,7 +1233,16 @@ void DrawSoundRoomSprites(void)
           }
         }
         *rawDst = (attr2 = *(frameData++));
-        ((u8 *) dst)[5] &= attr2Mask;
+        {
+          u8 old5 = ((u8 *) dst)[5];
+          s32 merged5;
+          asm volatile(
+              "mov %0, %2\n"
+              "and %0, %1"
+              : "=&r"(merged5)
+              : "r"(old5), "r"(attr2Mask));
+          ((u8 *) dst)[5] = merged5;
+        }
         rawDst += 2;
         dst++;
         slot--;
@@ -2021,17 +2016,26 @@ void DrawSoundRoomSprites(void)
   { s32 v; register s16 *p asm("r1"); v = FixedMul(sine, (s16) inverse); p = pcOut; asm volatile("" : "+r"(p)); *p = v; }
   { register s16 *wavePtr asm("r2"); register u32 phase asm("r0"); register const u8 *sinBase asm("r3"); wavePtr=&gSoundRoomTileWaveOffset; phase=(u16)*wavePtr; phase += 64; phase <<= 1; sinBase=(const u8 *)sSinCosTable; phase += (u32)sinBase; { register u32 hold asm("r3"); asm volatile("" : "=r"(hold)); sine=*(const s16 *)phase; asm volatile("" : : "r"(hold)); } }
   inverse = FixedInverse(384);
-  { u16 pdValue; register u32 h3 asm("r3"); pdValue = FixedMul(sine, (s16) inverse); asm volatile("" : "=r"(h3)); *pdOut = pdValue; asm volatile("" : : "r"(h3)); }
-  gOamBuffer[0].all.affineParam = stack.pa;
-  gOamBuffer[1].all.affineParam = *pbOut;
-  gOamBuffer[2].all.affineParam = *pcOut;
-  gOamBuffer[3].all.affineParam = *pdOut;
+  {
+    u16 pdValue;
+    register u32 h3 asm("r3");
+    register u16 *p asm("r2");
+    pdValue = FixedMul(sine, (s16) inverse);
+    asm volatile("" : "=r"(h3));
+    p = pdOut;
+    asm volatile("" : "+r"(p));
+    *p = pdValue;
+    asm volatile("" : : "r"(h3));
+    gOamBuffer[0].all.affineParam = stack.pa;
+    gOamBuffer[1].all.affineParam = *pbOut;
+    gOamBuffer[2].all.affineParam = *pcOut;
+    gOamBuffer[3].all.affineParam = pdValue;
+  }
   gOamSlotsUsed = used;
   finish:
   return;
 
 }
-#endif
 
 
 void LoadRandomSoundRoomPreview(void)

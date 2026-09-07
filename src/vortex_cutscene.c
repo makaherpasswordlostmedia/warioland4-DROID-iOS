@@ -622,7 +622,7 @@ void ApplyVortexCutsceneAffineRegisters(void)
 #ifndef NONMATCHING
 ASM_INCLUDE("asm/disasm_vortex_cutscene_RenderVortexCutsceneOam.s");
 #else
-/* Best current WIP C for RenderVortexCutsceneOam: 4630 / 106800 (95.66%),
+/* Best current WIP C for RenderVortexCutsceneOam: 4620 / 106800 (95.67%),
  * exact size 0x8e0. Independently compiled and scored in real context; hard
  * register lifetimes were audited before promotion. See decomp_work/updates. */
 void RenderVortexCutsceneOam(void)
@@ -770,9 +770,9 @@ void RenderVortexCutsceneOam(void)
     affine2Ptr = &localStorage.a[2];
     affine3Ptr = &localStorage.a[3];
     mask1FF = 0x1FF;
+    maskF3 = -13;
     do
     {
-      maskF3 = -13;
       if (drawn < next)
       {
         do
@@ -907,7 +907,11 @@ void RenderVortexCutsceneOam(void)
         *affine2Ptr = FixedMul((s16) neg0, (unsigned long) ((s16) FixedInverse((s16) ((struct StageResultsTreasure *) pairPointer)->scale)));
         asm volatile("" : "+r"(pairPointer));
         affine3Value = FixedMul(cos40, (s16) FixedInverse((s16) ((struct StageResultsTreasure *) pairPointer)->scale));
-        *affine3Ptr = affine3Value;
+        {
+          register u16 *treasureAffine3Out asm("r4") = affine3Ptr;
+          asm volatile("" : : "r"(treasureAffine3Out));
+          *treasureAffine3Out = affine3Value;
+        }
         gOamBuffer[0].all.affineParam = localStorage.a[0];
         gOamBuffer[1].all.affineParam = *affine1Ptr;
         gOamBuffer[2].all.affineParam = *affine2Ptr;

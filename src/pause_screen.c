@@ -673,7 +673,7 @@ u32 ClosePauseScreenWindow(void)
 #ifndef NONMATCHING
 ASM_INCLUDE("asm/disasm_pause_screen_RenderPauseScreenOam.s");
 #else
-/* Best current WIP C for RenderPauseScreenOam: 285 / 100500 (99.72%), EXACT
+/* Best current WIP C for RenderPauseScreenOam: 275 / 100500 (99.73%), EXACT
  * size match 0x840. Verified against real project context (stock compiler,
  * not any patched diagnostic build) via
  * decomp_work/DrawSoundRoomSprites/score_any.sh src/pause_screen.c
@@ -1014,59 +1014,62 @@ void RenderPauseScreenOam(void)
         currentSlot = nextSlot;
       }
     }
-    if ((gPauseAllJewelPiecesCollected == 0) && (gPauseJewelPieceStates[i] != 0))
     {
-      new_var4 = sUnk_86D36DC;
-      new_var2 = ((u8 *) new_var4) + (tableOffset + ((gPauseJewelPieceStates[i] - 1) * 16));
-      animation = *((const struct AnimationFrame **) new_var2);
-      src = animation->oam;
-      nextSlot += *(src++);
-      if (nextSlot > new_var)
+      register u8 allCollectedCheck asm("r1") = gPauseAllJewelPiecesCollected;
+      if ((allCollectedCheck == 0) && (gPauseJewelPieceStates[i] != 0))
       {
-        return;
-      }
-      if (currentSlot < nextSlot)
-      {
-        register const s32 *jewel2XTable asm("r9") = sUnk_86D36CC;
-        register s32 jewel2PreserveMask asm("r10") = -0x200;
-        register s32 jewel2PriorityMask asm("r8") = -13;
-        register u8 *jewel2State asm("r4") = &gUnk_3003C4A;
-        register OamData *oam asm("r5");
-        register u32 jewel2Offset asm("r0");
-        jewel2Offset = currentSlot << 3;
-        oam = (OamData *) (((u8 *) gOamBuffer) + jewel2Offset);
-        currentSlot = nextSlot - currentSlot;
-        do
+        new_var4 = sUnk_86D36DC;
+        new_var2 = ((u8 *) new_var4) + (tableOffset + ((gPauseJewelPieceStates[i] - 1) * 16));
+        animation = *((const struct AnimationFrame **) new_var2);
+        src = animation->oam;
+        nextSlot += *(src++);
+        if (nextSlot > new_var)
         {
-          attr = *(src++);
-          *(dest++) = attr;
-          oam->split.y = (attr + 88) & 0xFF;
-          attr = *(src++);
-          *(dest++) = attr;
-          {
-            register s32 jewelNewX asm("r1");
-            register u16 jewelOldAttr1 asm("r2");
-            register s32 jewelAttr1 asm("r0");
-            jewelNewX = (attr + jewel2XTable[*jewel2State]) & 0x1FF;
-            jewelOldAttr1 = oam->all.attr1;
-            jewelAttr1 = jewel2PreserveMask;
-            jewelAttr1 &= jewelOldAttr1;
-            jewelAttr1 |= jewelNewX;
-            oam->all.attr1 = jewelAttr1;
-          }
-          *(dest++) = *(src++);
-          {
-            register u8 jewel2PriorityByte asm("r1") = ((u8 *) oam)[5];
-            register unsigned short jewel2PriorityOut asm("r0") = jewel2PriorityMask;
-            jewel2PriorityOut &= jewel2PriorityByte;
-            ((u8 *) oam)[5] = jewel2PriorityOut;
-          }
-          dest++;
-          oam++;
-          currentSlot--;
+          return;
         }
-        while (currentSlot != 0);
-        currentSlot = nextSlot;
+        if (currentSlot < nextSlot)
+        {
+          register const s32 *jewel2XTable asm("r9") = sUnk_86D36CC;
+          register s32 jewel2PreserveMask asm("r10") = -0x200;
+          register s32 jewel2PriorityMask asm("r8") = -13;
+          register u8 *jewel2State asm("r4") = &gUnk_3003C4A;
+          register OamData *oam asm("r5");
+          register u32 jewel2Offset asm("r0");
+          jewel2Offset = currentSlot << 3;
+          oam = (OamData *) (((u8 *) gOamBuffer) + jewel2Offset);
+          currentSlot = nextSlot - currentSlot;
+          do
+          {
+            attr = *(src++);
+            *(dest++) = attr;
+            oam->split.y = (attr + 88) & 0xFF;
+            attr = *(src++);
+            *(dest++) = attr;
+            {
+              register s32 jewelNewX asm("r1");
+              register u16 jewelOldAttr1 asm("r2");
+              register s32 jewelAttr1 asm("r0");
+              jewelNewX = (attr + jewel2XTable[*jewel2State]) & 0x1FF;
+              jewelOldAttr1 = oam->all.attr1;
+              jewelAttr1 = jewel2PreserveMask;
+              jewelAttr1 &= jewelOldAttr1;
+              jewelAttr1 |= jewelNewX;
+              oam->all.attr1 = jewelAttr1;
+            }
+            *(dest++) = *(src++);
+            {
+              register u8 jewel2PriorityByte asm("r1") = ((u8 *) oam)[5];
+              register unsigned short jewel2PriorityOut asm("r0") = jewel2PriorityMask;
+              jewel2PriorityOut &= jewel2PriorityByte;
+              ((u8 *) oam)[5] = jewel2PriorityOut;
+            }
+            dest++;
+            oam++;
+            currentSlot--;
+          }
+          while (currentSlot != 0);
+          currentSlot = nextSlot;
+        }
       }
     }
       {
@@ -1084,51 +1087,54 @@ void RenderPauseScreenOam(void)
     }
   }
 
-  if (gPauseAllJewelPiecesCollected != 0)
   {
-    src = sUnk_86D3DB0[0].oam;
-    nextSlot += *(src++);
-    if (currentSlot < nextSlot)
+    register u8 *allCollectedPtr asm("r5") = &gPauseAllJewelPiecesCollected;
+    if (*allCollectedPtr != 0)
     {
-      OamData *oam;
-      register OamData *cdOamBase asm("r1") = gOamBuffer;
-      register const s32 *allXTable asm("r10");
-      register const s32 *allXTableLoad asm("r0") = sUnk_86D36CC;
-      register s32 allPriorityMask asm("r9") = -13;
-      register u8 *allState asm("r8") = &gUnk_3003C4A;
-      register s32 allXMask asm("r5");
-      asm("" : "+r"(allXTableLoad));
-      allXTable = allXTableLoad;
-      oam = (OamData *) ((currentSlot << 3) + (u32) cdOamBase);
-      allXMask = 0x1FF;
-      currentSlot = nextSlot - currentSlot;
-      do
+      src = sUnk_86D3DB0[0].oam;
+      nextSlot += *(src++);
+      if (currentSlot < nextSlot)
       {
-        attr = *(src++);
-        *(dest++) = attr;
-        oam->split.y = (attr + 88) & 0xFF;
-        attr = *(src++);
-        *(dest++) = attr;
+        OamData *oam;
+        register OamData *cdOamBase asm("r1") = gOamBuffer;
+        register const s32 *allXTable asm("r10");
+        register const s32 *allXTableLoad asm("r0") = sUnk_86D36CC;
+        register s32 allPriorityMask asm("r9") = -13;
+        register u8 *allState asm("r8") = &gUnk_3003C4A;
+        register s32 allXMask asm("r5");
+        asm("" : "+r"(allXTableLoad));
+        allXTable = allXTableLoad;
+        oam = (OamData *) ((currentSlot << 3) + (u32) cdOamBase);
+        allXMask = 0x1FF;
+        currentSlot = nextSlot - currentSlot;
+        do
         {
-          register u8 *allStateRead asm("r1") = allState;
-          register s32 allNewX asm("r1");
-          register u16 allOldAttr1 asm("r2");
-          register s32 allAttr1 asm("r0");
-          allNewX = (attr + allXTable[*allStateRead]) & allXMask;
-          allOldAttr1 = oam->all.attr1;
-          allAttr1 = -0x200;
-          allAttr1 &= allOldAttr1;
-          allAttr1 |= allNewX;
-          oam->all.attr1 = allAttr1;
+          attr = *(src++);
+          *(dest++) = attr;
+          oam->split.y = (attr + 88) & 0xFF;
+          attr = *(src++);
+          *(dest++) = attr;
+          {
+            register u8 *allStateRead asm("r1") = allState;
+            register s32 allNewX asm("r1");
+            register u16 allOldAttr1 asm("r2");
+            register s32 allAttr1 asm("r0");
+            allNewX = (attr + allXTable[*allStateRead]) & allXMask;
+            allOldAttr1 = oam->all.attr1;
+            allAttr1 = -0x200;
+            allAttr1 &= allOldAttr1;
+            allAttr1 |= allNewX;
+            oam->all.attr1 = allAttr1;
+          }
+          *(dest++) = *(src++);
+          ((u8 *) oam)[5] &= allPriorityMask;
+          dest++;
+          oam++;
+          currentSlot--;
         }
-        *(dest++) = *(src++);
-        ((u8 *) oam)[5] &= allPriorityMask;
-        dest++;
-        oam++;
-        currentSlot--;
+        while (currentSlot != 0);
+        currentSlot = nextSlot;
       }
-      while (currentSlot != 0);
-      currentSlot = nextSlot;
     }
   }
   if ((gCollectedKeyzer == 1) || gCurrentCollection[gCurrentPassage][gCurrentStageNumber].keyzer)
