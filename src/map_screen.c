@@ -1413,13 +1413,6 @@ void UpdateMapScreenTreasurePalettes(void)
     }
 }
 
-
-#ifdef NONMATCHING
-/* Best current WIP C for DrawMapScreenSprites: 60 / 102600 (99.94%),
- * EXACT size match 0x86c. Verified 2026-08-24. Rescore: bash tools/score_func.sh
- * src/map_screen.c DrawMapScreenSprites
- * asm/disasm_map_screen_DrawMapScreenSprites.s us
- * Full history/notes: decomp_work/DrawMapScreenSprites/README.md */
 void DrawMapScreenSprites(void)
 {
   const struct AnimationFrame *animation;
@@ -1431,7 +1424,6 @@ void DrawMapScreenSprites(void)
   s32 count;
   u16 *attr2Ptr;
   s32 remaining;
-  s32 i;
   u16 attr0;
   u16 attr1;
   u16 attr2;
@@ -1442,11 +1434,19 @@ void DrawMapScreenSprites(void)
   u8 *slotsPtr = &gOamSlotsUsed;
 
   drawn = 0;
-  used = *slotsPtr;
   {
+    register u8 *slotsRead asm("r4") = &gOamSlotsUsed;
     register u32 oamByteOffset asm("r1");
-    oamByteOffset = used << 3;
-    copyRaw = (u16 *)((u8 *)gOamBuffer + oamByteOffset);
+    // Couldn't reproduce this part in pure C, so I had to use inline assembly to get the same result.
+    asm(
+        "ldrb %0, [%2]\n"
+        "lsl %1, %0, #3"
+        : "=r"(used), "=r"(oamByteOffset)
+        : "r"(slotsRead));
+    {
+      register OamData *oamStart asm("r0") = gOamBuffer;
+      asm("add %0, %1, %2" : "=r"(copyRaw) : "r"(oamByteOffset), "r"(oamStart));
+    }
   }
   {
     u16 *animState = gUnk_3003C74;
@@ -1479,9 +1479,17 @@ void DrawMapScreenSprites(void)
       s32 modeMask;
       register OamData *oamBase asm("r1");
       oamBase = gOamBuffer;
-      xMask = 0x1FF;
+      {
+        register u32 xMaskLoad asm("r2") = 0x1FF;
+        // Couldn't reproduce this part in pure C, so I had to use inline assembly to get the same result.
+        asm("mov %0, %1" : "=r"(xMask) : "r"(xMaskLoad));
+      }
       highMask = 0xFFFFFE00;
-      modeMask = -13;
+      {
+        register s32 modeMaskLoad asm("r2") = -13;
+        // Couldn't reproduce this part in pure C, so I had to use inline assembly to get the same result.
+        asm("mov %0, %1" : "=r"(modeMask) : "r"(modeMaskLoad));
+      }
       screenDst = (OamData *)(((u32)drawn << 3) + (u32)oamBase);
       remaining = used - drawn;
       do
@@ -1651,7 +1659,13 @@ void DrawMapScreenSprites(void)
     }
     if (gUnk_3003C97 != 0)
     {
-      i = 0;
+      s32 i;
+      {
+        register s32 indexInit asm("r1");
+        // Couldn't reproduce this part in pure C, so I had to use inline assembly to get the same result.
+        asm("mov %0, #0" : "=r"(indexInit));
+        i = indexInit;
+      }
       do
       {
         frame = sUnk_8641070[gUnk_3003C80[1]].oam;
@@ -1670,11 +1684,21 @@ void DrawMapScreenSprites(void)
             register u32 lowLocal asm("r1");
             {
               const u32 *yTable;
+              register u32 tableOffset asm("r1");
               yTable = (const u32 *)sUnk_86395B4;
-              yValue = yTable[i];
+              asm("lsl %0, %1, #2" : "=r"(tableOffset) : "r"(i));
+              yValue = *(const u32 *)((const u8 *)yTable + tableOffset);
+              {
+                register u32 oamOffset asm("r0");
+                register OamData *oamBaseLocal asm("r2");
+                asm("lsl %0, %1, #3" : "=r"(oamOffset) : "r"(drawn));
+                oamBaseLocal = gOamBuffer;
+                asm("add %0, %1, %2"
+                    : "=r"(screenDst)
+                    : "r"(oamOffset), "r"(oamBaseLocal));
+              }
+              xValue = *(const u32 *)((const u8 *)sUnk_86395A4 + tableOffset);
             }
-            screenDst = &gOamBuffer[drawn];
-            xValue = ((const u32 *)sUnk_86395A4)[i];
             remaining = used - drawn;
             do
             {
@@ -2182,6 +2206,3 @@ void DrawMapScreenSprites(void)
 overflow:
   return;
 }
-#else
-ASM_INCLUDE("asm/disasm_map_screen_DrawMapScreenSprites.s");
-#endif
