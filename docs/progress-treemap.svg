@@ -13,8 +13,8 @@
 </defs>
 <rect width="100%" height="100%" fill="#0d1117"/>
 <text x="24" y="42" class="title">Wario Land 4 Decompilation Progress</text>
-<text x="24" y="68" class="mono">Functions  ██████████████████████████████  99.9%   3,990 / 3,995</text>
-<text x="24" y="88" class="mono">Code size  ██████████████████████████████  98.4%   593,186 / 603,118 bytes</text>
+<text x="24" y="68" class="mono">Functions  ██████████████████████████████  99.9%   3,991 / 3,995</text>
+<text x="24" y="88" class="mono">Code size  ██████████████████████████████  98.7%   595,298 / 603,118 bytes</text>
 <text x="1256" y="68" text-anchor="end" class="sub">green = matched C</text>
 <text x="1256" y="88" text-anchor="end" class="sub">byte sizes: mixed/estimated (3,987 / 3,995 exact)</text>
 <rect x="6.00" y="112.00" width="1268.00" height="742.00" fill="#05080d" stroke="#000000" stroke-width="1"/>
@@ -2232,13 +2232,13 @@
 <rect x="690.89" y="762.13" width="2.93" height="5.56" fill="url(#matchedGrad)" stroke="#2c7a41" stroke-opacity="0.72" stroke-width="0.45"><title>minigame/SetMinigameVBlankCallback: 16 bytes, matched, size=symbol</title></rect>
 </g>
 <g>
-<title>pause_screen: 25.0% matched, 4,744 bytes</title>
+<title>pause_screen: 69.5% matched, 4,744 bytes</title>
 <rect x="607.41" y="769.04" width="87.16" height="83.36" fill="#10151c" stroke="#000000" stroke-width="1"/>
 <clipPath id="moduleLabelClip33"><rect x="609.41" y="770.04" width="83.76" height="15.11"/></clipPath>
 <rect x="608.41" y="770.04" width="85.76" height="15.11" fill="#05080d"/>
 <text x="609.91" y="782.15" clip-path="url(#moduleLabelClip33)" fill="#e2e8f0" font-family="Inter, Segoe UI, sans-serif" font-size="11" font-weight="800">pause_scre…</text>
-<text x="692.17" y="782.04" text-anchor="end" clip-path="url(#moduleLabelClip33)" fill="#94a3b8" font-family="Inter, Segoe UI, sans-serif" font-size="10" font-weight="700">25%</text>
-<rect x="608.41" y="785.15" width="37.83" height="66.50" fill="url(#unmatchedGrad)" stroke="#393b3f" stroke-opacity="0.72" stroke-width="0.45"><title>pause_screen/RenderPauseScreenOam: 2,112 bytes, not matched, size=symbol</title></rect>
+<text x="692.17" y="782.04" text-anchor="end" clip-path="url(#moduleLabelClip33)" fill="#94a3b8" font-family="Inter, Segoe UI, sans-serif" font-size="10" font-weight="700">69%</text>
+<rect x="608.41" y="785.15" width="37.83" height="66.50" fill="url(#matchedGrad)" stroke="#2c7a41" stroke-opacity="0.72" stroke-width="0.45"><title>pause_screen/RenderPauseScreenOam: 2,112 bytes, matched, size=symbol</title></rect>
 <rect x="646.59" y="785.15" width="47.23" height="36.43" fill="url(#unmatchedGrad)" stroke="#393b3f" stroke-opacity="0.72" stroke-width="0.45"><title>pause_screen/InitializePauseScreen: 1,448 bytes, not matched, size=symbol</title></rect>
 <rect x="646.59" y="821.93" width="17.33" height="29.72" fill="url(#matchedGrad)" stroke="#2c7a41" stroke-opacity="0.72" stroke-width="0.45"><title>pause_screen/PauseScreenSubroutine: 440 bytes, matched, size=symbol</title></rect>
 <rect x="664.27" y="821.93" width="18.51" height="20.67" fill="url(#matchedGrad)" stroke="#2c7a41" stroke-opacity="0.72" stroke-width="0.45"><title>pause_screen/UpdatePauseScreenSelection: 328 bytes, matched, size=symbol</title></rect>
