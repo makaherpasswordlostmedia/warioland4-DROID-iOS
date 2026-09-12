@@ -169,17 +169,6 @@ void PauseScreenVBlank(void)
     }
 }
 
-#ifndef NONMATCHING
-ASM_INCLUDE("asm/disasm_pause_screen_InitializePauseScreen.s");
-#else
-/* Best current WIP C for InitializePauseScreen: 970 / 63700 (98.48%),
- * EXACT size match 0x5a8. Verified against real project context via
- * decomp_work/DrawSoundRoomSprites/score_any.sh src/pause_screen.c
- * InitializePauseScreen asm/disasm_pause_screen_InitializePauseScreen.s us
- * (NOT tools/score_func.sh -- confirmed unreliable for this
- * multi-function file). Full history/notes:
- * decomp_work/InitializePauseScreen/README.md */
-
 #define PAUSE_DMA_TRANSFER(src_, dst_, cnt_) do { \
     ((struct DmaRegisters *)0x040000D4)->src = (u32)(src_); \
     ((struct DmaRegisters *)0x040000D4)->dst = (u32)(dst_); \
@@ -433,7 +422,10 @@ void InitializePauseScreen(void)
         {
             s32 jewelBase;
             register s32 jewelIt asm("r1");
+            register s32 jewelZero asm("r2");
             jewelBase = (s32)jewelStates;
+            jewelZero = 0;
+            asm("" : : "r"(jewelZero));
             jewelIt = jewelBase + 3;
             do {
                 *(u8 *)jewelIt = 0;
@@ -463,19 +455,33 @@ void InitializePauseScreen(void)
         else if (gCurrentCollection[*passagePtr][*stagePtr].jewelPieceNW)
             jewelStates[3] = 2; }
 
-        gStageEntrySequenceTimer = 0;
+        {
+            register u16 zero asm("r0");
+            register u16 *sequenceTimer asm("r1");
+
+            zero = 0;
+            sequenceTimer = &gStageEntrySequenceTimer;
+            asm("strh r0, [r1]" : : "r"(zero), "r"(sequenceTimer) : "memory");
+        }
         { register u8 *seqStepPtr asm("r2"); seqStepPtr = &gStageEntrySequenceStep; *seqStepPtr = 0; }
 
-        for (i = 0; i < 4; i++) {
-            gPauseJewelAnimationStates[i].animationTimer = 0;
-            gPauseJewelAnimationStates[i].animationFrame = 0;
-        }
-        cdPtr->animationTimer = 0;
-        cdPtr->animationFrame = 0;
-        keyPtr->animationTimer = 0;
-        keyPtr->animationFrame = 0;
+        {
+            register u16 jewelReset asm("r2");
 
-        UploadFiveDigitNumberTiles(gHighScoreTable[*passagePtr][*stagePtr], sUnk_86D6E78, 0x2A80);
+            jewelReset = 0;
+            for (i = 0; i < 4; i++) {
+                gPauseJewelAnimationStates[i].animationTimer = jewelReset;
+                gPauseJewelAnimationStates[i].animationFrame = jewelReset;
+            }
+            cdPtr->animationTimer = 0;
+            cdPtr->animationFrame = 0;
+            keyPtr->animationTimer = 0;
+            keyPtr->animationFrame = 0;
+            asm("" : : "r"(jewelReset));
+        }
+
+        UploadFiveDigitNumberTiles(gHighScoreTable[*passagePtr][*stagePtr],
+                                   sUnk_86D6E78, 0x2A80);
         {
             register struct DmaRegisters *waitDma asm("r2");
             register u32 waitMask asm("r1");
@@ -511,14 +517,10 @@ void InitializePauseScreen(void)
     MPlayStop(gMPlayTable[6].info);
 
     *(vu16 *)0x04000200 |= 1;
-
-
-
 }
 
 #undef PAUSE_DMA_TRANSFER_DMA
 #undef PAUSE_DMA_TRANSFER
-#endif
 
 u32 UpdatePauseScreenSelection(void)
 {

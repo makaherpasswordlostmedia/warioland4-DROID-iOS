@@ -622,7 +622,7 @@ void ApplyVortexCutsceneAffineRegisters(void)
 #ifndef NONMATCHING
 ASM_INCLUDE("asm/disasm_vortex_cutscene_RenderVortexCutsceneOam.s");
 #else
-/* Best current WIP C for RenderVortexCutsceneOam: 4620 / 106800 (95.67%),
+/* Best current WIP C for RenderVortexCutsceneOam: 4610 / 106800 (95.68%),
  * exact size 0x8e0. Independently compiled and scored in real context; hard
  * register lifetimes were audited before promotion. See decomp_work/updates. */
 void RenderVortexCutsceneOam(void)
@@ -1187,7 +1187,6 @@ void RenderVortexCutsceneOam(void)
           s32 highMask1FF = 0x1FF;
           s32 highFullMask = 0xFFFFFE00;
           register s32 highMask13 asm("r4") = -13;
-          asm volatile("" : "+r"(highFullMask), "+r"(highMask1FF), "+r"(highMask13));
           {
             register s32 drawIndex asm("r2") = drawn;
             oam = &highBase[drawIndex];
@@ -1210,7 +1209,6 @@ void RenderVortexCutsceneOam(void)
               value = value + 120;
               new_var7 = 5;
               value &= highMask1FF;
-              asm volatile("" : "+r"(value));
               {
                 s32 oldAttr = oam->all.attr1;
                 oam->all.attr1 = (oldAttr & highFullMask) | value;
@@ -1285,6 +1283,10 @@ void RenderVortexCutsceneOam(void)
     }
 
   }
-  gOamSlotsUsed = next;
+  asm("mov r4, %0\n\t"
+      "strb r4, [%1]"
+      :
+      : "r"(next), "r"(&gOamSlotsUsed)
+      : "r4", "memory");
 }
 #endif
