@@ -410,13 +410,10 @@ void SpawnPassageClearParticles(void)
 #ifndef NONMATCHING
 ASM_INCLUDE("asm/disasm_passage_clear_RenderPassageClearOam.s");
 #else
-/* Semantically audited WIP C for RenderPassageClearOam: 32979 / 99200
- * (66.76%), size 0x7dc. This clean baseline replaces invalid permuter output
- * with direct, warning-free GBA-era C before further instruction matching.
- * Rescore: bash decomp_work/DrawSoundRoomSprites/score_any.sh
- * src/passage_clear.c RenderPassageClearOam
- * asm/disasm_passage_clear_RenderPassageClearOam.s us
- * Full history/notes: decomp_work/RenderPassageClearOam/README.md */
+/* Semantically audited WIP C for RenderPassageClearOam: 21475 / 99200
+ * (78.35%), EXACT size 0x814. Rescore:
+ * bash decomp_work_v2/tools/score_all.sh Passage
+ * Full history/notes: decomp_work_v2/NOTES.md */
 void RenderPassageClearOam(void)
 {
   register s32 slot asm("r9");
@@ -426,14 +423,18 @@ void RenderPassageClearOam(void)
   register OamData *oam asm("r5");
   s32 i;
   register struct PassageClearAnimationState *secondaryAnim;
-  register struct PassageClearParticle *particle;
-  s16 affineA;
-  s16 affineB;
-  s16 affineC;
-  s16 affineD;
+  s16 affine[4];
   s32 angle;
   s32 sine;
   s32 inverse;
+  s32 attr2High;
+  u16 savedAttr1;
+  int unitScale;
+  int attr1Bits;
+  u8 attr3Mask;
+  u8 matrixBits;
+  int attr1Mask;
+  attr1Mask = 0xFE00;
   slot = 0;
   total = gOamSlotsUsed;
   { register u32 initOff asm("r0"); initOff = ((u32) total) << 3; rawDst = (u16 *) ((u32) gOamBuffer + initOff); }
@@ -452,8 +453,9 @@ void RenderPassageClearOam(void)
         mainAnim->frame++;
         if (animation[mainAnim->frame].time == 0)
         {
-          mainAnim->timer = 0;
-          mainAnim->frame = 0;
+          /* slot is still 0 here; the target reuses its register for the reset. */
+          mainAnim->timer = slot;
+          mainAnim->frame = slot;
           mainAnim->state = 0;
         }
       }
@@ -466,37 +468,44 @@ void RenderPassageClearOam(void)
         if (slot < total)
         {
           u16 *mainState;
-          s32 attr2Mask;
+          register s32 attr2Mask asm("r12");
+          register s32 coordMask asm("sl");
 
           mainState = gStageEntryMainSpriteState;
           attr2Mask = -13;
-          oam = &gOamBuffer[slot];
-          slot = total - slot;
           do
           {
-            u16 value;
-            s32 coord;
-            value = *(src++);
-            *(rawDst++) = value;
-            ((u8 *)oam)[0] = value + ((u8 *)mainState)[6] - 4;
-            value = *(src++);
-            *(rawDst++) = value;
-            coord = value + mainState[2] - 2;
+            coordMask = 0x1FF;
+            oam = &gOamBuffer[slot];
+            slot = total - slot;
+            do
             {
-              s32 preservedAttr1;
+              u16 value;
+              s32 coord;
+              value = *(src++);
+              savedAttr1 = oam->all.attr1;
+              *(rawDst++) = value;
+              ((u8 *)oam)[0] = value + ((u8 *)mainState)[6] - 4;
+              value = *(src++);
+              *(rawDst++) = value;
+              coord = value + mainState[2] - 2;
+              {
+                s32 preservedAttr1;
 
-              preservedAttr1 = oam->all.attr1;
-              coord &= 0x1FF;
-              preservedAttr1 &= 0xFFFFFE00;
-              oam->all.attr1 = preservedAttr1 | coord;
+                preservedAttr1 = savedAttr1;
+                coord &= coordMask;
+                preservedAttr1 &= 0xFFFFFE00;
+                oam->all.attr1 = preservedAttr1 | coord;
+              }
+              *rawDst = *(src++);
+              ((u8 *)oam)[5] &= (u8)attr2Mask;
+              rawDst += 2;
+              oam++;
+              slot--;
             }
-            *rawDst = *(src++);
-            ((u8 *)oam)[5] &= (u8)attr2Mask;
-            rawDst += 2;
-            oam++;
-            slot--;
+            while (slot != 0);
           }
-          while (slot != 0);
+          while (0);
           slot = total;
         }
       }
@@ -524,9 +533,8 @@ void RenderPassageClearOam(void)
       i = 0;
       do
       {
-        s16 x;
-        s16 y;
-
+        register s32 bonusOffset asm("r12") = i << 2;
+        register s32 nextBonus asm("sl") = i + 1;
         src = animation[gPassageClearBonusAnimationFrame].oam;
         total += *(src++);
         if (total > 128)
@@ -535,8 +543,7 @@ void RenderPassageClearOam(void)
         }
         if (slot < total)
         {
-          x = (s16) gPassageClearBonusItemPositions[i * 2] >> 4;
-          y = (s16) gPassageClearBonusItemPositions[i * 2 + 1] >> 4;
+          s16 *position = (s16 *)((u8 *)gPassageClearBonusItemPositions + bonusOffset);
           oam = &gOamBuffer[slot];
           slot = total - slot;
           do
@@ -546,11 +553,12 @@ void RenderPassageClearOam(void)
 
             value = *(src++);
             *(rawDst++) = value;
-            ((u8 *) oam)[0] = value + y;
+            ((u8 *) oam)[0] = value + ((s16) position[1] >> 4);
+            attr1Bits = oam->all.attr1;
             value = *(src++);
             *(rawDst++) = value;
-            coord = value + x;
-            oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
+            coord = value + ((s16) position[0] >> 4);
+            oam->all.attr1 = (attr1Bits & 0xFE00) | (coord & 0x1FF);
             *rawDst = *(src++);
             ((u8 *) oam)[5] &= (u8) -13;
             rawDst += 2;
@@ -560,9 +568,12 @@ void RenderPassageClearOam(void)
           while (slot != 0);
           slot = total;
         }
-        gPassageClearBonusItemPositions[i * 2] += ((const s32 *) sPassageClearBonusItemXVelocities)[i];
-        gPassageClearBonusItemPositions[i * 2 + 1] += ((const s32 *) sPassageClearBonusItemYVelocities)[i];
-        i++;
+        {
+          s16 *position = (s16 *)((u8 *)gPassageClearBonusItemPositions + bonusOffset);
+          position[0] += *(const s32 *)((const u8 *)sPassageClearBonusItemXVelocities + bonusOffset);
+          position[1] += *(const s32 *)((const u8 *)sPassageClearBonusItemYVelocities + bonusOffset);
+        }
+        i = nextBonus;
       }
       while (i <= 5);
     }
@@ -579,19 +590,21 @@ void RenderPassageClearOam(void)
   {
     OamData *oamBase;
     u16 *mainState;
+    u8 *mainStateBytes;
     s32 attr2Mask;
     oamBase = gOamBuffer;
     mainState = gStageEntryMainSpriteState;
     attr2Mask = -13;
     oam = &oamBase[slot];
     slot = total - slot;
+    mainStateBytes = (u8 *) mainState;
     do
     {
       u16 value;
       s32 coord;
       value = *(src++);
       *(rawDst++) = value;
-      ((u8 *) oam)[0] = value + ((u8 *) mainState)[6];
+      ((u8 *) oam)[0] = value + mainStateBytes[6];
       value = *(src++);
       *(rawDst++) = value;
       coord = value + mainState[2];
@@ -649,10 +662,14 @@ void RenderPassageClearOam(void)
           *(rawDst++) = value;
           ((u8 *) oam)[0] = value + ((u8 *) gStageEntryMainSpriteState)[6];
           value = *(src++);
-          *(rawDst++) = value;
-          coord = value + gStageEntryMainSpriteState[2] - 16;
-          oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
-          *rawDst = *(src++);
+          do
+          {
+            *(rawDst++) = value;
+            coord = value + gStageEntryMainSpriteState[2] - 16;
+            oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
+            *rawDst = *(src++);
+          }
+          while (0);
           ((u8 *) oam)[5] &= (u8) -13;
           rawDst += 2;
           oam++;
@@ -693,19 +710,19 @@ void RenderPassageClearOam(void)
         }
         if (slot < total)
         {
+          u16 *mainState = gStageEntryMainSpriteState;
           oam = &gOamBuffer[slot];
           slot = total - slot;
           do
           {
             u16 value;
-            s32 coord;
             value = *(src++);
             *(rawDst++) = value;
-            ((u8 *) oam)[0] = value + ((u8 *) gStageEntryMainSpriteState)[6] - 4;
+            ((u8 *) oam)[0] = value + ((u8 *) mainState)[6] - 4;
             value = *(src++);
             *(rawDst++) = value;
-            coord = gStageEntryMainSpriteState[2] + value;
-            oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
+            attr1Bits = oam->all.attr1;
+            oam->all.attr1 = (attr1Bits & 0xFE00) | ((mainState[2] + value) & 0x1FF);
             *rawDst = *(src++);
             ((u8 *) oam)[5] &= (u8) -13;
             rawDst += 2;
@@ -719,176 +736,197 @@ void RenderPassageClearOam(void)
     }
   }
   i = 0;
-  do
   {
-    particle = &gPassageClearFastParticles[i];
-    if (particle->type != 0)
+    register struct PassageClearParticle *particle asm("sl") = gPassageClearFastParticles;
+    do
     {
-      src = sPassageClearFastParticleOamFrames[particle->type - 1];
-      total += *(src++);
-      if (total > 128)
+      if (particle->type != 0)
       {
-        goto finish;
-      }
-      if (slot < total)
-      {
-        oam = &gOamBuffer[slot];
-        slot = total - slot;
-        do
+        src = sPassageClearFastParticleOamFrames[particle->type - 1];
+        total += *(src++);
+        if (total > 128)
         {
-          u16 value;
-          s32 coord;
-          u8 matrix;
-          value = *(src++);
-          *(rawDst++) = value;
-          ((u8 *) oam)[0] = value + (particle->y >> 4);
-          ((u8 *) oam)[1] = (((u8 *) oam)[1] & (u8) -4) | 1;
-          value = *(src++);
-          *(rawDst++) = value;
-          coord = value + particle->x;
-          oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
-          matrix = (((particle->type - 1) / 3) + 4) & 7;
-          ((u8 *) oam)[3] = (((u8 *) oam)[3] & (u8) -15) | (matrix << 1);
-          *rawDst = *(src++);
-          ((u8 *) oam)[5] = (((u8 *) oam)[5] & (u8) -13) | 8;
-          rawDst += 2;
-          oam++;
-          slot--;
+          goto finish;
         }
-        while (slot != 0);
-        slot = total;
+        if (slot < total)
+        {
+          oam = &gOamBuffer[slot];
+          slot = total - slot;
+          do
+          {
+            u16 value;
+            s32 coord;
+            u8 matrix;
+            value = *(src++);
+            *(rawDst++) = value;
+            ((u8 *) oam)[0] = value + (particle->y >> 4);
+            ((u8 *) oam)[1] = (((u8 *) oam)[1] & (u8) -4) | 1;
+            value = *(src++);
+            *(rawDst++) = value;
+            coord = value + particle->x;
+            oam->all.attr1 = (oam->all.attr1 & attr1Mask) | (coord & 0x1FF);
+            matrix = (((particle->type - 1) / 3) + 4) & 7;
+            ((u8 *) oam)[3] = (((u8 *) oam)[3] & (u8) -15) | (matrix << 1);
+            *rawDst = *(src++);
+            ((u8 *) oam)[5] = (((u8 *) oam)[5] & (u8) -13) | 8;
+            rawDst += 2;
+            oam++;
+            slot--;
+          }
+          while (slot != 0);
+          slot = total;
+        }
+        particle->y += 60;
+        if (particle->y > 0xAA0)
+        {
+          particle->type = 0;
+        }
       }
-      particle->y += 60;
-      if (particle->y > 0xAA0)
-      {
-        particle->type = 0;
-      }
+      particle++;
+      i++;
     }
-    i++;
+    while (i <= 4);
   }
-  while (i <= 4);
   i = 0;
-  do
+  attr3Mask = (u8) -15;
   {
-    particle = &gPassageClearMediumParticles[i];
-    if (particle->type != 0)
+    register struct PassageClearParticle *particle asm("sl") = gPassageClearMediumParticles;
+    struct PassageClearParticle *activeParticle;
+    do
     {
-      src = sPassageClearMediumParticleOamFrames[particle->type - 1];
-      total += *(src++);
-      if (total > 128)
+      if (particle->type != 0)
       {
-        goto finish;
-      }
-      if (slot < total)
-      {
-        oam = &gOamBuffer[slot];
-        slot = total - slot;
-        do
+        src = sPassageClearMediumParticleOamFrames[particle->type - 1];
+        total += *(src++);
+        if (total > 128)
         {
-          u16 value;
-          s32 coord;
-          u8 matrix;
-          value = *(src++);
-          *(rawDst++) = value;
-          ((u8 *) oam)[0] = value + (particle->y >> 4);
-          ((u8 *) oam)[1] |= 3;
-          value = *(src++);
-          *(rawDst++) = value;
-          coord = value + particle->x;
-          oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
-          matrix = (((particle->type - 1) / 3) + 2) & 7;
-          ((u8 *) oam)[3] = (((u8 *) oam)[3] & (u8) -15) | (matrix << 1);
-          *rawDst = *(src++);
-          ((u8 *) oam)[5] = (((u8 *) oam)[5] & (u8) -13) | 8;
-          rawDst += 2;
-          oam++;
-          slot--;
+          goto finish;
         }
-        while (slot != 0);
-        slot = total;
+        activeParticle = particle;
+        if (slot < total)
+        {
+          oam = &gOamBuffer[slot];
+          slot = total - slot;
+          do
+          {
+            u16 value;
+            s32 coord;
+            u8 matrix;
+            value = *(src++);
+            *(rawDst++) = value;
+            ((u8 *) oam)[0] = value + (activeParticle->y >> 4);
+            ((u8 *) oam)[1] |= 3;
+            value = *(src++);
+            *(rawDst++) = value;
+            coord = value + activeParticle->x;
+            oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
+            matrix = (((activeParticle->type - 1) / 3) + 2) & 7;
+            ((u8 *) oam)[3] = (((u8 *) oam)[3] & attr3Mask) | (matrix << 1);
+            *rawDst = *(src++);
+            ((u8 *) oam)[5] = (((u8 *) oam)[5] & (u8) -13) | 8;
+            rawDst += 2;
+            oam++;
+            slot--;
+          }
+          while (slot != 0);
+          slot = total;
+        }
+        activeParticle->y += 52;
+        if (activeParticle->y > 0xAA0)
+        {
+          activeParticle->type = 0;
+        }
       }
-      particle->y += 52;
-      if (particle->y > 0xAA0)
-      {
-        particle->type = 0;
-      }
+      particle++;
+      i++;
     }
-    i++;
+    while (i <= 4);
   }
-  while (i <= 4);
   i = 0;
-  do
   {
-    particle = &gPassageClearSlowParticles[i];
-    if (particle->type != 0)
+    register struct PassageClearParticle *particle asm("sl") = gPassageClearSlowParticles;
+    do
     {
-      src = ((const u16 * const *) sPassageClearSlowParticleOamFrames)[particle->type - 1];
-      total += *(src++);
-      if (total > 128)
+      if (particle->type != 0)
       {
-        goto finish;
-      }
-      if (slot < total)
-      {
-        oam = &gOamBuffer[slot];
-        slot = total - slot;
-        do
+        src = ((const u16 * const *) sPassageClearSlowParticleOamFrames)[particle->type - 1];
+        total += *(src++);
+        if (total > 128)
         {
-          u16 value;
-          s32 coord;
-          u8 matrix;
-          value = *(src++);
-          *(rawDst++) = value;
-          ((u8 *) oam)[0] = value + (particle->y >> 4);
-          ((u8 *) oam)[1] = (((u8 *) oam)[1] & (u8) (-4)) | 1;
-          value = *(src++);
-          *(rawDst++) = value;
-          coord = value + particle->x;
-          oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
-          matrix = ((particle->type - 1) / 3) & 7;
-          ((u8 *) oam)[3] = (((u8 *) oam)[3] & (u8) (-15)) | (matrix << 1);
-          *rawDst = *(src++);
-          ((u8 *) oam)[5] = (((u8 *) oam)[5] & (u8) (-13)) | 8;
-          rawDst += 2;
-          oam++;
-          slot--;
+          goto finish;
         }
-        while (slot != 0);
-        slot = total;
+        if (slot < total)
+        {
+          oam = &gOamBuffer[slot];
+          slot = total - slot;
+          do
+          {
+            u16 value;
+            s32 coord;
+            u8 matrix;
+            value = *(src++);
+            *(rawDst++) = value;
+            ((u8 *) oam)[0] = value + (particle->y >> 4);
+            ((u8 *) oam)[1] = (((u8 *) oam)[1] & (u8) (-4)) | 1;
+            value = *(src++);
+            *(rawDst++) = value;
+            coord = value + particle->x;
+            oam->all.attr1 = (oam->all.attr1 & 0xFE00) | (coord & 0x1FF);
+            matrix = ((particle->type - 1) / 3) & 7;
+            matrixBits = matrix << 1;
+            ((u8 *) oam)[3] = (((u8 *) oam)[3] & attr3Mask) | matrixBits;
+            *rawDst = *(src++);
+            attr2High = ((u8 *) oam)[5];
+            ((u8 *) oam)[5] = (attr2High & (u8) (-13)) | 8;
+            rawDst += 2;
+            oam++;
+            slot--;
+          }
+          while (slot != 0);
+          slot = total;
+        }
+        particle->y += 32;
+        if (particle->y > 0xAA0)
+        {
+          particle->type = 0;
+        }
       }
-      particle->y += 32;
-      if (particle->y > 0xAA0)
-      {
-        particle->type = 0;
-      }
+      particle++;
+      i++;
     }
-    i++;
+    while (i <= 4);
   }
-  while (i <= 4);
   i = 0;
-  do
   {
-    gPassageClearParticleAffineAngles[i] += ((const s32 *) sPassageClearParticleAngleSteps)[i];
-    angle = gPassageClearParticleAffineAngles[i];
-    sine = sSinCosTable[angle + 64];
-    inverse = FixedInverse(0x100);
-    affineA = FixedMul(sine, (s16) inverse);
-    sine = sSinCosTable[angle];
-    inverse = FixedInverse(0x100);
-    affineB = FixedMul(sine, (s16) inverse);
-    sine = -(u16) sSinCosTable[angle];
-    inverse = FixedInverse(0x100);
-    affineC = FixedMul((s16) sine, (s16) inverse);
-    sine = sSinCosTable[angle + 64];
-    inverse = FixedInverse(0x100);
-    affineD = FixedMul(sine, (s16) inverse);
-    gOamBuffer[i * 4].all.affineParam = affineA;
-    gOamBuffer[i * 4 + 1].all.affineParam = affineB;
-    gOamBuffer[i * 4 + 2].all.affineParam = affineC;
-    gOamBuffer[i * 4 + 3].all.affineParam = affineD;
-    i++;
+    register const s16 *sinTable asm("r9") = sSinCosTable;
+    register s16 *affine2 asm("sl") = &affine[2];
+    s16 *affine3 = &affine[3];
+    register OamData *affineOam asm("r6") = gOamBuffer;
+    do
+    {
+      gPassageClearParticleAffineAngles[i] += ((const s32 *) sPassageClearParticleAngleSteps)[i];
+      sine = sinTable[gPassageClearParticleAffineAngles[i] + 64];
+      inverse = FixedInverse(0x100);
+      unitScale = 0x100;
+      affine[0] = FixedMul(sine, (s16) inverse);
+      sine = sinTable[gPassageClearParticleAffineAngles[i]];
+      inverse = FixedInverse(0x100);
+      affine[1] = FixedMul(sine, (s16) inverse);
+      sine = -(u16) sinTable[gPassageClearParticleAffineAngles[i]];
+      inverse = FixedInverse(0x100);
+      *affine2 = FixedMul((s16) sine, (s16) inverse);
+      sine = sinTable[gPassageClearParticleAffineAngles[i] + 64];
+      inverse = FixedInverse(unitScale);
+      *affine3 = FixedMul(sine, (s16) inverse);
+      affineOam[0].all.affineParam = affine[0];
+      affineOam[1].all.affineParam = affine[1];
+      affineOam[2].all.affineParam = *affine2;
+      affineOam[3].all.affineParam = *affine3;
+      affineOam += 4;
+      i++;
+    }
+    while (i <= 5);
   }
-  while (i <= 5);
   gOamSlotsUsed = total;
   finish:
   return;
