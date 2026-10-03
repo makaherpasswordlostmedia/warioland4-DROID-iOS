@@ -569,7 +569,7 @@ void CuckooCondorEnterArena(void)
     }
 }
 
-int TryStartCuckooCondorGrab(void)
+void TryStartCuckooCondorGrab(void)
 {
     register u32 flag asm("r3");
     register struct WarioData *wario asm("r1");
