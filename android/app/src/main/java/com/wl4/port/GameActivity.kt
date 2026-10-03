@@ -16,9 +16,11 @@ class GameActivity : AppCompatActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         view = GameView(this) { keysTouch = it; push() }
         setContentView(view)
-        val rom = File(filesDir, "wl4.gba").takeIf { it.exists() }?.readBytes() ?: run { finish(); return }
+        val rom = File(filesDir, "wl4.gba").takeIf { it.exists() }?.readBytes()
+            ?: run { Native.log("ROM not found: ${File(filesDir, "wl4.gba")} - closing"); finish(); return }
+        Native.log("GameActivity: rom ${rom.size} bytes, running=${Native.running()}")
         val save = saveFile.takeIf { it.exists() }?.readBytes()
-        if (!Native.running()) Native.start(rom, save)
+        if (!Native.running()) Native.log("Native.start returned ${Native.start(rom, save)}")
     }
     private fun push() = Native.setKeys(keysPad or keysTouch)
 

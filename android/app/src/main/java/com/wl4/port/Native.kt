@@ -9,6 +9,8 @@ object Native {
     external fun running(): Boolean
     external fun copyFrame(out: IntArray): Int
     external fun readSave(): ByteArray
+    external fun setLogPath(path: String)
+    external fun log(msg: String)
 }
 
 /** KEYINPUT bit order. */
