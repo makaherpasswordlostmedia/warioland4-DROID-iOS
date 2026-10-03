@@ -616,6 +616,9 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/sprite_ai/cractus.c', r'^    SpriteUtilFindSprite\(219, 0\);\n(?=    /\* Preserve the signed-return)', ''),
     ('src/game_screen_helpers.c', r'^            DecompressRoomBackground\(0, selectedData, overlayBuffer\);\n(?=\s*/\* Preserve the decompressed size)', ''),
     ('src/wario/puffy.c', r'^void ResolveWarioFloorCollision\(void\);', 'u8 ResolveWarioFloorCollision(void);'),
+    # SampleFreqSet busy-waits on VCOUNT through a raw memory read; nothing advances VCOUNT in wasm memory, so it spun forever
+    # (black screen, frames=0).  Read it through the HAL, which steps the scanline.
+    ('src/m4a.c', r'\*\(vu8 \*\)REG_ADDR_VCOUNT', '((u8)hal_poll_vcount())'),
 ]
 
 n = 0
