@@ -22,6 +22,7 @@ static uint32_t g_front[GBA_W * GBA_H];
 static volatile int g_stop, g_running, g_frames;
 static uint8_t *g_rom; static size_t g_romSize;
 static int g_paused;
+static volatile unsigned g_polls, g_syscalls, g_dmas;   /* diagnostics for the watchdog */
 static uint8_t g_save[GBA_SRAM_SIZE]; static int g_haveSave;
 
 /* A wasm trap (OOB, bad indirect call...) means a port bug: report it and stop the game thread
@@ -32,13 +33,13 @@ void wl4_trap(wasm_rt_trap_t code) {
 }
 
 /* ---------- imports the wasm module expects ---------- */
-void w2c_env_hal_dma_set(struct w2c_env *e, u32 ch, u32 src, u32 dst, u32 ctl) { (void)e; hal_dma_set((int)ch, src, dst, ctl); }
+void w2c_env_hal_dma_set(struct w2c_env *e, u32 ch, u32 src, u32 dst, u32 ctl) { (void)e; g_dmas++; hal_dma_set((int)ch, src, dst, ctl); }
 void w2c_env_LZ77UnCompVram(struct w2c_env *e, u32 src, u32 dst) { (void)e; bios_LZ77UnComp(src, dst); }
 static char g_siteSeen[8192];
 void w2c_env_hal_unported_asm(struct w2c_env *e, u32 site) {
     (void)e; if (site < sizeof g_siteSeen && !g_siteSeen[site]) { g_siteSeen[site] = 1; WL4_LOG("UNPORTED inline asm site #%u executed (see ASM_SITES.txt)", site); }
 }
-u32 w2c_env_hal_poll_vcount(struct w2c_env *e) { (void)e; return hal_poll_vcount(); }
+u32 w2c_env_hal_poll_vcount(struct w2c_env *e) { (void)e; g_polls++; return hal_poll_vcount(); }
 void w2c_env_CPUSet(struct w2c_env *e, u32 src, u32 dst, u32 ctl) { (void)e; bios_CpuSet(src, dst, ctl); }
 void w2c_env_CpuFastSet(struct w2c_env *e, u32 src, u32 dst, u32 ctl) { (void)e; bios_CpuFastSet(src, dst, ctl); }
 void w2c_env_LZ77UnCompWram(struct w2c_env *e, u32 src, u32 dst) { (void)e; bios_LZ77UnComp(src, dst); }
@@ -48,7 +49,7 @@ void w2c_env_BgAffineSet(struct w2c_env *e, u32 src, u32 dst, u32 n) { (void)e; 
 void w2c_env_ObjAffineSet(struct w2c_env *e, u32 src, u32 dst, u32 n, u32 off) { (void)e; bios_ObjAffineSet(src, dst, (int32_t)n, (int32_t)off); }
 void w2c_env_irq_handler(struct w2c_env *e) { (void)e; }
 void w2c_env_hal_syscall(struct w2c_env *e, u32 num) {
-    (void)e;
+    (void)e; g_syscalls++;
     switch (num) {
     case 2: case 5: hal_run_frame(); break;            /* Halt / VBlankIntrWait: advance one frame */
     default: break;
@@ -62,7 +63,7 @@ static void cb_vcount(void) { w2c_wl4_InterruptCallbackCallVCount(&g_inst); }
 static void cb_frame(void) {
     static struct timespec next; struct timespec now;
     pthread_mutex_lock(&g_lock); memcpy(g_front, hal_framebuffer(), sizeof g_front); g_frames++; pthread_mutex_unlock(&g_lock);
-    if (g_frames == 1 || g_frames % 300 == 0) {
+    if (g_frames <= 3 || g_frames == 10 || g_frames == 30 || g_frames % 120 == 0) {
         int nz = 0; for (int i = 0; i < GBA_W * GBA_H; i++) if (g_front[i] & 0xFFFFFF) nz++;
         WL4_LOG("frame %d, non-black pixels %d/%d", g_frames, nz, GBA_W * GBA_H);
     }
@@ -91,12 +92,30 @@ static void *game_main(void *arg) {
     g_running = 0; return NULL;
 }
 
+/* Prints one line per second: tells "stuck in a busy loop" (polls grow) from "not even polling" (nothing grows) from "running". */
+static void *watchdog(void *arg) {
+    (void)arg; unsigned lastFrames = (unsigned)-1;
+    for (int t = 1; g_running && !g_stop; t++) {
+        struct timespec ts = {1, 0}; nanosleep(&ts, NULL);
+        if (!g_running || g_stop) break;
+        unsigned f = (unsigned)g_frames;
+        if (t <= 20 || t % 10 == 0 || f == lastFrames)
+            WL4_LOG("alive t=%ds frames=%u%s polls=%u syscalls=%u dma=%u DISPCNT=%04x IE=%04x IME=%u", t, f, f == lastFrames ? " (STALLED)" : "",
+                    g_polls, g_syscalls, g_dmas, g_inst.w2c_memory.data ? rd16(IO_DISPCNT) : 0, g_inst.w2c_memory.data ? rd16(IO_IE) : 0,
+                    g_inst.w2c_memory.data ? (rd16(IO_IME) & 1) : 0);
+        lastFrames = f;
+    }
+    return NULL;
+}
+
 int wl4_start(const uint8_t *rom, size_t size) {
     if (g_running) return -1;
     free(g_rom); g_rom = malloc(size); if (!g_rom) return -2; memcpy(g_rom, rom, size); g_romSize = size;
-    g_stop = 0; g_paused = 0; g_frames = 0; g_running = 1;
+    g_stop = 0; g_paused = 0; g_frames = 0; g_polls = g_syscalls = g_dmas = 0; g_running = 1;
     WL4_LOG("wl4_start: rom=%zu bytes", size);
-    return pthread_create(&g_thread, NULL, game_main, NULL) ? -3 : 0;
+    if (pthread_create(&g_thread, NULL, game_main, NULL)) return -3;
+    pthread_t wd; if (pthread_create(&wd, NULL, watchdog, NULL) == 0) pthread_detach(wd);
+    return 0;
 }
 #ifdef __ANDROID__
 /* bionic has no pthread_cancel(): kill the stuck game thread with a signal whose handler exits the thread */
