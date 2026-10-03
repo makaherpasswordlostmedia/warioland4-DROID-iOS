@@ -8,3 +8,10 @@ int __divsi3(int a, int b) { return b ? (a == (-2147483647 - 1) && b == -1 ? a :
 int __modsi3(int a, int b) { return b ? (b == -1 ? 0 : a % b) : a; }
 unsigned __udivsi3(unsigned a, unsigned b) { return b ? a / b : 0xFFFFFFFFu; }
 unsigned __umodsi3(unsigned a, unsigned b) { return b ? a % b : a; }
+
+/* ---- m4a helpers that were ARM/Thumb asm in the ROM build (asm/m4a_asm.s) ---------------------------------------- */
+extern void *const sMPlayJumpTableTemplate[];
+/* copy the 36 music-player command handlers into the RAM jump table (asm: `movs r1,#0x24` loop) */
+void MPlayJumpTableCopy(void **dst) { for (int i = 0; i < 0x24; i++) dst[i] = sMPlayJumpTableTemplate[i]; }
+/* high 32 bits of a 32x32 -> 64 bit unsigned multiply (asm: umull) */
+unsigned umul3232H32(unsigned a, unsigned b) { return (unsigned)(((unsigned long long)a * b) >> 32); }
