@@ -162,6 +162,7 @@ jobs:
           OPT_LEVEL: ${{ env.OPT_LEVEL }}
         run: |
           set -o pipefail
+          chmod +x port/build_wasm.sh
           ./port/build_wasm.sh us 2>&1 | tee port-build.log
           echo "--- failed C files (expected: none)"
           cat port/build/FAILED.txt
