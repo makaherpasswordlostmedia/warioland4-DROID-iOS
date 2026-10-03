@@ -1,0 +1,299 @@
+name: Build Wario Land 4 Android port
+
+# Repo layout expected: the pret-style decomp at the root (src/, include/, asm/, asset_database.yaml, ...)
+# with port/ and android/ from this port copied on top.
+#
+# ROM: the build needs YOUR OWN US ROM (md5 5fe47355a33e3fabec2a1607af88a404).  Either
+#   - commit baserom_us.gba to a PRIVATE repo, or
+#   - add the repo secret WL4_ROM_URL (a direct download link only you can reach).
+# `make extract` turns ROM data into C includes that get compiled into the APK, so the artifact is
+# ROM-derived: this workflow refuses to run in a public repo unless you explicitly override that.
+
+on:
+  workflow_dispatch:
+    inputs:
+      abis:
+        description: "Android ABIs (comma separated). arm64-v8a = real phones; x86_64 = emulator."
+        default: "arm64-v8a"
+      allow_public_repo:
+        description: "I understand the APK embeds ROM-derived data and the artifact is downloadable from a public repo"
+        type: boolean
+        default: false
+      run_host_smoke_test:
+        description: "Run the ROM headless on the runner for a few seconds before building the APK"
+        type: boolean
+        default: true
+      wabt_version:
+        description: "Override wabt version (leave blank to use the default below)"
+        default: ""
+      opt_level:
+        description: "Clang -O level for the wasm32 compile (0/1/2). Lower values use less RAM but produce larger .wasm."
+        default: "2"
+
+env:
+  WASI_SDK_VERSION: "24"
+  WABT_VERSION: "1.0.36"
+  ROM_MD5_US: "5fe47355a33e3fabec2a1607af88a404"
+  NDK_VERSION: "26.3.11579264"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Refuse public repos unless overridden
+        if: ${{ github.event.repository.private == false && inputs.allow_public_repo != true }}
+        run: |
+          echo "::error::This repo is public. The APK embeds data extracted from your ROM; rerun with allow_public_repo=true only if you accept that."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Resolve effective tool versions once so cache keys and install steps agree.
+      - name: Resolve tool versions
+        run: |
+          WABT_EFF="${{ inputs.wabt_version }}"
+          echo "WABT_EFF=${WABT_EFF:-${{ env.WABT_VERSION }}}" >> "$GITHUB_ENV"
+          OPT="${{ inputs.opt_level }}"
+          echo "OPT_LEVEL=${OPT:-2}" >> "$GITHUB_ENV"
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 python3-venv python3-pip \
+            gcc-multilib curl ca-certificates git unzip
+
+      - name: Get ROM
+        env:
+          ROM_URL: ${{ secrets.WL4_ROM_URL }}
+        run: |
+          if [ ! -f baserom_us.gba ]; then
+            if [ -z "$ROM_URL" ]; then
+              echo "::error::No baserom_us.gba in the repo and no WL4_ROM_URL secret. See the header of this workflow."
+              exit 1
+            fi
+            curl -fsSL "$ROM_URL" -o baserom_us.gba
+          fi
+          ls -l baserom_us.gba
+          echo "${ROM_MD5_US}  baserom_us.gba" | md5sum -c - \
+            || { echo "::error::baserom_us.gba is not the US ROM the decomp expects"; exit 1; }
+
+      - name: Extract assets from ROM (make extract)
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet pyyaml
+          make extract VERSION=us
+          echo "Extracted $(find include/data -type f | wc -l) asset files"
+
+      # ── wasi-sdk ────────────────────────────────────────────────────────────
+      - name: Cache wasi-sdk
+        id: cache-wasi
+        uses: actions/cache@v4
+        with:
+          path: ~/wasi-sdk
+          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}
+
+      - name: Install wasi-sdk
+        if: steps.cache-wasi.outputs.cache-hit != 'true'
+        run: |
+          ARCH=$(uname -m)   # x86_64 on standard runners; aarch64 on arm runners
+          VER="${{ env.WASI_SDK_VERSION }}"
+          # GitHub release assets have used two naming conventions across versions:
+          #   <v>.0-<arch>-linux.tar.gz   (current)
+          #   <v>.0+m-<arch>-linux.tar.gz (older patch releases)
+          BASE="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${VER}"
+          PRIMARY="${BASE}/wasi-sdk-${VER}.0-${ARCH}-linux.tar.gz"
+          FALLBACK="${BASE}/wasi-sdk-${VER}.0+m-${ARCH}-linux.tar.gz"
+          if ! curl -fsSL -o /tmp/wasi.tgz "$PRIMARY"; then
+            echo "::warning::Primary wasi-sdk URL failed; trying fallback naming."
+            curl -fsSL -o /tmp/wasi.tgz "$FALLBACK"
+          fi
+          mkdir -p ~/wasi-sdk
+          tar -xzf /tmp/wasi.tgz -C ~/wasi-sdk --strip-components=1
+          ~/wasi-sdk/bin/clang --version
+
+      # ── wabt (wasm2c) ────────────────────────────────────────────────────────
+      - name: Cache wabt
+        id: cache-wabt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/wabt-install
+            ~/wabt-src
+          # Cache key includes the effective version so an input override busts the cache.
+          key: wabt-${{ env.WABT_EFF }}
+
+      - name: Build wabt (wasm2c) from source
+        if: steps.cache-wabt.outputs.cache-hit != 'true'
+        run: |
+          VER="${{ env.WABT_EFF }}"
+          # Try the exact tag first; fall back to the branch name without "v" prefix.
+          if ! git clone --recursive --depth 1 --branch "${VER}" \
+                https://github.com/WebAssembly/wabt ~/wabt-src 2>/dev/null; then
+            echo "::warning::Tag ${VER} not found; trying v${VER}"
+            git clone --recursive --depth 1 --branch "v${VER}" \
+              https://github.com/WebAssembly/wabt ~/wabt-src
+          fi
+          cmake -S ~/wabt-src -B ~/wabt-src/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$HOME/wabt-install"
+          cmake --build ~/wabt-src/build -j"$(nproc)"
+          cmake --install ~/wabt-src/build
+          ~/wabt-install/bin/wasm2c --version
+
+      # ── portify → wasm32 → wasm2c ───────────────────────────────────────────
+      - name: portify -> wasm32 -> wasm2c
+        env:
+          WASI_SDK: /home/runner/wasi-sdk
+          WABT: /home/runner/wabt-install
+          WABT_SRC: /home/runner/wabt-src
+          OPT_LEVEL: ${{ env.OPT_LEVEL }}
+        run: |
+          set -o pipefail
+          ./port/build_wasm.sh us 2>&1 | tee port-build.log
+          echo "--- failed C files (expected: none)"
+          cat port/build/FAILED.txt
+          echo "--- unported asm sites (expected: none)"
+          cat port/build/ASM_SITES.txt
+          echo "--- audit (expected: empty)"
+          cat port/build/p/AUDIT.txt
+          test -s port/build/wasm2c/wl4.c
+          ls -l port/build/wl4.wasm port/build/wasm2c/wl4.c
+
+      # ── host smoke test ──────────────────────────────────────────────────────
+      - name: Host smoke test (compile wasm2c output natively, run the ROM headless)
+        if: ${{ inputs.run_host_smoke_test }}
+        continue-on-error: true
+        run: |
+          set -x
+          W=port/build/wasm2c
+
+          python3 port/tools/gen_stubs.py "$W/wl4.h" /tmp/stubs.c
+
+          # Determine whether this wabt version's wl4.c already pulls in the
+          # wasm-rt implementation (newer wabt: wl4.c includes wasm-rt-impl.h).
+          # If it does, compiling wasm-rt-impl.c separately causes duplicate
+          # symbol errors at link time.  Only include the *.c runtime files that
+          # are NOT already embedded by wl4.c.
+          RT=""
+          for f in $(ls "$W"/wasm-rt-*.c 2>/dev/null | grep -v -- '-win\.c'); do
+            base=$(basename "$f")
+            # If wl4.c (or its header) already includes this file, skip it.
+            if grep -qF "\"$base\"" "$W/wl4.c" "$W/wl4.h" 2>/dev/null; then
+              echo "smoke-test: skipping $base (already included by wl4.c)"
+            else
+              RT="$RT $f"
+            fi
+          done
+
+          gcc -O1 -w \
+            -I "$W" -I port/host \
+            -DWASM_RT_TRAP_HANDLER=wl4_trap \
+            port/tests/headless.c port/host/host.c port/hal/*.c \
+            /tmp/stubs.c "$W/wl4.c" $RT \
+            -o /tmp/headless -lm -lpthread
+
+          timeout 120 /tmp/headless baserom_us.gba 300 2>&1 | tail -30
+
+      # ── Android build ────────────────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK / NDK / CMake components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build debug APK
+        env:
+          ABIS: ${{ inputs.abis }}
+        run: gradle -p android assembleDebug -Pwl4Abis="$ABIS" --no-daemon --stacktrace
+
+      # ── artifacts ────────────────────────────────────────────────────────────
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wl4-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
+
+      - name: Upload build diagnostics (no ROM data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wl4-build-diagnostics
+          path: |
+            port-build.log
+            port/build/FAILED.txt
+            port/build/errors.log
+            port/build/ASM_SITES.txt
+            port/build/p/AUDIT.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ── job summary ──────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## WL4 Android build summary"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| wabt | ${{ env.WABT_EFF }} |"
+            echo "| wasi-sdk | ${{ env.WASI_SDK_VERSION }} |"
+            echo "| -O level | ${{ env.OPT_LEVEL }} |"
+            echo "| ABIs | ${{ inputs.abis }} |"
+            echo ""
+
+            if [ -f port/build/wl4.wasm ]; then
+              WASM_SIZE=$(stat -c %s port/build/wl4.wasm)
+              echo "| wl4.wasm | ${WASM_SIZE} bytes |"
+            fi
+            if [ -f port/build/wasm2c/wl4.c ]; then
+              WL4C_SIZE=$(stat -c %s port/build/wasm2c/wl4.c)
+              echo "| wl4.c (wasm2c output) | ${WL4C_SIZE} bytes |"
+            fi
+
+            echo ""
+            echo "### C compilation"
+            if [ -f port/build/FAILED.txt ]; then
+              BAD=$(grep -c . port/build/FAILED.txt 2>/dev/null || echo 0)
+              echo "- Failed files: **${BAD}** (see \`port/build/FAILED.txt\`)"
+            fi
+            if [ -f port/build/ASM_SITES.txt ]; then
+              ASM=$(grep -c . port/build/ASM_SITES.txt 2>/dev/null || echo 0)
+              echo "- Unported ASM sites: **${ASM}**"
+            fi
+
+            echo ""
+            echo "### APK"
+            APK=android/app/build/outputs/apk/debug/app-debug.apk
+            if [ -f "$APK" ]; then
+              APK_SIZE=$(stat -c %s "$APK")
+              echo "- Built: ✅ (${APK_SIZE} bytes)"
+            else
+              echo "- Built: ❌"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
