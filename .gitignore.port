@@ -1,0 +1,4 @@
+baserom*.gba
+port/build/
+android/.gradle/
+android/app/build/
