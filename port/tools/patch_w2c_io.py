@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """Make the wasm2c output memory-mapped-IO aware.
 
-The game programs hardware by plain stores (e.g. `dma[2] = 0x80000000`, which
-on a GBA starts a transfer immediately).  After every store whose address is
-inside the IO page (0x04000000–0x040003FF) we call hal_io_write(addr, size) so
-the HAL can react.
+Supports two DEFINE_STORE macro formats across wabt versions:
 
-Instead of matching the exact multi-line macro text (which changes with wabt
-whitespace tweaks), we parse line-by-line:
+  Old format (wabt < 1.0.34ish):          New format (wabt 1.0.36+):
+    #define DEFINE_STORE(name, t1, t2) \\    #define DEFINE_STORE(name, t1, t2) \\
+      void w2c_##name(...) {           \\      static inline void name(...) {   \\
+        ...                            \\        ...                            \\
+        wasm_rt_memcpy(...);           \\        wasm_rt_memcpy(...);           \\
+      }                                \\      }                        ← NO backslash
+      DEF_MEM_CHECKS1(...)
 
-  1. Find `#define DEFINE_STORE(name, t1, t2)`.
-  2. Walk the continuation lines (every line ending with a bare backslash).
-  3. Locate the last line that is purely a closing brace inside that block.
-  4. Insert the IO-hook lines immediately before it.
-  5. Prepend the `extern` declaration once, just above DEFINE_STORE.
-
-Idempotent: a second run on an already-patched file is a no-op.
+In both cases we insert the IO hook just before the closing `}`.
 
 usage: patch_w2c_io.py wl4.c
 """
@@ -33,7 +29,6 @@ if '0x04000000ull' in src:
     print('patch_w2c_io: already patched,', path)
     sys.exit(0)
 
-# ── split into lines, keeping line endings ───────────────────────────────────
 lines = src.splitlines(keepends=True)
 
 # ── find DEFINE_STORE ────────────────────────────────────────────────────────
@@ -47,28 +42,40 @@ if ds_idx is None:
         'wasm2c output format unrecognised (wrong file or unsupported wabt version)'
     )
 
-# A continuation line ends with a backslash (possibly followed by spaces/CR/LF).
-CONT_RE        = re.compile(r'\\\s*$')
-# A closing-brace continuation line is *only* }, optional whitespace, then \.
-CLOSE_BRACE_RE = re.compile(r'^\s*\}\s*\\\s*$')
+# A continuation line ends with backslash (then optional whitespace/newline).
+CONT_RE = re.compile(r'\\\s*$')
+# Closing brace WITH continuation backslash  (old format): `  }  \`
+BRACE_CONT_RE = re.compile(r'^\s*\}\s*\\\s*$')
+# Closing brace WITHOUT continuation backslash (new format): `  }`
+BRACE_TERM_RE = re.compile(r'^\s*\}\s*$')
 
-# Walk the macro body to find the last `}  \` line.
 last_brace_idx = None
 for i in range(ds_idx + 1, len(lines)):
-    stripped = lines[i].rstrip('\r\n')
-    if CLOSE_BRACE_RE.match(stripped):
+    raw      = lines[i].rstrip('\r\n')
+    stripped = raw.rstrip()
+    is_cont  = bool(CONT_RE.search(raw))
+
+    if BRACE_CONT_RE.match(stripped):
+        # Old format: `}  \` is itself a continuation line; record and keep going.
         last_brace_idx = i
-    if not CONT_RE.search(stripped):
-        break   # first non-continuation line → end of macro
+
+    if not is_cont:
+        # This is the last line of the macro (no backslash).
+        # New format: the `}` is the terminator itself.
+        if BRACE_TERM_RE.match(stripped) and last_brace_idx is None:
+            last_brace_idx = i
+        break   # end of macro regardless
 
 if last_brace_idx is None:
     sys.exit(
-        'patch_w2c_io: could not locate closing `}` in DEFINE_STORE body – '
-        'wasm2c output format unrecognised'
+        'patch_w2c_io: could not locate closing } in DEFINE_STORE body – '
+        'wasm2c output format unrecognised\n'
+        'Lines around DEFINE_STORE:\n' +
+        ''.join(lines[ds_idx:ds_idx + 15])
     )
 
-# ── build IO-hook lines (must themselves be continuation lines) ──────────────
-# We use 4-space indent (standard wabt macro body indent).
+# ── build IO-hook lines ───────────────────────────────────────────────────────
+# The hook lines must be continuation lines so the macro body stays valid.
 HOOK = (
     '    if ((u64)(addr - 0x04000000ull) < 0x400ull)                        \\\n'
     '      hal_io_write((unsigned)addr, (unsigned)sizeof(t1));              \\\n'
@@ -77,7 +84,6 @@ HOOK = (
 lines.insert(last_brace_idx, HOOK)
 
 # ── prepend extern decl immediately above DEFINE_STORE ───────────────────────
-# Re-scan after the insert (index may have shifted by 1).
 for i, ln in enumerate(lines):
     if MACRO_DECL in ln:
         lines.insert(i, EXTERN_DECL + '\n')
