@@ -68,18 +68,19 @@ jobs:
 
       - name: Get ROM
         env:
-          ROM_URL: ${{ secrets.WL4_ROM_URL }}
+          ROM_ID: ${{ secrets.WL4_ROM_ID }}
         run: |
           if [ ! -f baserom_us.gba ]; then
-            if [ -z "$ROM_URL" ]; then
-              echo "::error::No baserom_us.gba in the repo and no WL4_ROM_URL secret. See the header of this workflow."
+            if [ -z "$ROM_ID" ]; then
+              echo "::error::Secret WL4_ROM_ID not set. Add your Google Drive file ID as a repo secret."
               exit 1
             fi
-            curl -fsSL "$ROM_URL" -o baserom_us.gba
+            pip install --quiet gdown
+            gdown "$ROM_ID" -O baserom_us.gba
           fi
           ls -l baserom_us.gba
           echo "${ROM_MD5_US}  baserom_us.gba" | md5sum -c - \
-            || { echo "::error::baserom_us.gba is not the US ROM the decomp expects"; exit 1; }
+            || { echo "::error::baserom_us.gba MD5 mismatch — wrong ROM version or corrupted download"; exit 1; }
 
       - name: Extract assets from ROM (make extract)
         run: |
