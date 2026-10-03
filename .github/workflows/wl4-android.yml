@@ -163,17 +163,7 @@ jobs:
         run: |
           set -o pipefail
           chmod +x port/build_wasm.sh
-          ./port/build_wasm.sh us 2>&1 | tee port-build.log || true
-          # Dump the DEFINE_STORE macro so we can see the real format
-          echo "=== DEFINE_STORE in wl4.c ==="
-          grep -n "DEFINE_STORE\|DEFINE_LOAD\|wasm_rt_memcpy\|DEF_MEM" \
-            port/build/wasm2c/wl4.c 2>/dev/null | head -40 || true
-          echo "=== raw lines around DEFINE_STORE ==="
-          grep -n "define DEFINE_STORE" port/build/wasm2c/wl4.c | head -5 || true
-          # Show 20 lines after DEFINE_STORE
-          awk '/define DEFINE_STORE/{found=1; count=0} found{print NR": "$0; count++; if(count>25) exit}' \
-            port/build/wasm2c/wl4.c || true
-          echo "==="
+          ./port/build_wasm.sh us 2>&1 | tee port-build.log
           echo "--- failed C files (expected: none)"
           cat port/build/FAILED.txt
           echo "--- unported asm sites (expected: none)"
