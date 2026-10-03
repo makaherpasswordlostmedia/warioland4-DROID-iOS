@@ -82,6 +82,11 @@ jobs:
           echo "${ROM_MD5_US}  baserom_us.gba" | md5sum -c - \
             || { echo "::error::baserom_us.gba MD5 mismatch — wrong ROM version or corrupted download"; exit 1; }
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Extract assets from ROM (make extract)
         run: |
           python3 -m venv .venv
