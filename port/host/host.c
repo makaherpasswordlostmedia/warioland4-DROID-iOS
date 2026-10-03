@@ -9,12 +9,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
-#ifdef __ANDROID__
-#include <android/log.h>
-#define WL4_LOG(...) __android_log_print(ANDROID_LOG_INFO, "wl4", __VA_ARGS__)
-#else
+/* stderr is piped into logcat + the log file by jni.c (JNI_OnLoad), so plain fprintf is enough on every platform */
 #define WL4_LOG(...) (fprintf(stderr, "wl4: " __VA_ARGS__), fputc('\n', stderr))
-#endif
 
 struct w2c_env { w2c_wl4 *inst; };
 
