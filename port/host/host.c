@@ -4,6 +4,7 @@
 #include "../hal/hal.h"
 #include "host.h"
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -87,10 +88,22 @@ int wl4_start(const uint8_t *rom, size_t size) {
     g_stop = 0; g_paused = 0; g_frames = 0; g_running = 1;
     return pthread_create(&g_thread, NULL, game_main, NULL) ? -3 : 0;
 }
+#ifdef __ANDROID__
+/* bionic has no pthread_cancel(): kill the stuck game thread with a signal whose handler exits the thread */
+static void wl4_kill_handler(int sig) { (void)sig; g_running = 0; pthread_exit(NULL); }
+static void wl4_force_stop(void) {
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = wl4_kill_handler; sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, NULL);
+    pthread_kill(g_thread, SIGUSR2);
+}
+#else
+static void wl4_force_stop(void) { pthread_cancel(g_thread); }
+#endif
 void wl4_stop(void) {
     g_stop = 1;
     for (int i = 0; i < 100 && g_running; i++) { struct timespec ts = {0, 10000000}; nanosleep(&ts, NULL); }
-    if (g_running) pthread_cancel(g_thread);            /* game stuck in a loop that never reaches a frame boundary */
+    if (g_running) wl4_force_stop();                    /* game stuck in a loop that never reaches a frame boundary */
     pthread_join(g_thread, NULL); g_running = 0;
 }
 void wl4_pause(int p) { g_paused = p; }
