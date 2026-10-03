@@ -217,9 +217,14 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # default is "tools platform-tools"; the legacy `tools` package no longer
+          # exists in the repo and makes sdkmanager exit 1 ("Failed to find package 'tools'")
+          packages: ""
 
       - name: Install SDK / NDK / CMake components
         run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager \
             "platforms;android-34" \
