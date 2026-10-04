@@ -54,4 +54,5 @@ if [ -n "${WABT_SRC:-}" ]; then
 fi
 for need in wasm-rt.h wasm-rt-impl.c; do [ -f "$OUT/wasm2c/$need" ] || { echo "missing wasm2c runtime file $need (set WABT_SRC to a wabt checkout)"; exit 1; }; done
 python3 "$REPO/port/tools/patch_w2c_io.py" "$OUT/wasm2c/wl4.c"
+python3 "$REPO/port/tools/patch_w2c_trace.py" "$OUT/wasm2c/wl4.c"
 echo "done: $OUT/wasm2c/wl4.c"
