@@ -618,6 +618,8 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/wario/puffy.c', r'^void ResolveWarioFloorCollision\(void\);', 'u8 ResolveWarioFloorCollision(void);'),
     # SampleFreqSet busy-waits on VCOUNT through a raw memory read; nothing advances VCOUNT in wasm memory, so it spun forever
     # (black screen, frames=0).  Read it through the HAL, which steps the scanline.
+    # BuildMainSaveWorkingBuffer is void; the old fn-pointer cast read a stale r0.  A plain call can't assign a void result.
+    ('src/minigame.c', r'result = BuildMainSaveWorkingBuffer\(\);', 'BuildMainSaveWorkingBuffer(); result = 0;'),
     ('src/m4a.c', r'\*\(vu8 \*\)REG_ADDR_VCOUNT', '((u8)hal_poll_vcount())'),
     # SoundMainBTM is really Clear64byte (called as void(void *) through the jump table): wasm checks indirect-call signatures
     ('include/gba/m4a.h', r'void SoundMainBTM\(void\);', 'void SoundMainBTM(void *);'),
