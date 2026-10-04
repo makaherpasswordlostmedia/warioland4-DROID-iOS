@@ -632,6 +632,10 @@ PATCHES = [   # (relative path, regex, replacement)
     # as u8(*)(void).  ARM ignores the unused r0; wasm traps (trap 6) on the signature mismatch in FinalizeWarioUpdate.
     ('include/wario.h', r'^(typedef void \(\*WarioInteractionFunc\)\(u8\);)', r'\1\ntypedef void (*WarioVoidFunc)(void);'),
     ('include/wario.h', r'^extern WarioPoseFunc (sUnk_82DE(?:CD0|D00|D60|D90))\[\];', r'extern WarioVoidFunc \1[];'),
+    # Diagnostic + guard: log the pose before the indirect call (host prints it when it changes) and refuse an index past the
+    # 79-slot ROM table instead of trapping.  The last "trace[1]" line before a call_indirect trap names the offending pose.
+    ('src/wario/normal.c', r'pose = sWarioNormalPoseTable\[gWarioData\.pose\]\(\);',
+     '{ u32 poseIdx = gWarioData.pose; hal_trace_val(1, poseIdx); if (poseIdx >= 79) { pose = 0xFF; } else { pose = sWarioNormalPoseTable[poseIdx](); } }'),
     # --- uninitialised register read: the original asm("" : "=r"(p)) just named r4 (= &gStageEntrySelectedStage);
     # with the asm gone `p` is undef and clang turns the *p path into wasm `unreachable` (trap 5 on stage entry).
     ('src/stage_entry.c', r'(u8 \*normalSelectedStage);(\s*\n\s*);', r'\1 = &gStageEntrySelectedStage;\2'),
