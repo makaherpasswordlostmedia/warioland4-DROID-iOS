@@ -29,6 +29,7 @@ import os
 STRICT = os.environ.get('PORT_STRICT') == '1'
 SITE_IDS = []
 MACRO_NOOPS = []
+TIED_ASM = []
 AUDIT = []
 untranslated = Counter()
 CUR = ['', '']
@@ -488,6 +489,20 @@ def fix_asm(m):
         USED_OVERRIDES.add((CUR[0], _ln))
         return _ov[1]
     if tpl.strip() == '':
+        # An empty template with a tied input (`: "=r"(out) : "0"(in)`) is an assignment `out = in`
+        # in disguise (agbcc register steering).  Dropping it leaves `out` uninitialised and clang
+        # then turns the later use into wasm `unreachable`.  Emit the assignment instead.
+        parts = re.split(r'(?<!:):(?!:)', cons)
+        if len(parts) >= 3:
+            outs = [(c, e) for c, e in re.findall(r'"([^"]*)"\s*\(\s*([^()]*?)\s*\)', parts[1])]
+            ins = re.findall(r'"([^"]*)"\s*\(\s*((?:[^()]|\([^()]*\))*?)\s*\)', parts[2])
+            asg = []
+            for c, e in ins:
+                if c.isdigit() and int(c) < len(outs) and outs[int(c)][0].startswith('='):
+                    asg.append(f'{outs[int(c)][1]} = {e};')
+            if asg:
+                TIED_ASM.append(f'{CUR[0]}:{_ln}')
+                return ' '.join(asg)
         return ';'                                    # pure optimizer barrier
     if _macro_only(tpl):
         MACRO_NOOPS.append(f'{CUR[0]}:{_ln}')
@@ -735,6 +750,7 @@ if _missing:
 _miss = sorted(set(LDSYMS) - set(LD_REWRITTEN))
 (out / "LDSYMS_UNREWRITTEN.txt").write_text("\n".join(_miss) + "\n")
 print(f"linker.ld symbols: {len(LD_REWRITTEN)}/{len(LDSYMS)} rewritten to real IWRAM addresses ({len(_miss)} never declared, see LDSYMS_UNREWRITTEN.txt)")
+print(f"tied empty-asm sites rewritten to assignments: {len(TIED_ASM)}")
 print(f"cast calls rewritten to plain calls: {sum(CASTCALL_FIXED.values())} ({dict(CASTCALL_FIXED)})")
 print(f"audit: {len(AUDIT)} translated asm site(s) dropped an output operand (see AUDIT.txt)")
 print(f"portified {n} files -> {out}; {len(untranslated)} inline-asm sites left for manual port (see UNTRANSLATED.txt)")
