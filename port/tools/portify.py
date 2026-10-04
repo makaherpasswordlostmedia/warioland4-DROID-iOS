@@ -613,6 +613,9 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/sprite_collision.c', r'gSpriteCollisionFlags & COLLISION_BELOW\b', 'gSpriteCollisionFlags & SPRITE_COLLISION_BELOW'),
     ('src/sprite_collision.c', r'(gSpriteData\[slot\]\.pose = SPOSE_PUSHED_RIGHT_INIT)\s*\n', r'\1;\n'),
     ('src/sprite_ai/moguramen.c', r'extern void func_8023BFC\(\);', 'extern void func_8023BFC(u16, u16);'),
+    # --- uninitialised register read: the original asm("" : "=r"(p)) just named r4 (= &gStageEntrySelectedStage);
+    # with the asm gone `p` is undef and clang turns the *p path into wasm `unreachable` (trap 5 on stage entry).
+    ('src/stage_entry.c', r'(u8 \*normalSelectedStage);(\s*\n\s*);', r'\1 = &gStageEntrySelectedStage;\2'),
     ('src/sprite_ai/cractus.c', r'^    SpriteUtilFindSprite\(219, 0\);\n(?=    /\* Preserve the signed-return)', ''),
     ('src/game_screen_helpers.c', r'^            DecompressRoomBackground\(0, selectedData, overlayBuffer\);\n(?=\s*/\* Preserve the decompressed size)', ''),
     ('src/wario/puffy.c', r'^void ResolveWarioFloorCollision\(void\);', 'u8 ResolveWarioFloorCollision(void);'),
