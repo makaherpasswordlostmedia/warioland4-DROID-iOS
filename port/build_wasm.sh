@@ -35,6 +35,12 @@ while IFS= read -r f; do
 done < <(find "$OUT/p/src" -name '*.c' | sort)
 echo "compiled $ok files, $bad failed (see $OUT/FAILED.txt, errors.log)"
 
+# Wario's pose/handler tables are raw ARM addresses in the blobs; wasm call_indirect needs real table
+# indices.  Generate C tables (names only) from the user's ROM.  Must precede the nm step below so
+# gen_blobs.py skips the aliases for these symbols.
+python3 "$REPO/port/tools/gen_wario_tables.py" "$REPO" "$ROM" "$OUT/wario_tables.c"
+$CC $CFLAGS -c "$OUT/wario_tables.c" -o "$OUT/obj/wario_tables.o"
+
 # ROM blobs: alias every named blob that no compiled C data file already defines
 "$WASI_SDK/bin/llvm-nm" --defined-only -g "$OUT"/obj/*.o 2>/dev/null | awk 'NF==3{print $3}' > "$OUT/defined.txt"
 python3 "$REPO/port/tools/gen_blobs.py" "$REPO" "$OUT/blobs.S" "$ROMSIZE" "$OUT/defined.txt"
