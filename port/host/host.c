@@ -48,6 +48,12 @@ void wl4_trap(wasm_rt_trap_t code) {
 /* ---------- imports the wasm module expects ---------- */
 void w2c_env_hal_dma_set(struct w2c_env *e, u32 ch, u32 src, u32 dst, u32 ctl) { (void)e; g_dmas++; hal_dma_set((int)ch, src, dst, ctl); }
 void w2c_env_LZ77UnCompVram(struct w2c_env *e, u32 src, u32 dst) { (void)e; bios_LZ77UnComp(src, dst); }
+/* Diagnostics from the wasm side: logs a value whenever it changes (tag 1 = Wario normal pose index). */
+void w2c_env_hal_trace_val(struct w2c_env *e, u32 tag, u32 val) {
+    static u32 last[8]; static int init;
+    (void)e; if (!init) { memset(last, 0xFF, sizeof last); init = 1; }
+    if (tag < 8 && last[tag] != val) { last[tag] = val; WL4_LOG("trace[%u] = %u (frame %d)", tag, val, g_frames); }
+}
 static char g_siteSeen[8192];
 void w2c_env_hal_unported_asm(struct w2c_env *e, u32 site) {
     (void)e; if (site < sizeof g_siteSeen && !g_siteSeen[site]) { g_siteSeen[site] = 1; WL4_LOG("UNPORTED inline asm site #%u executed (see ASM_SITES.txt)", site); }
