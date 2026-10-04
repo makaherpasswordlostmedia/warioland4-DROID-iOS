@@ -619,6 +619,8 @@ PATCHES = [   # (relative path, regex, replacement)
     # SampleFreqSet busy-waits on VCOUNT through a raw memory read; nothing advances VCOUNT in wasm memory, so it spun forever
     # (black screen, frames=0).  Read it through the HAL, which steps the scanline.
     ('src/m4a.c', r'\*\(vu8 \*\)REG_ADDR_VCOUNT', '((u8)hal_poll_vcount())'),
+    # SoundMainBTM is really Clear64byte (called as void(void *) through the jump table): wasm checks indirect-call signatures
+    ('include/gba/m4a.h', r'void SoundMainBTM\(void\);', 'void SoundMainBTM(void *);'),
     # linker.ld `gNumMusicPlayers = 8; gMaxLines = 70;` are absolute *values* used through their address; undefined symbols were 0
     ('include/gba/m4a.h', r'#define NUM_MUSIC_PLAYERS \(\(u16\)gNumMusicPlayers\)', '#define NUM_MUSIC_PLAYERS 8'),
     ('include/gba/m4a.h', r'#define MAX_LINES \(\(u32\)gMaxLines\)', '#define MAX_LINES 70'),
