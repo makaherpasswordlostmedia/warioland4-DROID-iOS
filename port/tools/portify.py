@@ -669,6 +669,18 @@ PATCHES = [   # (relative path, regex, replacement)
     # (gSubGameMode = 6) just when gCollectedKeyzer != 1 -- with the Keyzer collected nothing did, Wario stayed disabled for the
     # whole 16.7 s pause and the timer ran out.  Start the exit unconditionally (the Keyzer sprite sets the very same values).
     ('src/sprite_ai/vortex.c', r'if \(gCollectedKeyzer != 1\) \{\n(\s*gSubGameMode = 6;\n\s*gSpriteAiDropTimer = 0;\n\s*gStageExitType = 2;\n)(\s*)\}', r'{\n\1\2}'),
+    # DrawHomerunDerby keeps `register u8 *stackFrame asm("sp")` and addresses affine PB/PC/PD as sp+2/+4/+6, i.e. the elements
+    # after the local u16 affineMatrix[0] at the bottom of its frame.  Under wasm the `sp` register variable is undefined, so
+    # clang turned every use into `unreachable` (wasm trap 5 in the Home Run Derby minigame).  Point it at the real array.
+    ('src/minigames/homerun_derby.c', r'(?<!\*)\bstackFrame\b', '((u8 *) affineMatrix)'),
+    # defensive: these pick a table with `if (x == 1) p = A; if (x == 2) p = B;` and read p unconditionally.  On ARM an unexpected
+    # x used a stale register; under clang an uninitialised read is undef and can collapse the path to `unreachable`.  Make the
+    # second test a catch-all so p is always set (identical for the expected values).  Found with gcc -Wmaybe-uninitialized.
+    ('src/minigames/homerun_derby.c', r'if \(byteValue == 2\)(\s*\{\s*frameData = sHomerunCameraOamMode2;)', r'if (byteValue != 1)\1'),
+    ('src/minigames/roulette/draw_roulette.c', r'if \(active == 2\)(\s*src = sRouletteMainState2Oam)', r'if (active != 1)\1'),
+    ('src/minigames/wario_hop.c', r'if \(active == 2\) \{(\s*frame = sUnk_870D890;)', r'if (active != 1) {\1'),
+    # UpdateRouletteResultTiles only sets src/dst for states 7/9/11 and then copies through them unconditionally
+    ('src/minigames/roulette/update_roulette_result_tiles.c', r'(CALC_SOURCE\(gRouletteBottomResult, sRouletteBottomResultTiles, 0x06017200\);\s*break;)', r'\1\n    default:\n        return;'),
     ('src/credits.c', r'while \(\(\*\(vu16 \*\)0x04000004 & 2\) == 0\) \{\s*\}', '/* port: HBlank-flag spin skipped (the HAL calls this at HBlank time) */'),
 ]
 
