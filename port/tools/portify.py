@@ -654,6 +654,43 @@ def _ld_macro(m):
     LD_REWRITTEN[name] += 1
     return f'#undef {name}\n#define {name} {body}'
 
+# ---- function-pointer-cast calls ------------------------------------------------------------------
+# The decomp writes `((int (*)(u8, u16, u8))CheckWarioVerticalCollision)(a, b, c)` to coax agbcc into a particular
+# register allocation.  Under clang the call goes through a prototype whose parameter types differ from the callee's
+# (u8 / s32 vs u32 / u16): wasm-ld cannot bitcast that and replaces the call by `<fn>_bitcast_invalid`, which is just
+# `unreachable` (wasm trap 5, e.g. CutsceneWarioDrawPoseOam in the intro cutscene).  A plain call lets C convert the args.
+CASTCALL = re.compile(r'\(\(\s*[\w\s\*]+?\(\*\)\s*\([^()]*\)\s*\)\s*(\w+)\s*\)\s*\(')
+PAD_ARGS = {'SpawnHighPriorityPrimarySprite': 5}      # callers pass 4 args (5th was a stale register on ARM)
+CASTCALL_FIXED = Counter()
+def _balanced_args(text, i):
+    """text[i] is just after '(' -> (args list, index after the matching ')')"""
+    depth, j, cur, args = 1, i, '', []
+    while j < len(text) and depth:
+        c = text[j]
+        if c == '(': depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0: break
+        if c == ',' and depth == 1: args.append(cur); cur = ''
+        else: cur += c
+        j += 1
+    if cur.strip() or args: args.append(cur)
+    return args, j + 1
+def fix_castcalls(text):
+    out, pos = [], 0
+    for m in CASTCALL.finditer(text):
+        if m.start() < pos: continue
+        name = m.group(1)
+        out.append(text[pos:m.start()]); CASTCALL_FIXED[name] += 1
+        if name in PAD_ARGS:
+            args, end = _balanced_args(text, m.end())
+            while len(args) < PAD_ARGS[name]: args.append(' 0')
+            out.append(name + '(' + ','.join(args) + ')'); pos = end
+        else:
+            out.append(name + '('); pos = m.end()
+    out.append(text[pos:])
+    return ''.join(out)
+
 n = 0
 for sub in ("src", "include"):
     for p in (root / sub).rglob("*"):
@@ -670,6 +707,7 @@ for sub in ("src", "include"):
                 text = DMASET.sub(lambda m: DMASET_NEW, text)
                 text = '#include "port.h"\n' + text
             CUR[0] = str(p.relative_to(root)); text = fix(text); n += 1
+            text = fix_castcalls(text)
             text = IGN.sub(lambda m: m.group(1) + '()' if m.group(2).strip() != 'void' else m.group(0), text)
             for rp, rx, rep in PATCHES:
                 if CUR[0] == rp: text = re.sub(rx, rep, text, flags=re.M)
@@ -692,5 +730,6 @@ if _missing:
 _miss = sorted(set(LDSYMS) - set(LD_REWRITTEN))
 (out / "LDSYMS_UNREWRITTEN.txt").write_text("\n".join(_miss) + "\n")
 print(f"linker.ld symbols: {len(LD_REWRITTEN)}/{len(LDSYMS)} rewritten to real IWRAM addresses ({len(_miss)} never declared, see LDSYMS_UNREWRITTEN.txt)")
+print(f"cast calls rewritten to plain calls: {sum(CASTCALL_FIXED.values())} ({dict(CASTCALL_FIXED)})")
 print(f"audit: {len(AUDIT)} translated asm site(s) dropped an output operand (see AUDIT.txt)")
 print(f"portified {n} files -> {out}; {len(untranslated)} inline-asm sites left for manual port (see UNTRANSLATED.txt)")
