@@ -43,6 +43,11 @@ $CC -x assembler -I"$OUT" -c "$OUT/blobs.S" -o "$OUT/obj/blobs.o"
 # C sources that replace ARM-only parts (m4a mixer/sequencer, crt0, BIOS stubs) go in port/rt/*.c
 for f in "$REPO"/port/rt/*.c; do [ -f "$f" ] && $CC $CFLAGS -mbulk-memory -c "$f" -o "$OUT/obj/rt_$(basename "$f").o"; done
 
+# asm/data/*.s tables (palette-fade amounts/step limits, demo configs, ...) are not blobs and were never assembled:
+# their symbols resolved to address 0 and the file-select fade-in never finished (black screen).  Emit them as C.
+python3 "$REPO/port/tools/gen_asm_data.py" "$REPO" "$OUT/asm_data.c"
+$CC $CFLAGS -c "$OUT/asm_data.c" -o "$OUT/obj/asm_data.o"
+
 "$WASI_SDK/bin/wasm-ld" "$OUT"/obj/*.o -o "$OUT/wl4.wasm" --no-entry --allow-undefined --export-memory \
   --export=AgbMain --export=rom_image --export=InterruptCallbackCallVBlank --export=InterruptCallbackCallHBlank --export=InterruptCallbackCallVCount \
   --global-base=$GLOBAL_BASE -z stack-size=$STACK --initial-memory=$MEM_BYTES --max-memory=$MEM_BYTES --gc-sections
