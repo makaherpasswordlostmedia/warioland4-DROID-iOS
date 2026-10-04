@@ -15,5 +15,5 @@ add_library(wl4 SHARED
   ${CMAKE_BINARY_DIR}/stubs.c
   ${W2C}/wl4.c ${W2C_RT})
 target_include_directories(wl4 PRIVATE ${W2C} ${WL4_PORT_DIR}/host)
-target_compile_options(wl4 PRIVATE -O2 -w -fno-strict-aliasing -DWASM_RT_TRAP_HANDLER=wl4_trap)
+target_compile_options(wl4 PRIVATE -O2 -w -fno-strict-aliasing -DWASM_RT_TRAP_HANDLER=wl4_trap -DWL4_TRACE=1)
 target_link_libraries(wl4 log m)
