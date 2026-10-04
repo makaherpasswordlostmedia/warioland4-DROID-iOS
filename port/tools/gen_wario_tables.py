@@ -105,7 +105,14 @@ for idx, f in enumerate(FILES):
                 die(f'normal: {p} missing')
     else:
         pick = [rest[0], rest[1], rest[-3], rest[-2], rest[-1]]
-    names = [fn[0], fn[si]] + pick
+    # normal.c: the request slot is ApplyNormalWarioPoseTransition (it decodes 0xFE/0xFD, then calls SetNormalWarioPose);
+    # the Set*Pose regex doesn't match it, so pin it explicitly.  Other reactions' slot is their Set*Pose.
+    req = fn[si]
+    if f == 'normal':
+        if 'ApplyNormalWarioPoseTransition' not in fn:
+            die('normal: ApplyNormalWarioPoseTransition missing')
+        req = 'ApplyNormalWarioPoseTransition'
+    names = [fn[0], req] + pick
     for (sym, _, _), nm in zip(REACTION_TABLES, names):
         reaction_names[sym].append(nm)
     # ascending-address sanity: the seven addresses of this reaction must ascend in this order
