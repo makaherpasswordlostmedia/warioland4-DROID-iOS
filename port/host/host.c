@@ -14,6 +14,10 @@
 
 struct w2c_env { w2c_wl4 *inst; };
 
+/* Last wasm functions entered (filled by the FUNC_PROLOGUE hook that port/tools/patch_w2c_trace.py adds to wl4.c). */
+const char *volatile g_wl4_trace[16]; volatile unsigned g_wl4_trace_i;
+extern volatile int g_hal_stage, g_hal_line; extern volatile unsigned g_hal_irq_calls[3];
+
 static w2c_wl4 g_inst;
 static struct w2c_env g_env;
 static pthread_t g_thread;
@@ -57,7 +61,12 @@ void w2c_env_hal_syscall(struct w2c_env *e, u32 num) {
 }
 
 /* ---------- HAL callbacks into wasm ---------- */
-static void cb_vblank(void) { w2c_wl4_InterruptCallbackCallVBlank(&g_inst); }
+static void cb_vblank(void) {
+    static int n; if (n < 3) WL4_LOG("vblank callback #%d: enter (frame %d)", n + 1, g_frames);
+    w2c_wl4_InterruptCallbackCallVBlank(&g_inst);
+    if (n < 3) WL4_LOG("vblank callback #%d: done", n + 1);
+    n++;
+}
 static void cb_hblank(void) { w2c_wl4_InterruptCallbackCallHBlank(&g_inst); }
 static void cb_vcount(void) { w2c_wl4_InterruptCallbackCallVCount(&g_inst); }
 static void cb_frame(void) {
@@ -103,6 +112,12 @@ static void *watchdog(void *arg) {
             WL4_LOG("alive t=%ds frames=%u%s polls=%u syscalls=%u dma=%u DISPCNT=%04x IE=%04x IME=%u", t, f, f == lastFrames ? " (STALLED)" : "",
                     g_polls, g_syscalls, g_dmas, g_inst.w2c_memory.data ? rd16(IO_DISPCNT) : 0, g_inst.w2c_memory.data ? rd16(IO_IE) : 0,
                     g_inst.w2c_memory.data ? (rd16(IO_IME) & 1) : 0);
+        if (f == lastFrames && g_running) {
+            WL4_LOG("  stall: hal line=%d stage=%d irq(v/h/c)=%u/%u/%u", g_hal_line, g_hal_stage, g_hal_irq_calls[0], g_hal_irq_calls[1], g_hal_irq_calls[2]);
+            char buf[512]; int o = 0; unsigned ti = g_wl4_trace_i;
+            for (int i = 0; i < 16 && o < (int)sizeof buf - 64; i++) { const char *nm = g_wl4_trace[(ti - 1 - i) & 15]; if (nm) o += snprintf(buf + o, sizeof buf - (size_t)o, "%s%s", i ? " < " : "", nm); }
+            WL4_LOG("  stall: last wasm funcs: %s", o ? buf : "(trace hook not compiled in)");
+        }
         lastFrames = f;
     }
     return NULL;
