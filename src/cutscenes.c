@@ -1187,8 +1187,8 @@ void UpdateLayeredBackgroundTransition(s32 inputFrame)
     }
     else
     {
-      register s32 elseOffset asm("r2");
-      asm("" : "=r"(elseOffset));
+      /* port fix: r2 still held gCutsceneBackgroundHorizontalOffset (signedMax) here; the empty asm output was undefined under clang */
+      s32 elseOffset = gCutsceneBackgroundHorizontalOffset;
       destination = AppendCutsceneOamTemplate((u16 *) oam, destination, (-elseOffset) + 128, wave + 64);
     }
       FinalizeCutsceneOamBuffer(destination);

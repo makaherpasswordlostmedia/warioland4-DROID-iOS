@@ -1457,19 +1457,17 @@ u32 FileSelectSubroutine(void)
     switch (gSubGameMode) {
         case 0:
         {
-            register s16 *modePointer asm("r4");
             register u32 nextMode asm("r1");
-
             register u32 initResult asm("r0");
 
             initResult = InitializeFileSelect();
-            /* Preserve the original agbcc allocation/lifetime; emits no instructions. */
-            asm("" : "=r"(modePointer));
             nextMode = 1;
             if (initResult != 0) {
                 nextMode = 8;
             }
-            *modePointer = nextMode;
+            /* port fix: the original asm("" : "=r"(modePointer)) left the pointer undefined under clang
+             * (store through undef -> wasm `unreachable`); r4 held &gSubGameMode, so write it directly. */
+            gSubGameMode = nextMode;
             break;
         }
         case 1:
