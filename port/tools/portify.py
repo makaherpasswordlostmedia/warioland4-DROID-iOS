@@ -619,10 +619,38 @@ PATCHES = [   # (relative path, regex, replacement)
     # SampleFreqSet busy-waits on VCOUNT through a raw memory read; nothing advances VCOUNT in wasm memory, so it spun forever
     # (black screen, frames=0).  Read it through the HAL, which steps the scanline.
     ('src/m4a.c', r'\*\(vu8 \*\)REG_ADDR_VCOUNT', '((u8)hal_poll_vcount())'),
+    # linker.ld `gNumMusicPlayers = 8; gMaxLines = 70;` are absolute *values* used through their address; undefined symbols were 0
+    ('include/gba/m4a.h', r'#define NUM_MUSIC_PLAYERS \(\(u16\)gNumMusicPlayers\)', '#define NUM_MUSIC_PLAYERS 8'),
+    ('include/gba/m4a.h', r'#define MAX_LINES \(\(u32\)gMaxLines\)', '#define MAX_LINES 70'),
+    # linker.ld `sRouletteInitialTileSin = sSinCosTable + 0x1C0;` (an address inside the sine table)
+    ('include/minigames/roulette.h', r'extern const s16 sRouletteInitialTileSin;', '#include "fixed_point.h"\n#define sRouletteInitialTileSin (*(const s16 *)((const char *)sSinCosTable + 0x1C0))'),
     # same class of bug: raw busy-waits on registers only the HAL can advance
     ('src/file_select.c', r'\(u16\)\(\*\(vu16 \*\)0x04000006 - 21\)', '(u16)(hal_poll_vcount() - 21)'),
     ('src/credits.c', r'while \(\(\*\(vu16 \*\)0x04000004 & 2\) == 0\) \{\s*\}', '/* port: HBlank-flag spin skipped (the HAL calls this at HBlank time) */'),
 ]
+
+# ---- linker.ld symbols ------------------------------------------------------------------------------
+# The ROM build gives ~550 IWRAM variables their address in linker.ld (`. = 0x0018; gResetSaveFile = .;`) and the C
+# only has `extern` declarations.  wasm-ld has no such script: with --allow-undefined every one of them resolved to
+# address 0, so gResetSaveFile, gRandomSeed, gCurrentStageID ... all aliased the same bytes (AgbMain's
+# `gRandomSeed += 1` made gResetSaveFile non-zero on the 2nd frame and the main loop exited -> black screen).
+# Rewrite each such `extern T name;` / `extern T name[N];` into a macro that accesses the real GBA IWRAM address,
+# the same place raw `*(u16 *)0x03000xxx` accesses and DMA/BIOS fills see.
+IWRAM_BASE = 0x03000000
+_ld = (root / 'linker.ld').read_text()
+_iw = _ld[_ld.index('iwram (NOLOAD)'):]; _iw = _iw[:_iw.index('} > IWRAM')]
+LDSYMS = {n: IWRAM_BASE + int(a, 16) for a, n in re.findall(r'\.\s*=\s*(0x[0-9a-fA-F]+);\s*(\w+)\s*=\s*\.;', _iw)}
+LD_DECL = re.compile(r'^[ \t]*extern[ \t]+([^;(){},]*?)[ \t]*\b(\w+)\b((?:[ \t]*\[[^\]]*\])*)[ \t]*;[ \t]*$', re.M)
+LD_REWRITTEN = Counter()
+def _ld_macro(m):
+    ty, name, dims = m.group(1).strip(), m.group(2), re.findall(r'\[[^\]]*\]', m.group(3))
+    if name not in LDSYMS or not ty: return m.group(0)
+    addr = '0x%08X' % LDSYMS[name]
+    if not dims: body = f'(*({ty} *){addr})'
+    elif len(dims) == 1: body = f'(({ty} *){addr})'
+    else: body = f'(({ty} (*){"".join(dims[1:])}){addr})'
+    LD_REWRITTEN[name] += 1
+    return f'#undef {name}\n#define {name} {body}'
 
 n = 0
 for sub in ("src", "include"):
@@ -643,6 +671,7 @@ for sub in ("src", "include"):
             text = IGN.sub(lambda m: m.group(1) + '()' if m.group(2).strip() != 'void' else m.group(0), text)
             for rp, rx, rep in PATCHES:
                 if CUR[0] == rp: text = re.sub(rx, rep, text, flags=re.M)
+            text = LD_DECL.sub(_ld_macro, text)
             dst.write_text(text)
         else:
             shutil.copy2(p, dst)
@@ -658,5 +687,8 @@ if _missing:
 (out / "AUDIT.txt").write_text("\n".join(AUDIT) + "\n")
 (out / "UNTRANSLATED.txt").write_text(
     "\n".join(f"{f}:{l}\t{t}" for (f, l, t), c in sorted(untranslated.items())) + "\n")
+_miss = sorted(set(LDSYMS) - set(LD_REWRITTEN))
+(out / "LDSYMS_UNREWRITTEN.txt").write_text("\n".join(_miss) + "\n")
+print(f"linker.ld symbols: {len(LD_REWRITTEN)}/{len(LDSYMS)} rewritten to real IWRAM addresses ({len(_miss)} never declared, see LDSYMS_UNREWRITTEN.txt)")
 print(f"audit: {len(AUDIT)} translated asm site(s) dropped an output operand (see AUDIT.txt)")
 print(f"portified {n} files -> {out}; {len(untranslated)} inline-asm sites left for manual port (see UNTRANSLATED.txt)")
