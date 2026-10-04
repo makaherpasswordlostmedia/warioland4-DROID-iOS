@@ -619,6 +619,9 @@ PATCHES = [   # (relative path, regex, replacement)
     # SampleFreqSet busy-waits on VCOUNT through a raw memory read; nothing advances VCOUNT in wasm memory, so it spun forever
     # (black screen, frames=0).  Read it through the HAL, which steps the scanline.
     ('src/m4a.c', r'\*\(vu8 \*\)REG_ADDR_VCOUNT', '((u8)hal_poll_vcount())'),
+    # same class of bug: raw busy-waits on registers only the HAL can advance
+    ('src/file_select.c', r'\(u16\)\(\*\(vu16 \*\)0x04000006 - 21\)', '(u16)(hal_poll_vcount() - 21)'),
+    ('src/credits.c', r'while \(\(\*\(vu16 \*\)0x04000004 & 2\) == 0\) \{\s*\}', '/* port: HBlank-flag spin skipped (the HAL calls this at HBlank time) */'),
 ]
 
 n = 0
