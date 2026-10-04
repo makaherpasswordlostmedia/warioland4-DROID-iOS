@@ -39,7 +39,7 @@ static void dump_trace(void) {
 void wl4_trap(wasm_rt_trap_t code) {
     const char *nm = code == WASM_RT_TRAP_OOB ? "out-of-bounds memory access" : code == WASM_RT_TRAP_INT_OVERFLOW ? "integer overflow"
                    : code == WASM_RT_TRAP_DIV_BY_ZERO ? "division by zero" : code == WASM_RT_TRAP_INVALID_CONVERSION ? "invalid conversion"
-                   : code == WASM_RT_TRAP_UNREACHABLE ? "unreachable" : "other (see wasm-rt.h)";
+                   : code == WASM_RT_TRAP_UNREACHABLE ? "unreachable" : (int)code == 6 ? "call_indirect (null entry / out of range / signature mismatch)" : "other (see wasm-rt.h)";
     WL4_LOG("wasm trap %d: %s (game thread stopped)", (int)code, nm);
     dump_trace();
     g_running = 0; pthread_exit(NULL);
