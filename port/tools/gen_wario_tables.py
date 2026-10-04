@@ -214,6 +214,51 @@ def block_handlers():
     return [lut[x] for x in w]
 
 
+# --- secondary sprite AI table (src/score.c: aiTable[id]()) ---------------------------------------
+# 90 ROM addresses at 0x78F714 (blob_0x78F714-0x78F970.s).  Targets are, in ascending address == link order:
+#   UpdateBigBoardSecondarySprite (hud.c), then every AI function of secondary_sprite_ai.c in source order,
+#   minus the non-AI helpers below.  Verified against the ROM: spacing of consecutive targets matches the
+#   function sizes (0x14 wrappers, 0x2c timed animations, 0x48 bugle notes ...).
+SSAI_ROM = 0x78F714
+SSAI_LEN = 90
+SSAI_HELPERS = {
+    'ApplySecondarySpriteVerticalMotionTable', 'ApplySecondarySpriteScaleMotionTableA',
+    'ApplySecondarySpriteScaleMotionTableB', 'UpdateBugleNoteDriftMotion', 'ApplyBugleNoteRotatingAffine',
+    'ApplyBugleNotePulseAffine', 'PlayAllJewelPiecesCollectedJingle', 'ApplyJewelPieceIconAffine',
+    'ClampFallingSecondarySpriteAtBottom',
+}
+
+
+def secondary_sprite_ai():
+    lines = (repo / 'src' / 'secondary_sprite_ai.c').read_text().split('\n')
+    ai = []
+    for i, l in enumerate(lines[:-1]):
+        if lines[i + 1].strip() == '{' and not l.startswith((' ', '\t', '#')):
+            m = re.match(r'^(\S+) (\w+)\((.*)\)$', l)
+            if m and m.group(2) not in SSAI_HELPERS:
+                ai.append(m.group(2))
+    names = ['UpdateBigBoardSecondarySprite'] + ai
+    w = words(SSAI_ROM, SSAI_LEN)
+    if any(x & 1 == 0 or not (0x08000000 <= x < 0x08800000) for x in w):
+        die('sSecondarySpriteAITable: non-Thumb or out-of-ROM address (wrong ROM / wrong offset?)')
+    uniq = sorted(set(w))
+    if len(uniq) > len(names):
+        die(f'sSecondarySpriteAITable: {len(uniq)} unique targets but only {len(names)} candidate functions')
+    lut = dict(zip(uniq, names))
+    return [lut[x] for x in w]
+
+
+ssai = secondary_sprite_ai()
+L.append('/* secondary sprite AI: void (*)(void) */')
+L.append('typedef void (*SecondarySpriteAIFn)(void);')
+for nm in sorted(set(ssai)):
+    L.append(f'extern void {nm}(void);')
+L.append('')
+L.append(f'void (*const sSecondarySpriteAITable[{SSAI_LEN}])(void) = {{')
+L += [f'    {n},' for n in ssai]
+L.append('};')
+L.append('')
+
 blk = block_handlers()
 L.append('/* block collision handlers: s32 (*)(struct BlockCollisionContext *) */')
 L.append('typedef s32 (*BlockCollisionHandlerFn)(void *);')
