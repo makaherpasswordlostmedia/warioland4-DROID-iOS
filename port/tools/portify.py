@@ -653,6 +653,10 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/m4a.c', r'\*\(vu8 \*\)REG_ADDR_VCOUNT', '((u8)hal_poll_vcount())'),
     # SoundMainBTM is really Clear64byte (called as void(void *) through the jump table): wasm checks indirect-call signatures
     ('include/gba/m4a.h', r'void SoundMainBTM\(void\);', 'void SoundMainBTM(void *);'),
+    # MPlayMain(mplayInfo) is chained through SoundInfo.func/intp and ply_note(noteIdx, mplayInfo, track) is called through
+    # SoundInfo.plynote: the ported C versions in port/rt/rt.c have these real signatures (wasm checks them on call_indirect)
+    ('include/gba/m4a.h', r'void MPlayMain\(void\);', 'void MPlayMain(struct MusicPlayerInfo *);'),
+    ('include/gba/m4a.h', r'void ply_note\(struct MusicPlayerInfo \*, struct MusicPlayerTrack \*\);', 'void ply_note(u32, struct MusicPlayerInfo *, struct MusicPlayerTrack *);'),
     # linker.ld `gNumMusicPlayers = 8; gMaxLines = 70;` are absolute *values* used through their address; undefined symbols were 0
     ('include/gba/m4a.h', r'#define NUM_MUSIC_PLAYERS \(\(u16\)gNumMusicPlayers\)', '#define NUM_MUSIC_PLAYERS 8'),
     ('include/gba/m4a.h', r'#define MAX_LINES \(\(u32\)gMaxLines\)', '#define MAX_LINES 70'),
