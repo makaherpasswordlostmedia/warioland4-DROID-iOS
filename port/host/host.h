@@ -10,4 +10,6 @@ void wl4_load_save(const uint8_t *data, size_t n);  /* call before wl4_start */
 int  wl4_read_save(uint8_t *out64k);               /* current SRAM contents; persist this */
 int  wl4_running(void);
 int  wl4_copy_frame(uint32_t *out240x160);         /* returns frame counter */
+void wl4_ring_write(int fd);                       /* dump the flight recorder to fd (signal-handler safe-ish) */
+void wl4_set_dump_path(const char *path);          /* where the stall/trap memory snapshot goes */
 #endif
