@@ -16,3 +16,22 @@ extern void *const sMPlayJumpTableTemplate[];
 void MPlayJumpTableCopy(MPlayFunc *dst) { for (int i = 0; i < 0x24; i++) dst[i] = (MPlayFunc)sMPlayJumpTableTemplate[i]; }
 /* high 32 bits of a 32x32 -> 64 bit unsigned multiply (asm: umull) */
 unsigned umul3232H32(unsigned a, unsigned b) { return (unsigned)(((unsigned long long)a * b) >> 32); }
+
+/* ---- jump-table targets that Clear64byte()/ClearChain() reach through call_indirect ------------------------------
+ * wasm checks the callee's signature on every indirect call.  These two were asm-only (= wasm imports whose declared
+ * type did not match the call site: SoundMainBTM was declared `void(void)` but is called as `void(void *)`), so
+ * m4aSoundInit -> MPlayOpen -> Clear64byte trapped with CALL_INDIRECT as soon as NUM_MUSIC_PLAYERS became non-zero. */
+/* asm SoundMainBTM: zero 64 bytes at r0 (it is the m4a "Clear64byte" routine, not the mixer) */
+void SoundMainBTM(void *dst) { unsigned *p = (unsigned *)dst; for (int i = 0; i < 16; i++) p[i] = 0; }
+/* asm RealClearChain: unlink a note channel from its track's doubly linked chain */
+void RealClearChain(void *x) {
+    unsigned char *c = (unsigned char *)x;
+    unsigned parent = *(unsigned *)(c + 0x2C);
+    if (!parent) return;
+    unsigned next = *(unsigned *)(c + 0x34), prev = *(unsigned *)(c + 0x30);
+    if (prev) *(unsigned *)(prev + 0x34) = next; else *(unsigned *)(parent + 0x20) = next;
+    if (next) *(unsigned *)(next + 0x30) = prev;
+    *(unsigned *)(c + 0x2C) = 0;
+}
+/* The PCM mixer / sequencer (SoundMain, MPlayMain, ply_*) are not ported yet: no audio.  VSync only feeds the mixer's DMA. */
+void m4aSoundVSync(void) {}
