@@ -11,9 +11,11 @@ Mapping rule (verified, every file asserts it):
   after the file's handler function.  Duplicated slots (several poses sharing a function)
   fall out of the address lookup, no guessing from enum names.
   The six per-reaction tables are positional:
-    handler = first function, request = Set*Pose, then
-    ECD0 = motion, ED00 = collision, ED30 = graphics/draw(u8), ED60 = music/anim, ED90 = hitbox
-    (non-pose helpers in between, e.g. CheckZombieWarioFloor, are skipped via SKIP).
+    handler = first function, request = Set*Pose, ECD0 = rest[0] (motion), ED00 = rest[1] (collision),
+    and the last three functions of the file are ED30 = graphics/draw(u8), ED60 = music, ED90 = hitbox.
+    Anything in between is a helper (ResolveWarioWater*Collision, CheckZombieWarioFloor, ...).
+  The call-site type of every table is then checked against the real signature: wasm's call_indirect
+  traps on a return-type or arity mismatch, so a wrong guess fails the build instead of a playthrough.
 
 Usage: gen_wario_tables.py <repo> <baserom.gba> <out.c>
 """
@@ -52,7 +54,8 @@ POSE_TABLES = [  # file index, symbol, rom start, rom end
     (11, 'sWarioMaskPoseTable', 0x2DF08C, 0x2DF094),
 ]
 
-DEF = re.compile(r'^(?:static\s+)?(?:const\s+)?[A-Za-z_][A-Za-z0-9_\s\*]*?\b([A-Za-z_]\w*)\([^;{]*\)\s*$')
+DEF = re.compile(r'^((?:static\s+)?(?:const\s+)?[A-Za-z_][A-Za-z0-9_\s\*]*?)\b([A-Za-z_]\w*)\(([^;{]*)\)\s*$')
+SIG = {}
 
 
 def source_functions(name):
@@ -62,7 +65,8 @@ def source_functions(name):
         if lines[i + 1].strip() == '{' and not l.startswith((' ', '\t', '#')):
             m = DEF.match(l)
             if m:
-                res.append(m.group(1))
+                res.append(m.group(2))
+                SIG[m.group(2)] = (m.group(1).strip(), m.group(3).strip())
     return res
 
 
@@ -93,14 +97,14 @@ for idx, f in enumerate(FILES):
     rest = [x for x in fn[si + 1:] if x not in SKIP]
     if len(rest) < 5:
         die(f'{f}: expected >=5 functions after {fn[si]}, got {rest}')
-    # normal: movement, collision, ..., draw, music, hitbox (last three of the reaction-visible set)
     if f == 'normal':
+        # normal.c continues with collision/tile helpers after the hitbox function
         pick = [rest[0], rest[1], 'DrawNormalWario', 'UpdateWarioMusicEffects', 'UpdateWarioHitbox']
         for p in pick:
             if p not in rest:
                 die(f'normal: {p} missing')
     else:
-        pick = rest[:5]
+        pick = [rest[0], rest[1], rest[-3], rest[-2], rest[-1]]
     names = [fn[0], fn[si]] + pick
     for (sym, _, _), nm in zip(REACTION_TABLES, names):
         reaction_names[sym].append(nm)
@@ -126,6 +130,28 @@ for idx, sym, a, b in POSE_TABLES:
         die(f'{sym}: non-Thumb or out-of-ROM address')
     lut = dict(zip(uniq, cand))
     pose_names[sym] = [lut[x] for x in w]
+
+# --- signature check against how the decomp calls each table ---------------------------
+def argc(sig):
+    a = sig[1]
+    return 0 if a in ('', 'void') else len(a.split(','))
+
+CALLSITE = {   # table -> (return type, arg count) used by the callers
+    'sWarioPoseHandlerTable': ('u8', 0), 'sWarioPoseRequestFuncTable': ('void', 1),
+    'sUnk_82DECD0': ('void', 0), 'sUnk_82DED00': ('void', 0), 'sUnk_82DED30': ('void', 1),
+    'sUnk_82DED60': ('void', 0), 'sUnk_82DED90': ('void', 0),
+}
+for _, sym, _, _ in POSE_TABLES:
+    CALLSITE[sym] = ('u8', 0)
+problems = []
+for sym, lst in list(reaction_names.items()) + list(pose_names.items()):
+    want_ret, want_argc = CALLSITE[sym]
+    for i, nm in enumerate(lst):
+        ret, _a = SIG[nm]
+        if ret != want_ret or argc(SIG[nm]) != want_argc:
+            problems.append(f'{sym}[{i}] = {nm}: is {ret}({SIG[nm][1]}), callers use {want_ret}({want_argc} arg)')
+if problems:
+    die('signature mismatch (would trap in call_indirect):\n  ' + '\n  '.join(problems))
 
 # --- emit ------------------------------------------------------------------------------
 used = set()
