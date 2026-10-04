@@ -16,13 +16,27 @@ class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
     private val logFile get() = File(filesDir, "wl4.log")
     private val prevLogFile get() = File(filesDir, "wl4.prev.log")
+    private val prev2LogFile get() = File(filesDir, "wl4.prev2.log")
+    private val stallDump get() = File(filesDir, "wl4.log.stall.bin")   // written natively on stall / wasm trap
 
-    /* Previous session first, then the current one.  The native side truncates wl4.log on every start of this
-       activity, so a freeze followed by an app restart used to wipe exactly the log that mattered. */
+    /* Newest first: current, previous, the one before.  The native side truncates wl4.log on every start of this
+       activity, so sessions are rotated, but only if the game actually ran in them (opening the menu twice must not
+       push the interesting log out). */
     private fun logText(): String {
-        val prev = if (prevLogFile.exists()) "=== previous session ===\n" + prevLogFile.readText().takeLast(60_000) + "\n" else ""
-        val cur = if (logFile.exists()) "=== current session ===\n" + logFile.readText().takeLast(40_000) else ""
-        return if (prev.isEmpty() && cur.isEmpty()) "(log is empty)" else prev + cur
+        val sb = StringBuilder()
+        fun add(title: String, f: File, keep: Int) { if (f.exists() && f.length() > 0) sb.append("=== $title ===\n").append(f.readText().takeLast(keep)).append("\n") }
+        add("previous-2 session", prev2LogFile, 30_000)
+        add("previous session", prevLogFile, 90_000)
+        add("current session", logFile, 60_000)
+        return if (sb.isEmpty()) "(log is empty)" else sb.toString()
+    }
+    private fun saveStallDump() {
+        if (!stallDump.exists()) { Toast.makeText(this, "No stall dump yet", Toast.LENGTH_LONG).show(); return }
+        if (Build.VERSION.SDK_INT < 29) { Toast.makeText(this, "Needs Android 10+", Toast.LENGTH_LONG).show(); return }
+        val v = ContentValues().apply { put(MediaStore.Downloads.DISPLAY_NAME, "wl4_stall_${System.currentTimeMillis()}.bin"); put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream") }
+        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: return
+        contentResolver.openOutputStream(uri)?.use { o -> stallDump.inputStream().use { it.copyTo(o) } }
+        Toast.makeText(this, "Saved to Downloads", Toast.LENGTH_LONG).show()
     }
     private fun shareLog() {
         startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
@@ -40,8 +54,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
-        // keep the last session's log (only if it has real content) before the native side truncates wl4.log
-        if (logFile.exists() && logFile.length() > 200) { prevLogFile.delete(); logFile.copyTo(prevLogFile, overwrite = true) }
+        // rotate: keep the last two sessions in which the game really started, before the native side truncates wl4.log
+        if (logFile.exists() && logFile.readText().contains("game thread started")) {
+            if (prevLogFile.exists()) prevLogFile.copyTo(prev2LogFile, overwrite = true)
+            logFile.copyTo(prevLogFile, overwrite = true)
+        }
         Native.setLogPath(logFile.path)
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
@@ -53,7 +70,8 @@ class MainActivity : AppCompatActivity() {
         val play = Button(this).apply { text = "Play"; setOnClickListener { startActivity(Intent(this@MainActivity, GameActivity::class.java)) } }
         val share = Button(this).apply { text = "Share log"; setOnClickListener { shareLog() } }
         val save = Button(this).apply { text = "Save log to Downloads"; setOnClickListener { saveLogToDownloads() } }
-        col.addView(status); col.addView(pick); col.addView(play); col.addView(share); col.addView(save); setContentView(col)
+        val dump = Button(this).apply { text = "Save stall dump to Downloads"; setOnClickListener { saveStallDump() } }
+        col.addView(status); col.addView(pick); col.addView(play); col.addView(share); col.addView(save); col.addView(dump); setContentView(col)
         refresh()
     }
     private fun refresh() { status.text = if (romFile.exists()) "ROM ready (${romFile.length() / 1024} KB)" else "No ROM selected.\nThe app does not ship any game data." }
