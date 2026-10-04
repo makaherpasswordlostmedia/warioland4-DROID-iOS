@@ -656,6 +656,10 @@ PATCHES = [   # (relative path, regex, replacement)
     ('include/minigames/roulette.h', r'extern const s16 sRouletteInitialTileSin;', '#include "fixed_point.h"\n#define sRouletteInitialTileSin (*(const s16 *)((const char *)sSinCosTable + 0x1C0))'),
     # same class of bug: raw busy-waits on registers only the HAL can advance
     ('src/file_select.c', r'\(u16\)\(\*\(vu16 \*\)0x04000006 - 21\)', '(u16)(hal_poll_vcount() - 21)'),
+    # HBlank callbacks: the GBA build DMAs the callback's *code* into an IWRAM trampoline (gHBlankCallbackTrampoline) and
+    # registers `trampoline|1`.  In wasm a function pointer is a table index, so the DMA copied 512 junk bytes over IWRAM
+    # and the HBlank IRQ did call_indirect on 0x0300322d (wasm trap 6).  Register the real function directly.
+    ('src/hblank.c', r'(?s)\(\(volatile struct Dma3Regs_HBlankCallbackCopy\*\)0x040000D4\)->src = callback;.*?InterruptCallbackSetHBlank\(\(void \(\*\)\(\)\)\(1 \| \(\(s32\)\(&gHBlankCallbackTrampoline\)\)\)\);', 'InterruptCallbackSetHBlank(callback);'),
     ('src/credits.c', r'while \(\(\*\(vu16 \*\)0x04000004 & 2\) == 0\) \{\s*\}', '/* port: HBlank-flag spin skipped (the HAL calls this at HBlank time) */'),
 ]
 
