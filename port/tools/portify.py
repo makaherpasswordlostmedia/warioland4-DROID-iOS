@@ -625,6 +625,10 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/sprite_collision.c', r'\A', 'void func_8023BFC(u16 y, u16 x);\n'),
     ('src/passage_screen.c', r'\A', 'void BuildTemporaryStageSelectionSave(void);\n'),
     ('src/minigames/homerun_derby.c', r'\A', 's32 UpdateHomerunBonusAnimation(void); void DrawHomerunDerbyScore(void); void StartHomerunBonusAnimation(void); void ResetHomerunDerbyPitch(void);\nvoid SelectHomerunPitchPath(void); void UpdateHomerunBatInput(void);\n'),
+    # DrawHomerunDerby (static-OAM block): the original reads the attr1 mask from the register `sl` that the preceding asm set to -15.
+    # The port turns that asm into `oamByteMask = -15`, but the C reads the unrelated, stale `oamXMask` (0x1FF), which corrupts the
+    # pitcher's OAM attr byte.  Single-line replacement on purpose: ASM_OVERRIDES are keyed by ORIGINAL line numbers.
+    ('src/minigames/homerun_derby.c', r'(workingOffset = )oamXMask;(\s*\n\s*workingOffset &= pitcherAnimationType;)', r'\1oamByteMask;\2'),
     ('src/sprite_collision.c', r'gSpriteCollisionFlags & COLLISION_BELOW\b', 'gSpriteCollisionFlags & SPRITE_COLLISION_BELOW'),
     ('src/sprite_collision.c', r'(gSpriteData\[slot\]\.pose = SPOSE_PUSHED_RIGHT_INIT)\s*\n', r'\1;\n'),
     ('src/sprite_ai/moguramen.c', r'extern void func_8023BFC\(\);', 'extern void func_8023BFC(u16, u16);'),
