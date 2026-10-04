@@ -201,7 +201,7 @@ jobs:
 
           gcc -O1 -w \
             -I "$W" -I port/host \
-            -DWASM_RT_TRAP_HANDLER=wl4_trap \
+            -DWASM_RT_TRAP_HANDLER=wl4_trap -DWL4_TRACE=1 \
             port/tests/headless.c port/host/host.c port/hal/*.c \
             /tmp/stubs.c "$W/wl4.c" $RT \
             -o /tmp/headless -lm -lpthread
