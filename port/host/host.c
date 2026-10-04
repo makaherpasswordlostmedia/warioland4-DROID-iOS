@@ -3,6 +3,7 @@
 #include "wl4.h"
 #include "../hal/hal.h"
 #include "host.h"
+#include "audio.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -16,6 +17,13 @@
 #define WL4_RING(...) wl4_logf(1, __VA_ARGS__)           /* flight-recorder ring only (noisy stuff) */
 
 struct w2c_env { w2c_wl4 *inst; };
+
+/* audio.c (Android/AAudio) provides the real versions; these keep the desktop headless smoke test linking without it */
+__attribute__((weak)) void wl4_audio_start(void) {}
+__attribute__((weak)) void wl4_audio_stop(void) {}
+__attribute__((weak)) void wl4_audio_pause(int p) { (void)p; }
+__attribute__((weak)) void wl4_audio_poll(void) {}
+__attribute__((weak)) void wl4_audio_push(const int8_t *r, const int8_t *l, int n, int rate) { (void)r; (void)l; (void)n; (void)rate; }
 
 /* Last wasm functions entered (filled by the FUNC_PROLOGUE hook that port/tools/patch_w2c_trace.py adds to wl4.c). */
 const char *volatile g_wl4_trace[16]; volatile unsigned g_wl4_trace_i;
@@ -99,6 +107,12 @@ void wl4_trap(wasm_rt_trap_t code) {
 
 /* ---------- imports the wasm module expects ---------- */
 void w2c_env_hal_dma_set(struct w2c_env *e, u32 ch, u32 src, u32 dst, u32 ctl) { (void)e; g_dmas++; g_lastDma[0] = ch; g_lastDma[1] = src; g_lastDma[2] = dst; g_lastDma[3] = ctl; g_lastDma[4] = g_dmas; hal_dma_set((int)ch, src, dst, ctl); }
+/* SoundMain() (port/rt/rt.c) finished mixing one frame: right/left are s8 buffers in wasm memory */
+void w2c_env_hal_audio_push(struct w2c_env *e, u32 right, u32 left, u32 n, u32 rate) {
+    (void)e; size_t sz = g_inst.w2c_memory.size;
+    if (!g_mem || n > 4096 || (size_t)right + n > sz || (size_t)left + n > sz) return;
+    wl4_audio_push((const int8_t *)(g_mem + right), (const int8_t *)(g_mem + left), (int)n, (int)rate);
+}
 void w2c_env_LZ77UnCompVram(struct w2c_env *e, u32 src, u32 dst) { (void)e; bios_LZ77UnComp(src, dst); }
 /* Diagnostics from the wasm side: logs a value whenever it changes (tag 1 = Wario normal pose index). */
 void w2c_env_hal_trace_val(struct w2c_env *e, u32 tag, u32 val) {
@@ -138,6 +152,7 @@ static void cb_hblank(void) { w2c_wl4_InterruptCallbackCallHBlank(&g_inst); }
 static void cb_vcount(void) { w2c_wl4_InterruptCallbackCallVCount(&g_inst); }
 static void cb_frame(void) {
     static struct timespec next; struct timespec now;
+    wl4_audio_poll();
     pthread_mutex_lock(&g_lock); memcpy(g_front, hal_framebuffer(), sizeof g_front); g_frames++; pthread_mutex_unlock(&g_lock);
     if (g_mem) {                                          /* minigame state machine changes (rate limited, then ring only) */
         static unsigned char lastMg[4]; static int nlog;
@@ -207,7 +222,8 @@ int wl4_start(const uint8_t *rom, size_t size) {
     free(g_rom); g_rom = malloc(size); if (!g_rom) return -2; memcpy(g_rom, rom, size); g_romSize = size;
     g_stop = 0; g_paused = 0; g_frames = 0; g_t0 = mono_ms(); memset(g_ring, 0, sizeof g_ring); g_ringI = 0; g_polls = g_syscalls = g_dmas = 0; g_running = 1;
     WL4_LOG("wl4_start: rom=%zu bytes", size);
-    if (pthread_create(&g_thread, NULL, game_main, NULL)) return -3;
+    wl4_audio_start();
+    if (pthread_create(&g_thread, NULL, game_main, NULL)) { wl4_audio_stop(); return -3; }
     pthread_t wd; if (pthread_create(&wd, NULL, watchdog, NULL) == 0) pthread_detach(wd);
     return 0;
 }
@@ -228,8 +244,9 @@ void wl4_stop(void) {
     for (int i = 0; i < 100 && g_running; i++) { struct timespec ts = {0, 10000000}; nanosleep(&ts, NULL); }
     if (g_running) wl4_force_stop();                    /* game stuck in a loop that never reaches a frame boundary */
     pthread_join(g_thread, NULL); g_running = 0;
+    wl4_audio_stop();
 }
-void wl4_pause(int p) { g_paused = p; }
+void wl4_pause(int p) { g_paused = p; wl4_audio_pause(p); }
 void wl4_set_keys(uint16_t k) { hal_set_keys(k); }
 void wl4_load_save(const uint8_t *d, size_t n) { memset(g_save, 0xFF, sizeof g_save); memcpy(g_save, d, n > sizeof g_save ? sizeof g_save : n); g_haveSave = 1; }
 int  wl4_read_save(uint8_t *out) { if (g_running && g_inst.w2c_memory.data) memcpy(out, hal_sram(), GBA_SRAM_SIZE); else memcpy(out, g_save, GBA_SRAM_SIZE); return GBA_SRAM_SIZE; }
