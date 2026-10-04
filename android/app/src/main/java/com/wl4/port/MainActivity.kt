@@ -15,10 +15,14 @@ class MainActivity : AppCompatActivity() {
     private val romFile get() = File(filesDir, "wl4.gba")
     private lateinit var status: TextView
     private val logFile get() = File(filesDir, "wl4.log")
+    private val prevLogFile get() = File(filesDir, "wl4.prev.log")
 
+    /* Previous session first, then the current one.  The native side truncates wl4.log on every start of this
+       activity, so a freeze followed by an app restart used to wipe exactly the log that mattered. */
     private fun logText(): String {
-        val t = if (logFile.exists()) logFile.readText() else "(log is empty)"
-        return t.takeLast(100_000)
+        val prev = if (prevLogFile.exists()) "=== previous session ===\n" + prevLogFile.readText().takeLast(60_000) + "\n" else ""
+        val cur = if (logFile.exists()) "=== current session ===\n" + logFile.readText().takeLast(40_000) else ""
+        return if (prev.isEmpty() && cur.isEmpty()) "(log is empty)" else prev + cur
     }
     private fun shareLog() {
         startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
@@ -36,6 +40,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        // keep the last session's log (only if it has real content) before the native side truncates wl4.log
+        if (logFile.exists() && logFile.length() > 200) { prevLogFile.delete(); logFile.copyTo(prevLogFile, overwrite = true) }
         Native.setLogPath(logFile.path)
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
