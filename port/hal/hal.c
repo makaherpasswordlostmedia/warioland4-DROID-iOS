@@ -6,6 +6,8 @@ static size_t g_memSize;
 static uint16_t g_keys;
 static uint32_t g_fb[GBA_W * GBA_H];
 static HalCallbacks g_cb;
+volatile int g_hal_stage, g_hal_line;      /* watchdog breadcrumbs: where the host thread is inside hal_step_line */
+volatile unsigned g_hal_irq_calls[3];     /* vblank / hblank / vcount callbacks entered */
 void ppu_frame_start(void);
 void hal_step_line(void);
 static void dma_timed(int timing);
@@ -25,7 +27,9 @@ static void raise_irq(uint16_t flag, void (*cb)(void)) {
     uint16_t ie = rd16(IO_IE);
     if (!(ie & flag) || !(rd16(IO_IME) & 1)) return;
     wr16(IO_IF, rd16(IO_IF) | flag);                      /* game's handler clears it in crt0's irq_handler path */
+    g_hal_irq_calls[flag == 1 ? 0 : flag == 2 ? 1 : 2]++; g_hal_stage = 10 + (int)flag;
     if (cb) cb();
+    g_hal_stage = 20 + (int)flag;
     wr16(IO_IF, rd16(IO_IF) & ~flag);
 }
 
@@ -34,6 +38,7 @@ static void raise_irq(uint16_t flag, void (*cb)(void)) {
 static int g_line;
 void hal_step_line(void) {
     int line = g_line;
+    g_hal_line = line; g_hal_stage = 1;
     if (line == 0) { ppu_frame_start(); wr16(IO_KEYINPUT, (uint16_t)(~g_keys & 0x03FF)); }
     uint16_t st = rd16(IO_DISPSTAT);
     wr16(IO_VCOUNT, (uint16_t)line);
@@ -41,14 +46,16 @@ void hal_step_line(void) {
     wr16(IO_DISPSTAT, (uint16_t)((st & ~7) | (line >= 160 && line < 227 ? 1 : 0) | (vcmatch ? 4 : 0)));
     if (vcmatch && (st & 0x20)) raise_irq(0x0004, g_cb.vcount);
     if (line < GBA_H) {
-        ppu_render_scanline(line, g_fb + line * GBA_W);
-        dma_timed(2);
+        g_hal_stage = 2; ppu_render_scanline(line, g_fb + line * GBA_W);
+        g_hal_stage = 3; dma_timed(2);
         wr16(IO_DISPSTAT, rd16(IO_DISPSTAT) | 2);
         if (st & 0x10) raise_irq(0x0002, g_cb.hblank);
         wr16(IO_DISPSTAT, rd16(IO_DISPSTAT) & ~2);
-    } else if (line == GBA_H) { dma_timed(1); if (st & 0x08) raise_irq(0x0001, g_cb.vblank); }
+    } else if (line == GBA_H) { g_hal_stage = 4; dma_timed(1); g_hal_stage = 5; if (st & 0x08) raise_irq(0x0001, g_cb.vblank); }
+    g_hal_stage = 6;
     g_line = line + 1;
-    if (g_line == 228) { g_line = 0; if (g_cb.frame_done) g_cb.frame_done(); }
+    if (g_line == 228) { g_line = 0; g_hal_stage = 7; if (g_cb.frame_done) g_cb.frame_done(); }
+    g_hal_stage = 8;
 }
 void hal_run_frame(void) { do hal_step_line(); while (g_line != 0); }
 uint16_t hal_poll_vcount(void) { hal_step_line(); return (uint16_t)g_line; }
