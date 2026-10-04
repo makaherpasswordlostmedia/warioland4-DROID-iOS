@@ -660,6 +660,15 @@ PATCHES = [   # (relative path, regex, replacement)
     # registers `trampoline|1`.  In wasm a function pointer is a table index, so the DMA copied 512 junk bytes over IWRAM
     # and the HBlank IRQ did call_indirect on 0x0300322d (wasm trap 6).  Register the real function directly.
     ('src/hblank.c', r'(?s)\(\(volatile struct Dma3Regs_HBlankCallbackCopy\*\)0x040000D4\)->src = callback;.*?InterruptCallbackSetHBlank\(\(void \(\*\)\(\)\)\(1 \| \(\(s32\)\(&gHBlankCallbackTrampoline\)\)\)\);', 'InterruptCallbackSetHBlank(callback);'),
+    # diagnostics: log changes of main/sub game mode, stage-exit step and exit type (tags 2..5 of hal_trace_val)
+    ('src/main.c', r'^(\s*)TIMER_COUNT_UP\(gMainTimer\);', r'\1TIMER_COUNT_UP(gMainTimer);\n\1{ extern void hal_trace_val(unsigned, unsigned); hal_trace_val(2, (unsigned)gMainGameMode); hal_trace_val(3, (unsigned)(u16)gSubGameMode); hal_trace_val(4, (unsigned)gSpriteAiDropTimer); hal_trace_val(5, (unsigned)gStageExitType); }'),
+    # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
+    ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ extern void hal_trace_val(unsigned, unsigned); hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
+    ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { extern void hal_trace_val(unsigned, unsigned); hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
+    # vortex exit: only SpriteWarioEnteringVortex is ever spawned (VortexFinishStage), but it started the stage-exit sequence
+    # (gSubGameMode = 6) just when gCollectedKeyzer != 1 -- with the Keyzer collected nothing did, Wario stayed disabled for the
+    # whole 16.7 s pause and the timer ran out.  Start the exit unconditionally (the Keyzer sprite sets the very same values).
+    ('src/sprite_ai/vortex.c', r'if \(gCollectedKeyzer != 1\) \{\n(\s*gSubGameMode = 6;\n\s*gSpriteAiDropTimer = 0;\n\s*gStageExitType = 2;\n)(\s*)\}', r'{\n\1\2}'),
     ('src/credits.c', r'while \(\(\*\(vu16 \*\)0x04000004 & 2\) == 0\) \{\s*\}', '/* port: HBlank-flag spin skipped (the HAL calls this at HBlank time) */'),
 ]
 
