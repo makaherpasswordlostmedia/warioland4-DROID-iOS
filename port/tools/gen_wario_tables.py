@@ -180,6 +180,43 @@ for idx, sym, a, b in POSE_TABLES:
     L += [f'    (void *){n},' for n in pose_names[sym]]
     L.append('};')
     L.append('')
+# --- block collision handlers (src/block.c) --------------------------------------------
+# sBlockCollisionHandlers lives in asm/blob_0x78EBF0-0x78F5A4.s as raw ARM addresses.  Left as a
+# blob, sBlockCollisionHandlers[n](&ctx) is a call_indirect on a ROM address -> wasm trap 6 the first
+# time Wario touches a tile (GetWarioBlockCollisionAtPosition).  Same fix as the pose tables: map every
+# address to a function name by source order and emit a real C table.
+BLOCK_TABLE_ROM = 0x78F2E4
+BLOCK_TABLE_LEN = 13          # block.c only indexes with tileType <= 12
+
+
+def block_handlers():
+    lines = (repo / 'src' / 'block.c').read_text().split('\n')
+    pat = re.compile(r'^s32 (Get\w+Collision)\(struct BlockCollisionContext \*context\)$')
+    names = [m.group(1) for i, l in enumerate(lines[:-1])
+             if (m := pat.match(l)) and lines[i + 1].strip() == '{']
+    if 'GetNonSolidBlockCollision' not in names:
+        die('block.c: GetNonSolidBlockCollision not found')
+    names = names[names.index('GetNonSolidBlockCollision'):]
+    w = words(BLOCK_TABLE_ROM, BLOCK_TABLE_LEN)
+    if any(x & 1 == 0 or not (0x08000000 <= x < 0x08800000) for x in w):
+        die('sBlockCollisionHandlers: non-Thumb or out-of-ROM address (wrong ROM / wrong offset?)')
+    uniq = sorted(set(w))
+    if len(uniq) > len(names):
+        die(f'sBlockCollisionHandlers: {len(uniq)} unique targets but only {len(names)} functions in block.c')
+    lut = dict(zip(uniq, names))      # agbcc keeps source order, so ascending address == declaration order
+    return [lut[x] for x in w]
+
+
+blk = block_handlers()
+L.append('/* block collision handlers: s32 (*)(struct BlockCollisionContext *) */')
+L.append('typedef s32 (*BlockCollisionHandlerFn)(void *);')
+for nm in sorted(set(blk)):
+    L.append(f'extern s32 {nm}(void *);')
+L.append('')
+L.append(f'const BlockCollisionHandlerFn sBlockCollisionHandlers[{BLOCK_TABLE_LEN}] = {{')
+L += [f'    {n},' for n in blk]
+L.append('};')
+L.append('')
 out.write_text('\n'.join(L))
 n_slots = sum(len(v) for v in pose_names.values()) + sum(len(v) for v in reaction_names.values())
 print(f'wario tables: {n_slots} slots, {len(used)} distinct functions -> {out}')
