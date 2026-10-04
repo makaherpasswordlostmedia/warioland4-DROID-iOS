@@ -31,8 +31,17 @@ static uint8_t g_save[GBA_SRAM_SIZE]; static int g_haveSave;
 
 /* A wasm trap (OOB, bad indirect call...) means a port bug: report it and stop the game thread
  * instead of crashing the app.  Build the wasm2c C files with -DWASM_RT_TRAP_HANDLER=wl4_trap. */
+static void dump_trace(void) {
+    char buf[512]; int o = 0; unsigned ti = g_wl4_trace_i;
+    for (int i = 0; i < 16 && o < (int)sizeof buf - 64; i++) { const char *nm = g_wl4_trace[(ti - 1 - i) & 15]; if (nm) o += snprintf(buf + o, sizeof buf - (size_t)o, "%s%s", i ? " < " : "", nm); }
+    WL4_LOG("  last wasm funcs: %s", o ? buf : "(trace hook not compiled in)");
+}
 void wl4_trap(wasm_rt_trap_t code) {
-    WL4_LOG("wasm trap %d (game thread stopped)", (int)code);
+    const char *nm = code == WASM_RT_TRAP_OOB ? "out-of-bounds memory access" : code == WASM_RT_TRAP_INT_OVERFLOW ? "integer overflow"
+                   : code == WASM_RT_TRAP_DIV_BY_ZERO ? "division by zero" : code == WASM_RT_TRAP_INVALID_CONVERSION ? "invalid conversion"
+                   : code == WASM_RT_TRAP_UNREACHABLE ? "unreachable" : "other (see wasm-rt.h)";
+    WL4_LOG("wasm trap %d: %s (game thread stopped)", (int)code, nm);
+    dump_trace();
     g_running = 0; pthread_exit(NULL);
 }
 
@@ -114,9 +123,7 @@ static void *watchdog(void *arg) {
                     g_inst.w2c_memory.data ? (rd16(IO_IME) & 1) : 0);
         if (f == lastFrames && g_running) {
             WL4_LOG("  stall: hal line=%d stage=%d irq(v/h/c)=%u/%u/%u", g_hal_line, g_hal_stage, g_hal_irq_calls[0], g_hal_irq_calls[1], g_hal_irq_calls[2]);
-            char buf[512]; int o = 0; unsigned ti = g_wl4_trace_i;
-            for (int i = 0; i < 16 && o < (int)sizeof buf - 64; i++) { const char *nm = g_wl4_trace[(ti - 1 - i) & 15]; if (nm) o += snprintf(buf + o, sizeof buf - (size_t)o, "%s%s", i ? " < " : "", nm); }
-            WL4_LOG("  stall: last wasm funcs: %s", o ? buf : "(trace hook not compiled in)");
+            dump_trace();
         }
         lastFrames = f;
     }
