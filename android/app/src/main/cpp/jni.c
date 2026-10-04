@@ -7,22 +7,29 @@
 #include <android/log.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <time.h>
 #include "host.h"
 
 /* Android drops stdout/stderr: pipe both into logcat (tag "wl4") so printf/fprintf in the port are visible. */
 static int g_logPipe[2];
 static int g_logFd = -1;
+static long long g_t0ms;
+static long long mono_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000LL + t.tv_nsec / 1000000; }
 static pthread_mutex_t g_logLock = PTHREAD_MUTEX_INITIALIZER;
 /* one line -> logcat AND the log file (so it can be read on the phone without a PC) */
 static void wl4_emit(const char *line) {
     __android_log_write(ANDROID_LOG_INFO, "wl4", line);
     pthread_mutex_lock(&g_logLock);
-    if (g_logFd >= 0) { (void)!write(g_logFd, line, strlen(line)); (void)!write(g_logFd, "\n", 1); }
+    if (g_logFd >= 0) {                                   /* file lines carry a [seconds since app start] stamp */
+        char out[700]; long long ms = mono_ms() - g_t0ms;
+        int n = snprintf(out, sizeof out - 1, "[%7lld.%03lld] %s\n", ms / 1000, ms % 1000, line); if (n > (int)sizeof out - 2) n = (int)sizeof out - 2;
+        (void)!write(g_logFd, out, (size_t)n);
+    }
     pthread_mutex_unlock(&g_logLock);
 }
 static void on_fatal_signal(int sig, siginfo_t *si, void *ctx) {
     (void)ctx; char m[96]; int n = snprintf(m, sizeof m, "FATAL native signal %d, fault addr %p\n", sig, si ? si->si_addr : 0);
-    if (g_logFd >= 0) (void)!write(g_logFd, m, (size_t)n);
+    if (g_logFd >= 0) { (void)!write(g_logFd, m, (size_t)n); wl4_ring_write(g_logFd); }
     __android_log_write(ANDROID_LOG_FATAL, "wl4", m);
     signal(sig, SIG_DFL); raise(sig);
 }
@@ -38,7 +45,7 @@ static void *log_pump(void *arg) {
     return NULL;
 }
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    (void)vm; (void)reserved;
+    (void)vm; (void)reserved; g_t0ms = mono_ms();
     setvbuf(stdout, NULL, _IOLBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
     if (pipe(g_logPipe) == 0) {
         dup2(g_logPipe[1], STDOUT_FILENO); dup2(g_logPipe[1], STDERR_FILENO);
@@ -88,6 +95,7 @@ JNIEXPORT void JNICALL Java_com_wl4_port_Native_setLogPath(JNIEnv *env, jclass c
     if (g_logFd >= 0) close(g_logFd);
     g_logFd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     pthread_mutex_unlock(&g_logLock);
+    { char d[300]; snprintf(d, sizeof d, "%s.stall.bin", p); wl4_set_dump_path(d); }
     (*env)->ReleaseStringUTFChars(env, path, p);
     wl4_emit(g_logFd >= 0 ? "log file opened" : "log file open FAILED");
 }
