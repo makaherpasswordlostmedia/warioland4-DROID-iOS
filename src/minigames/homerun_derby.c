@@ -1698,7 +1698,11 @@ void DrawHomerunDerby(void)
         preservedOamBits &= oamAttribute;
         *((u16 *) (((u8 *) staticOamBytes) + 2)) = (u16) (preservedOamBits | positionValue);
         pitcherAnimationType = *((u8 *) (((u8 *) staticOamBytes) + 3));
+#ifdef NON_MATCHING
+        workingOffset = oamByteMask; /* port: asm 'mov sl, r0' (-15) is translated into oamByteMask */
+#else
         workingOffset = oamXMask;
+#endif
         workingOffset &= pitcherAnimationType;
         *((u8 *) (((u8 *) staticOamBytes) + 3)) = (u8) (workingOffset | 2);
         *((u16 *) (((u8 *) oamDataDestination) + 0)) = *(frameData++);
