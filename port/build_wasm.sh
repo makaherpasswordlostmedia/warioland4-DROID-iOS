@@ -16,7 +16,7 @@ OPT_LEVEL=${OPT_LEVEL:-2}
 CC="$WASI_SDK/bin/clang --target=wasm32"
 ROM=$REPO/baserom_$VER.gba
 [ -f "$ROM" ] || { echo "missing $ROM"; exit 1; }
-ROMSIZE=$(stat -c %s "$ROM")
+ROMSIZE=$(wc -c < "$ROM" | tr -d ' ')      # portable: BSD stat has no -c
 GLOBAL_BASE=167772160        # 0x0A000000: above the GBA address space (ROM ends at 0x0A000000)
 MEM_BYTES=235995136          # 0x0E010000: covers ROM mirror, wasm data and 64KB SRAM at 0x0E000000
 STACK=1048576
@@ -26,7 +26,7 @@ python3 "$REPO/port/tools/portify.py" "$REPO" "$OUT/p"
 cp "$ROM" "$OUT/baserom.gba"
 cp "$OUT/p/ASM_SITES.txt" "$OUT/ASM_SITES.txt"
 
-CFLAGS="-O${OPT_LEVEL} -ffreestanding -fno-builtin -nostdinc -w -Wno-error=implicit-function-declaration -Wno-error=incompatible-function-pointer-types -Wno-error=int-conversion -Wno-error=return-mismatch -DNON_MATCHING -DNONMATCHING -DVERSION_${VER^^} -include types.h -include oam.h -include port.h \
+CFLAGS="-O${OPT_LEVEL} -ffreestanding -fno-builtin -nostdinc -w -Wno-error=implicit-function-declaration -Wno-error=incompatible-function-pointer-types -Wno-error=int-conversion -Wno-error=return-mismatch -DNON_MATCHING -DNONMATCHING -DVERSION_$(echo "$VER" | tr a-z A-Z) -include types.h -include oam.h -include port.h \
         -I$OUT/p/include -I$REPO -fno-strict-aliasing -fwrapv"
 : > "$OUT/FAILED.txt"; ok=0; bad=0
 while IFS= read -r f; do
