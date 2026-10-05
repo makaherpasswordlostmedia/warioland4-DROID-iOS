@@ -649,6 +649,15 @@ PATCHES = [   # (relative path, regex, replacement)
     # trace[6] = 20000 + animationIndex*100 + frame after every pitcher frame step (tag 6 is otherwise only used by the vortex).
     ('src/minigames/homerun_derby.c', r'(      gHomerunPitcherAnimation\.animationFrame = \(u16\) \(gHomerunPitcherAnimation\.animationFrame \+ 1\);\n)',
      r'\1      hal_trace_val(6, 20000 + (unsigned)gHomerunPitcherAnimation.animationIndex * 100 + (unsigned)gHomerunPitcherAnimation.animationFrame);\n'),
+    # The guard above never fired (log: no trace[0]), and the trap is still in UpdateBossDefeatPaletteFade ~50 frames into a level,
+    # so the timer value is fine and the *table lookup itself* fails.  Drop the function-pointer table: call the 4 blend functions directly.
+    ('src/color_fading.c', r'            func = \*\(ColorBlendFunction \*\)index;\n            \*dst = func\(red, green, blue, amount\);\n',
+     '            switch (timer[0]) {\n'
+     '            case 1: *dst = BlendColorFromWhite(red, green, blue, amount); break;\n'
+     '            case 2: *dst = BlendColorToWhite(red, green, blue, amount); break;\n'
+     '            case 3: *dst = BlendColorFromBlack(red, green, blue, amount); break;\n'
+     '            default: *dst = BlendColorToBlack(red, green, blue, amount); break;\n'
+     '            }\n'),
     # --- uninitialised register read: the original asm("" : "=r"(p)) just named r4 (= &gStageEntrySelectedStage);
     # with the asm gone `p` is undef and clang turns the *p path into wasm `unreachable` (trap 5 on stage entry).
     ('src/stage_entry.c', r'(u8 \*normalSelectedStage);(\s*\n\s*);', r'\1 = &gStageEntrySelectedStage;\2'),
