@@ -12,7 +12,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include <unistd.h>
-/* stderr is piped into logcat + the log file by jni.c (JNI_OnLoad), so plain fprintf is enough on every platform */
+/* stderr is piped into logcat (Android) / the log file (iOS) + the log file by jni.c (JNI_OnLoad), so plain fprintf is enough on every platform */
 #define WL4_LOG(...) wl4_logf(0, "wl4: " __VA_ARGS__)   /* file + logcat + flight-recorder ring */
 #define WL4_RING(...) wl4_logf(1, __VA_ARGS__)           /* flight-recorder ring only (noisy stuff) */
 
@@ -150,6 +150,18 @@ static void cb_vblank(void) {
 }
 static void cb_hblank(void) { w2c_wl4_InterruptCallbackCallHBlank(&g_inst); }
 static void cb_vcount(void) { w2c_wl4_InterruptCallbackCallVCount(&g_inst); }
+#ifdef __APPLE__
+/* Darwin has no clock_nanosleep()/TIMER_ABSTIME: sleep for the remaining time instead */
+static void wl4_sleep_until(const struct timespec *t) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    long long ns = (long long)(t->tv_sec - now.tv_sec) * 1000000000LL + (t->tv_nsec - now.tv_nsec);
+    if (ns <= 0) return;
+    struct timespec d; d.tv_sec = (time_t)(ns / 1000000000LL); d.tv_nsec = (long)(ns % 1000000000LL);
+    nanosleep(&d, NULL);
+}
+#else
+static void wl4_sleep_until(const struct timespec *t) { clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, t, NULL); }
+#endif
 static void cb_frame(void) {
     static struct timespec next; struct timespec now;
     wl4_audio_poll();
@@ -171,11 +183,14 @@ static void cb_frame(void) {
     if (!next.tv_sec || (now.tv_sec - next.tv_sec) * 1000000000LL + (now.tv_nsec - next.tv_nsec) > 100000000LL) next = now;
     next.tv_nsec += 16743000;                           /* 59.7275 Hz */
     while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    wl4_sleep_until(&next);
 }
 
 static void *game_main(void *arg) {
     (void)arg;
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     WL4_LOG("game thread started, rom=%zu bytes", g_romSize);
     wasm_rt_init();
     g_env.inst = &g_inst;
@@ -223,12 +238,16 @@ int wl4_start(const uint8_t *rom, size_t size) {
     g_stop = 0; g_paused = 0; g_frames = 0; g_t0 = mono_ms(); memset(g_ring, 0, sizeof g_ring); g_ringI = 0; g_polls = g_syscalls = g_dmas = 0; g_running = 1;
     WL4_LOG("wl4_start: rom=%zu bytes", size);
     wl4_audio_start();
-    if (pthread_create(&g_thread, NULL, game_main, NULL)) { wl4_audio_stop(); return -3; }
+    /* wasm2c compiles wasm calls to native C calls, so the game recurses on the native stack: Darwin's 512 KB default for
+     * secondary threads is too small, give the game thread a generous one (virtual memory, only touched pages count) */
+    pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, (size_t)8 << 20);
+    int prc = pthread_create(&g_thread, &at, game_main, NULL); pthread_attr_destroy(&at);
+    if (prc) { wl4_audio_stop(); return -3; }
     pthread_t wd; if (pthread_create(&wd, NULL, watchdog, NULL) == 0) pthread_detach(wd);
     return 0;
 }
-#ifdef __ANDROID__
-/* bionic has no pthread_cancel(): kill the stuck game thread with a signal whose handler exits the thread */
+#if defined(__ANDROID__) || defined(__APPLE__)
+/* bionic has no pthread_cancel() (and on Darwin it cannot interrupt a tight loop without cancellation points): kill the stuck game thread with a signal whose handler exits the thread */
 static void wl4_kill_handler(int sig) { (void)sig; g_running = 0; pthread_exit(NULL); }
 static void wl4_force_stop(void) {
     struct sigaction sa; memset(&sa, 0, sizeof sa);
