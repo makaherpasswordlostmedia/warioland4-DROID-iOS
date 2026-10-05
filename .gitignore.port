@@ -2,3 +2,5 @@ baserom*.gba
 port/build/
 android/.gradle/
 android/app/build/
+ios/build/
+ios/*.ipa
