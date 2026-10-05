@@ -640,6 +640,15 @@ PATCHES = [   # (relative path, regex, replacement)
     # 79-slot ROM table instead of trapping.  The last "trace[1]" line before a call_indirect trap names the offending pose.
     ('src/wario/normal.c', r'pose = sWarioNormalPoseTable\[gWarioData\.pose\]\(\);',
      '{ u32 poseIdx = gWarioData.pose; hal_trace_val(1, poseIdx); if (poseIdx >= 79) { pose = 0xFF; } else { pose = sWarioNormalPoseTable[poseIdx](); } }'),
+    # Guard for ApplyTimedPaletteFade: sColorBlendFunctionTable has exactly 4 entries (timer[0] == 1..4).  Any other value
+    # (stale/garbage gBossDefeatTimer) made call_indirect trap (trap 6) from UpdateBossDefeatPaletteFade.  Cancel the fade instead
+    # and log the offending value as trace[0] = 1000 + value.
+    ('src/color_fading.c', r'(            index = timer\[0\];\n)',
+     r'\1            if (index == 0 || index > 4) { hal_trace_val(0, 1000 + index); timer[0] = 0; timer[3] = 0; timer[5] = 0; return; }\n'),
+    # Diagnostic: Homerun Derby froze in state 6 (waiting for the pitcher animation to reach frame 10 of animation 4).
+    # trace[6] = 20000 + animationIndex*100 + frame after every pitcher frame step (tag 6 is otherwise only used by the vortex).
+    ('src/minigames/homerun_derby.c', r'(      gHomerunPitcherAnimation\.animationFrame = \(u16\) \(gHomerunPitcherAnimation\.animationFrame \+ 1\);\n)',
+     r'\1      hal_trace_val(6, 20000 + (unsigned)gHomerunPitcherAnimation.animationIndex * 100 + (unsigned)gHomerunPitcherAnimation.animationFrame);\n'),
     # --- uninitialised register read: the original asm("" : "=r"(p)) just named r4 (= &gStageEntrySelectedStage);
     # with the asm gone `p` is undef and clang turns the *p path into wasm `unreachable` (trap 5 on stage entry).
     ('src/stage_entry.c', r'(u8 \*normalSelectedStage);(\s*\n\s*);', r'\1 = &gStageEntrySelectedStage;\2'),
