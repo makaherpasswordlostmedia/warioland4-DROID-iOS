@@ -1,0 +1,203 @@
+name: Build Wario Land 4 iOS port
+
+# Same inputs as the Android workflow: the pret-style decomp at the repo root with port/ and ios/ on top.
+#
+# ROM: the build needs YOUR OWN US ROM (md5 5fe47355a33e3fabec2a1607af88a404) via the secret WL4_ROM_ID (Google Drive
+# file id) - or commit baserom_us.gba to a PRIVATE repo.  `make extract` turns ROM data into C includes that get
+# compiled into the app, so the .ipa is ROM-derived: this workflow refuses to run in a public repo unless you override.
+#
+# Output: an UNSIGNED .ipa.  Install with TrollStore (iOS 14.0-16.6.1 on supported builds, fake-signs on install),
+# or sign it with AltStore / Sideloadly / your own cert.  Deployment target is iOS 14.0, so 14.7+ is covered.
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_public_repo:
+        description: "I understand the .ipa embeds ROM-derived data and the artifact is downloadable from a public repo"
+        type: boolean
+        default: false
+      run_host_smoke_test:
+        description: "Run the ROM headless on the macOS runner for a few seconds first (checks host.c/hal on Apple clang)"
+        type: boolean
+        default: true
+      wabt_version:
+        description: "Override wabt version (blank = default below)"
+        default: ""
+      opt_level:
+        description: "Clang -O level for the wasm32 compile (0/1/2). Lower uses less RAM."
+        default: "2"
+      version:
+        description: "ROM version: us or jp (jp needs WL4_ROM_ID_JP and has not been tried)"
+        default: "us"
+
+env:
+  WASI_SDK_VERSION: "24"
+  WABT_VERSION: "1.0.36"
+  ROM_MD5_US: "5fe47355a33e3fabec2a1607af88a404"
+  ROM_MD5_JP: "99c8ad779a16be513a9fdff502b6f5c2"
+
+jobs:
+  build:
+    runs-on: macos-14            # Apple silicon, Xcode preinstalled
+    timeout-minutes: 150
+    steps:
+      - name: Refuse public repos unless overridden
+        if: ${{ github.event.repository.private == false && inputs.allow_public_repo != true }}
+        run: |
+          echo "::error::This repo is public. The .ipa embeds data extracted from your ROM; rerun with allow_public_repo=true only if you accept that."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve settings
+        run: |
+          VER="${{ inputs.version }}"; VER="${VER:-us}"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          WABT_IN="${{ inputs.wabt_version }}"; echo "WABT_EFF=${WABT_IN:-${{ env.WABT_VERSION }}}" >> "$GITHUB_ENV"
+          OPT="${{ inputs.opt_level }}"; echo "OPT_LEVEL=${OPT:-2}" >> "$GITHUB_ENV"
+          if [ "$VER" = jp ]; then echo "ROM_MD5=${{ env.ROM_MD5_JP }}" >> "$GITHUB_ENV"; else echo "ROM_MD5=${{ env.ROM_MD5_US }}" >> "$GITHUB_ENV"; fi
+
+      - name: Get ROM
+        env:
+          ROM_ID: ${{ inputs.version == 'jp' && secrets.WL4_ROM_ID_JP || secrets.WL4_ROM_ID }}
+        run: |
+          if [ ! -f "baserom_${VER}.gba" ]; then
+            [ -n "$ROM_ID" ] || { echo "::error::Secret WL4_ROM_ID (or WL4_ROM_ID_JP) not set - add your Google Drive file ID as a repo secret."; exit 1; }
+            pip install --quiet gdown
+            gdown "$ROM_ID" -O "baserom_${VER}.gba"
+          fi
+          ls -l "baserom_${VER}.gba"
+          python3 - <<PY
+          import hashlib, sys
+          h = hashlib.md5(open("baserom_${VER}.gba", "rb").read()).hexdigest()
+          if h != "${ROM_MD5}":
+              print("::error::baserom_${VER}.gba MD5 mismatch (%s) - wrong ROM version or corrupted download" % h); sys.exit(1)
+          print("ROM md5 ok")
+          PY
+
+      - name: Extract assets from ROM (make extract)
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet pyyaml
+          make extract VERSION=$VER
+          echo "Extracted $(find include/data -type f | wc -l) asset files"
+
+      - name: Cache wasi-sdk
+        id: cache-wasi
+        uses: actions/cache@v4
+        with:
+          path: ~/wasi-sdk
+          key: wasi-sdk-macos-${{ env.WASI_SDK_VERSION }}-${{ runner.arch }}
+
+      - name: Install wasi-sdk
+        if: steps.cache-wasi.outputs.cache-hit != 'true'
+        run: |
+          ARCH=$(uname -m)            # arm64 on macos-14
+          V="${{ env.WASI_SDK_VERSION }}"
+          BASE="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${V}"
+          if ! curl -fsSL -o /tmp/wasi.tgz "${BASE}/wasi-sdk-${V}.0-${ARCH}-macos.tar.gz"; then
+            echo "::warning::primary wasi-sdk URL failed; trying fallback naming"
+            curl -fsSL -o /tmp/wasi.tgz "${BASE}/wasi-sdk-${V}.0+m-${ARCH}-macos.tar.gz"
+          fi
+          mkdir -p ~/wasi-sdk && tar -xzf /tmp/wasi.tgz -C ~/wasi-sdk --strip-components=1
+          ~/wasi-sdk/bin/clang --version
+
+      - name: Cache wabt
+        id: cache-wabt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/wabt-install
+            ~/wabt-src
+          key: wabt-macos-${{ env.WABT_EFF }}-${{ runner.arch }}
+
+      - name: Build wabt (wasm2c) from source
+        if: steps.cache-wabt.outputs.cache-hit != 'true'
+        run: |
+          V="${WABT_EFF}"
+          git clone --recursive --depth 1 --branch "$V" https://github.com/WebAssembly/wabt ~/wabt-src 2>/dev/null \
+            || git clone --recursive --depth 1 --branch "v$V" https://github.com/WebAssembly/wabt ~/wabt-src
+          cmake -S ~/wabt-src -B ~/wabt-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$HOME/wabt-install"
+          cmake --build ~/wabt-src/build -j"$(sysctl -n hw.ncpu)"
+          cmake --install ~/wabt-src/build
+          ~/wabt-install/bin/wasm2c --version
+
+      - name: portify -> wasm32 -> wasm2c
+        run: |
+          set -o pipefail
+          export WASI_SDK="$HOME/wasi-sdk" WABT="$HOME/wabt-install" WABT_SRC="$HOME/wabt-src"
+          chmod +x port/build_wasm.sh
+          ./port/build_wasm.sh "$VER" 2>&1 | tee port-build.log
+          echo "--- failed C files (expected: none)";      cat port/build/FAILED.txt
+          echo "--- unported asm sites (expected: none)";  cat port/build/ASM_SITES.txt
+          echo "--- audit (expected: empty)";              cat port/build/p/AUDIT.txt
+          test -s port/build/wasm2c/wl4.c
+
+      # Compiles host.c/hal/audio-stub + wasm2c output with Apple clang and runs the ROM for ~300 frames.
+      # This is the only place where the Darwin changes in host.c get exercised before the iOS build.
+      - name: Host smoke test (macOS, headless)
+        if: ${{ inputs.run_host_smoke_test }}
+        continue-on-error: true
+        run: |
+          W=port/build/wasm2c
+          python3 port/tools/gen_stubs.py "$W/wl4.h" /tmp/stubs.c
+          RT=""
+          for f in $(ls "$W"/wasm-rt-*.c 2>/dev/null | grep -v -- '-win\.c'); do
+            b=$(basename "$f")
+            if grep -qF "\"$b\"" "$W/wl4.c" "$W/wl4.h" 2>/dev/null; then echo "skip $b (included by wl4.c)"; else RT="$RT $f"; fi
+          done
+          clang -O1 -w -I "$W" -I port/host -DWASM_RT_TRAP_HANDLER=wl4_trap -DWL4_TRACE=1 -DWASM_RT_USE_MMAP=0 \
+            port/tests/headless.c port/host/host.c port/hal/*.c /tmp/stubs.c "$W/wl4.c" $RT -o /tmp/headless -lm -lpthread
+          /tmp/headless "baserom_${VER}.gba" 300 2>&1 | tail -30
+
+      - name: Configure iOS project (CMake -> Xcode)
+        run: |
+          # STATIC_LIBRARY try_compile + signing off: CMake's compiler checks must not try to sign a test app bundle
+          cmake -S ios -B ios/build -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
+            -DWL4_PORT_DIR="$PWD/port" -DWL4_VERSION="$VER"
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          cmake --build ios/build --config Release -- CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tee ios-build.log | tail -60
+          APP=$(find ios/build -type d -name 'WL4.app' | head -n1)
+          [ -n "$APP" ] || { echo "::error::WL4.app not produced"; exit 1; }
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Verify Mach-O
+        run: |
+          lipo -info "$APP/WL4"
+          otool -l "$APP/WL4" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' | head -12
+          vtool -show-build "$APP/WL4" 2>/dev/null | head -8 || true
+          plutil -p "$APP/Info.plist" | head -30
+
+      - name: Pack .ipa
+        run: |
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry "../WL4-${VER}-unsigned.ipa" Payload)
+          ls -l WL4-*.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WL4-${{ env.VER }}-ios-unsigned-ipa
+          path: WL4-*.ipa
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs-ios
+          path: |
+            port-build.log
+            ios-build.log
+            port/build/errors.log
+          if-no-files-found: ignore
