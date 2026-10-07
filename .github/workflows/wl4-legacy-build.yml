@@ -1,4 +1,4 @@
-name: WL4 legacy v3 (time shim)
+name: WL4 legacy build
 
 # Branch: ioslegacy.  Target: iPad mini 1 (A5, 32-bit).  Linux runner, Theos + iPhoneOS 9.3 SDK (no Xcode needed).
 # Needs YOUR OWN US ROM via secret WL4_ROM_ID (Google Drive file id).  The .ipa embeds ROM-derived data (make extract),
@@ -88,6 +88,21 @@ jobs:
           HEOF
           grep -q 'legacy_time.h' ios-legacy/Makefile || sed -i 's|-DWL4_LEGACY=1|-DWL4_LEGACY=1 -include Sources/legacy_time.h|' ios-legacy/Makefile
           grep -n 'legacy_time' ios-legacy/Makefile
+
+      - name: Make AppDelegate independent of audio.h version
+        run: |
+          python3 - <<'PYEOF'
+          p = "ios-legacy/Sources/AppDelegate.m"
+          t = open(p).read()
+          shim = ('#include "audio.h"\n'
+                  '/* some audio.h versions lack this: declare it and provide a weak no-op (a real definition in audio.c wins) */\n'
+                  'void wl4_audio_request_restart(void);\n'
+                  '__attribute__((weak)) void wl4_audio_request_restart(void) {}\n')
+          assert '#include "audio.h"\n' in t
+          t = t.replace('#include "audio.h"\n', shim, 1)
+          open(p, "w").write(t)
+          PYEOF
+          grep -n "wl4_audio_request_restart" ios-legacy/Sources/AppDelegate.m | head -3
 
       - uses: actions/setup-python@v5
         with:
