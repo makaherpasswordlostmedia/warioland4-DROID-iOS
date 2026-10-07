@@ -1,6 +1,6 @@
-name: WL4 legacy build
+name: WL4 iOS 5 build
 
-# Branch: ioslegacy.  Target: iPad mini 1 (A5, 32-bit).  Linux runner, Theos + iPhoneOS 9.3 SDK (no Xcode needed).
+# Branch: ioslegacy.  Target: 32-bit armv7 devices on iOS 5.0+ (iPhone 3GS/4/4S, iPad 1/2/3, iPod touch 3/4; also runs on 6-9.3.5).  Linux runner, Theos + iPhoneOS 9.3 SDK (no Xcode needed).
 # Needs YOUR OWN US ROM via secret WL4_ROM_ID (Google Drive file id).  The .ipa embeds ROM-derived data (make extract),
 # so the job refuses to run in a public repo unless overridden.  Output: unsigned .ipa + .deb.
 
@@ -48,6 +48,17 @@ jobs:
         run: |
           test -f ioslegacy.patch || { echo "::error::ioslegacy.patch must be in the repo root"; exit 1; }
           git apply --whitespace=nowarn ioslegacy.patch
+
+      - name: Apply ios5.patch (iOS 5 compatibility on top of ioslegacy.patch)
+        run: |
+          test -f ios5.patch || { echo "::error::ios5.patch must be in the repo root"; exit 1; }
+          git apply --whitespace=nowarn ios5.patch
+          ls ios-legacy/Sources ios-legacy/Resources
+
+      - name: Host test for rt_shim.c (division / int64->float helpers)
+        run: |
+          gcc -O2 -o /tmp/rt_test ios-legacy/tests/rt_shim_test.c
+          /tmp/rt_test
 
       - name: Add iOS 7 time shim (no host.c edits needed)
         run: |
@@ -343,6 +354,15 @@ jobs:
           done
           find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          # Deployment target < 6.0 + -fobjc-arc: clang insists on lib/arc/libarclite_iphoneos.a (Apple's ARC back-deploy
+          # library, not shipped with this toolchain).  The code uses no []-subscripting / other arclite-only features
+          # (checked by "Verify Mach-O"), so an archive with one empty object is enough.
+          TC="$THEOS/toolchain/linux/iphone"
+          mkdir -p "$TC/lib/arc" /tmp/arclite
+          echo 'void wl4_arclite_stub(void) {}' > /tmp/arclite/stub.c
+          "$TC/bin/clang" -target armv7-apple-ios5.0 -isysroot "$SDK" -c /tmp/arclite/stub.c -o /tmp/arclite/stub.o
+          "$TC/bin/llvm-ar" --format=darwin rcs "$TC/lib/arc/libarclite_iphoneos.a" /tmp/arclite/stub.o
+          ls -la "$TC/lib/arc"
 
       - name: Build with Theos
         working-directory: ios-legacy
@@ -354,13 +374,27 @@ jobs:
           make package FINALPACKAGE=1 V=1 2>&1 | tee ../build-theos.log | tail -80
           ls -la packages
 
-      - name: Verify Mach-O (armv7, min iOS 7.0)
+      - name: Verify Mach-O (armv7, min iOS 5.0)
         working-directory: ios-legacy
         run: |
-          BIN="$(find .theos -type f -name WL4Legacy | head -n1)"
-          file "$BIN" || true
-          OTOOL="$(ls "$THEOS"/toolchain/linux/iphone/bin/*otool* 2>/dev/null | head -n1)"
-          [ -n "$OTOOL" ] && "$OTOOL" -hv -l "$BIN" | grep -E "cputype|ARM|LC_VERSION_MIN|version|minos" | head -10 || true
+          set -euo pipefail
+          BIN="$(find .theos/obj -type f -path '*WL4Legacy.app/WL4Legacy' | head -n1)"
+          [ -n "$BIN" ] || { echo "::error::binary not found"; exit 1; }
+          TCB="$THEOS/toolchain/linux/iphone/bin"
+          export PATH="$TCB:$PATH"
+          otool -hv "$BIN" | tail -2
+          MINOS=$(otool -l "$BIN" | grep -A2 LC_VERSION_MIN_IPHONEOS | awk '/version/{print $2}')
+          echo "min iOS: $MINOS"
+          [ "$MINOS" = "5.0" ] || { echo "::error::min iOS is $MINOS, expected 5.0"; exit 1; }
+          # arclite is an empty stand-in: the app must not use anything that needs the real one
+          if strings -a "$BIN" | grep -E "objectAtIndexedSubscript|objectForKeyedSubscript|setObject:atIndexedSubscript|setObject:forKeyedSubscript"; then
+            echo "::error::[]-subscripting found: it crashes on iOS 5 without the real libarclite"; exit 1
+          fi
+          echo "--- imports that are not Objective-C/UIKit symbols (review for anything newer than iOS 5):"
+          nm -u "$BIN" | grep -v -E "_OBJC_|^_NS|^_UI|^_CG|^_CA|^_kCA|^_kCG|^_AV|^_kAudio|^_objc_" || true
+          echo "--- compiler-rt helpers (must be defined in the binary, not imported):"
+          nm -u "$BIN" | grep -E "^___(u?div|u?mod|float|fix)" && { echo "::error::unresolved compiler-rt helper"; exit 1; } || echo "none imported"
+          nm -gU "$BIN" | grep -E "^[0-9a-f]+ [TtSs] ___(u?div|u?mod|float)" || true
 
       - name: Pack .ipa
         working-directory: ios-legacy
@@ -370,12 +404,12 @@ jobs:
           [ -n "$APP" ] || { echo "::error::WL4Legacy.app not found"; exit 1; }
           rm -rf ipa && mkdir -p ipa/Payload
           cp -a "$APP" ipa/Payload/
-          (cd ipa && zip -qr "../packages/WL4-${VER}-armv7-ios7.ipa" Payload)
+          (cd ipa && zip -qr "../packages/WL4-${VER}-armv7-ios5.ipa" Payload)
           ls -la packages
 
       - uses: actions/upload-artifact@v4
         with:
-          name: WL4-${{ env.VER }}-ios-legacy-armv7
+          name: WL4-${{ env.VER }}-ios5-armv7
           path: |
             ios-legacy/packages/*.ipa
             ios-legacy/packages/*.deb
@@ -384,7 +418,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: build-logs-ios-legacy
+          name: build-logs-ios5
           path: |
             port-build.log
             build-theos.log
