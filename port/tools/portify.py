@@ -694,6 +694,8 @@ PATCHES = [   # (relative path, regex, replacement)
     # p*6+s while InitMapScreen tested byte 16: the map never saw the first boss as defeated -> map mode stayed 0 and every exit
     # of the first passage stayed locked ("can't go further in stage select after the first boss").  Force the same 4-byte layout.
     ('include/score.h', r'(    u8 keyzer : 1;\n)\};', r'\1    u8 portPad[3];\n};'),
+    # diagnostics: tag 0 = 100 + mapMode*10 + currentPassage while the map screen runs (mode must become 1 after the first boss)
+    ('src/map_screen.c', r'(int UpdateMapScreen\(void\)\n\{\n)', r'\1    hal_trace_val(0, 100 + (unsigned)gUnk_3003C95 * 10 + (unsigned)gCurrentPassage);\n'),
     # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
     ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
     ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
