@@ -1,0 +1,1315 @@
+diff --git a/.github/workflows/wl4-ios-legacy.yml b/.github/workflows/wl4-ios-legacy.yml
+new file mode 100644
+index 0000000..52bfcd3
+--- /dev/null
++++ b/.github/workflows/wl4-ios-legacy.yml
+@@ -0,0 +1,189 @@
++name: Build Wario Land 4 iOS legacy (armv7, iOS 7.0-9.3.5)
++
++# Branch: ioslegacy.  Target: iPad mini 1 (A5, 32-bit).  Linux runner, Theos + iPhoneOS 9.3 SDK (no Xcode needed).
++# Needs YOUR OWN US ROM via secret WL4_ROM_ID (Google Drive file id).  The .ipa embeds ROM-derived data (make extract),
++# so the job refuses to run in a public repo unless overridden.  Output: unsigned .ipa + .deb.
++
++on:
++  workflow_dispatch:
++    inputs:
++      allow_public_repo:
++        description: "I understand the .ipa embeds ROM-derived data"
++        type: boolean
++        default: false
++      opt_level:
++        description: "Clang -O level for the wasm32 compile (0/1/2)"
++        default: "2"
++      version:
++        description: "ROM version: us or jp"
++        default: "us"
++
++env:
++  WASI_SDK_VERSION: "24"
++  WABT_VERSION: "1.0.36"
++  ROM_MD5_US: "5fe47355a33e3fabec2a1607af88a404"
++  ROM_MD5_JP: "99c8ad779a16be513a9fdff502b6f5c2"
++
++jobs:
++  build:
++    runs-on: ubuntu-22.04
++    timeout-minutes: 150
++    steps:
++      - name: Refuse public repos unless overridden
++        if: ${{ github.event.repository.private == false && inputs.allow_public_repo != true }}
++        run: |
++          echo "::error::Public repo: the .ipa embeds ROM-derived data. Rerun with allow_public_repo=true only if you accept that."
++          exit 1
++
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++
++      - name: Resolve settings
++        run: |
++          VER="${{ inputs.version }}"; VER="${VER:-us}"
++          echo "VER=$VER" >> "$GITHUB_ENV"
++          OPT="${{ inputs.opt_level }}"; echo "OPT_LEVEL=${OPT:-2}" >> "$GITHUB_ENV"
++          if [ "$VER" = jp ]; then echo "ROM_MD5=$ROM_MD5_JP" >> "$GITHUB_ENV"; else echo "ROM_MD5=$ROM_MD5_US" >> "$GITHUB_ENV"; fi
++
++      - name: System packages
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build python3-venv python3-pip \
++            perl curl ca-certificates git unzip zip xz-utils bzip2 fakeroot
++
++      - name: Get ROM
++        env:
++          ROM_ID: ${{ inputs.version == 'jp' && secrets.WL4_ROM_ID_JP || secrets.WL4_ROM_ID }}
++        run: |
++          if [ ! -f "baserom_${VER}.gba" ]; then
++            [ -n "$ROM_ID" ] || { echo "::error::Secret WL4_ROM_ID (or WL4_ROM_ID_JP) not set"; exit 1; }
++            pip install --quiet gdown
++            gdown "$ROM_ID" -O "baserom_${VER}.gba"
++          fi
++          echo "${ROM_MD5}  baserom_${VER}.gba" | md5sum -c - || { echo "::error::ROM MD5 mismatch"; exit 1; }
++
++      - name: Extract assets (make extract)
++        run: |
++          python3 -m venv .venv
++          . .venv/bin/activate
++          pip install --quiet pyyaml
++          make extract VERSION=$VER
++
++      - name: Cache wasi-sdk
++        id: cache-wasi
++        uses: actions/cache@v4
++        with:
++          path: ~/wasi-sdk
++          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}
++      - name: Install wasi-sdk
++        if: steps.cache-wasi.outputs.cache-hit != 'true'
++        run: |
++          V="$WASI_SDK_VERSION"; ARCH=$(uname -m); [ "$ARCH" = aarch64 ] && ARCH=arm64
++          BASE="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${V}"
++          curl -fsSL -o /tmp/wasi.tgz "${BASE}/wasi-sdk-${V}.0-${ARCH}-linux.tar.gz" \
++            || curl -fsSL -o /tmp/wasi.tgz "${BASE}/wasi-sdk-${V}.0+m-${ARCH}-linux.tar.gz"
++          mkdir -p ~/wasi-sdk && tar -xzf /tmp/wasi.tgz -C ~/wasi-sdk --strip-components=1
++
++      - name: Cache wabt
++        id: cache-wabt
++        uses: actions/cache@v4
++        with:
++          path: |
++            ~/wabt-install
++            ~/wabt-src
++          key: wabt-${{ env.WABT_VERSION }}
++      - name: Build wabt (wasm2c)
++        if: steps.cache-wabt.outputs.cache-hit != 'true'
++        run: |
++          V="$WABT_VERSION"
++          git clone --recursive --depth 1 --branch "$V" https://github.com/WebAssembly/wabt ~/wabt-src 2>/dev/null \
++            || git clone --recursive --depth 1 --branch "v$V" https://github.com/WebAssembly/wabt ~/wabt-src
++          cmake -S ~/wabt-src -B ~/wabt-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$HOME/wabt-install"
++          cmake --build ~/wabt-src/build -j"$(nproc)"
++          cmake --install ~/wabt-src/build
++
++      - name: portify -> wasm32 -> wasm2c
++        env:
++          WASI_SDK: /home/runner/wasi-sdk
++          WABT: /home/runner/wabt-install
++          WABT_SRC: /home/runner/wabt-src
++        run: |
++          set -o pipefail
++          chmod +x port/build_wasm.sh
++          ./port/build_wasm.sh "$VER" 2>&1 | tee port-build.log
++          echo "--- failed C files (expected: none)"; cat port/build/FAILED.txt
++          echo "--- unported asm sites (expected: none)"; cat port/build/ASM_SITES.txt
++          test -s port/build/wasm2c/wl4.c
++
++      - name: Prepare legacy sources (gen/)
++        run: |
++          chmod +x ios-legacy/prepare.sh
++          ./ios-legacy/prepare.sh "$VER"
++
++      - name: Install Theos + iOS toolchain
++        run: |
++          set -euo pipefail
++          export THEOS="$GITHUB_WORKSPACE/theos"
++          git clone --recursive https://github.com/theos/theos.git "$THEOS"
++          mkdir -p "$THEOS/toolchain/linux/iphone"
++          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/ios-toolchain.tar.xz
++          tar -xf /tmp/ios-toolchain.tar.xz -C "$THEOS/toolchain"
++          mkdir -p "$THEOS/sdks"
++          curl -fsSL -o /tmp/iphoneos9.3.sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
++          tar -xjf /tmp/iphoneos9.3.sdk.tbz2 -C "$THEOS/sdks"
++          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
++          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
++            if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
++          done
++          find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
++          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
++
++      - name: Build with Theos
++        working-directory: ios-legacy
++        env:
++          FINALPACKAGE: "1"
++        run: |
++          set -euo pipefail
++          make clean || true
++          make package FINALPACKAGE=1 V=1 2>&1 | tee ../build-theos.log | tail -80
++          ls -la packages
++
++      - name: Verify Mach-O (armv7, min iOS 7.0)
++        working-directory: ios-legacy
++        run: |
++          BIN="$(find .theos -type f -name WL4Legacy | head -n1)"
++          file "$BIN" || true
++          OTOOL="$(ls "$THEOS"/toolchain/linux/iphone/bin/*otool* 2>/dev/null | head -n1)"
++          [ -n "$OTOOL" ] && "$OTOOL" -hv -l "$BIN" | grep -E "cputype|ARM|LC_VERSION_MIN|version|minos" | head -10 || true
++
++      - name: Pack .ipa
++        working-directory: ios-legacy
++        run: |
++          set -euo pipefail
++          APP="$(find .theos -type d -name WL4Legacy.app | head -n1)"
++          [ -n "$APP" ] || { echo "::error::WL4Legacy.app not found"; exit 1; }
++          rm -rf ipa && mkdir -p ipa/Payload
++          cp -a "$APP" ipa/Payload/
++          (cd ipa && zip -qr "../packages/WL4-${VER}-armv7-ios7.ipa" Payload)
++          ls -la packages
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: WL4-${{ env.VER }}-ios-legacy-armv7
++          path: |
++            ios-legacy/packages/*.ipa
++            ios-legacy/packages/*.deb
++          if-no-files-found: error
++
++      - uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: build-logs-ios-legacy
++          path: |
++            port-build.log
++            build-theos.log
++            port/build/errors.log
++          if-no-files-found: ignore
+diff --git a/.gitignore b/.gitignore
+index e034ff4..53668e7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -79,4 +79,9 @@ __pycache__
+ bundles/
+ tools/
+ decomp_work/
+-decomp_work_v2/
+\ No newline at end of file
++decomp_work_v2/
++# ios-legacy (Theos) build products
++ios-legacy/gen/
++ios-legacy/.theos/
++ios-legacy/packages/
++ios-legacy/ipa/
+diff --git a/ios-legacy/Makefile b/ios-legacy/Makefile
+new file mode 100644
+index 0000000..c8617d1
+--- /dev/null
++++ b/ios-legacy/Makefile
+@@ -0,0 +1,34 @@
++# Wario Land 4 - legacy iOS port (armv7, iOS 7.0 - 9.3.5; target device: iPad mini 1 / A5).
++# Built on Linux with Theos + the iPhoneOS 9.3 SDK (same toolchain as the Crash Bandicoot armv7 port).
++# Run ./prepare.sh first: it gathers the portable core + wasm2c output into gen/.  See ../.github/workflows/wl4-ios-legacy.yml.
++export THEOS_DEVICE_IP =
++ARCHS = armv7
++TARGET = iphone:clang:9.3:7.0
++INSTALL_TARGET_PROCESSES = WL4Legacy
++
++include $(THEOS)/makefiles/common.mk
++
++APPLICATION_NAME = WL4Legacy
++
++WL4Legacy_FILES = $(wildcard gen/core/*.c) $(wildcard gen/w2c/*.c) gen/stubs.c \
++	Sources/WL4Log.c Sources/main.m Sources/AppDelegate.m Sources/WL4Session.m \
++	Sources/MenuViewController.m Sources/GameViewController.m Sources/GameView.m Sources/PadView.m
++
++# UI files are ARC; the C core is not (ADDITIONAL_OBJCFLAGS only touches .m).
++ADDITIONAL_OBJCFLAGS += -fobjc-arc
++
++# WASM_RT_USE_MMAP=0: explicit bounds checks (32-bit host has no room for guard-page reservations anyway).
++# WL4_LEGACY: host.c skips APIs newer than iOS 7 (QoS).  -fno-modules*: the 9.3 SDK's legacy module maps confuse modern clang.
++ADDITIONAL_CFLAGS += -std=gnu11 -O2 -w -fno-strict-aliasing \
++	-fno-modules -fno-implicit-modules -fno-implicit-module-maps \
++	-Igen/core -Igen/w2c -Igen -ISources \
++	-DWASM_RT_TRAP_HANDLER=wl4_trap -DWL4_TRACE=1 -DWASM_RT_USE_MMAP=0 -DWL4_LEGACY=1
++
++WL4Legacy_LDFLAGS = -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics \
++	-framework AudioToolbox -framework AVFoundation -weak_framework GameController -Wl,-dead_strip
++
++WL4Legacy_CODESIGN_FLAGS = -SResources/entitlements.plist
++WL4Legacy_PLIST = Resources/Info.plist
++WL4Legacy_RESOURCE_FILES = $(wildcard Resources/LaunchImage*.png)
++
++include $(THEOS_MAKE_PATH)/application.mk
+diff --git a/ios-legacy/Resources/Info.plist b/ios-legacy/Resources/Info.plist
+new file mode 100644
+index 0000000..05db45a
+--- /dev/null
++++ b/ios-legacy/Resources/Info.plist
+@@ -0,0 +1,32 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>CFBundleDevelopmentRegion</key><string>en</string>
++	<key>CFBundleExecutable</key><string>WL4Legacy</string>
++	<key>CFBundleIdentifier</key><string>com.wl4.port.legacy</string>
++	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
++	<key>CFBundleName</key><string>WL4</string>
++	<key>CFBundleDisplayName</key><string>Wario Land 4</string>
++	<key>CFBundlePackageType</key><string>APPL</string>
++	<key>CFBundleShortVersionString</key><string>1.0.0</string>
++	<key>CFBundleVersion</key><string>1</string>
++	<key>MinimumOSVersion</key><string>7.0</string>
++	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string></array>
++	<key>LSRequiresIPhoneOS</key><true/>
++	<key>UIDeviceFamily</key><array><integer>2</integer><integer>1</integer></array>
++	<key>UILaunchImages</key>
++	<array>
++		<dict><key>UILaunchImageMinimumOSVersion</key><string>7.0</string><key>UILaunchImageName</key><string>LaunchImage-Landscape</string><key>UILaunchImageOrientation</key><string>Landscape</string><key>UILaunchImageSize</key><string>{768, 1024}</string></dict>
++		<dict><key>UILaunchImageMinimumOSVersion</key><string>7.0</string><key>UILaunchImageName</key><string>LaunchImage-Portrait</string><key>UILaunchImageOrientation</key><string>Portrait</string><key>UILaunchImageSize</key><string>{768, 1024}</string></dict>
++	</array>
++	<key>UISupportedInterfaceOrientations</key>
++	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationPortrait</string></array>
++	<key>UISupportedInterfaceOrientations~ipad</key>
++	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationPortrait</string></array>
++	<key>UIStatusBarHidden</key><true/>
++	<key>UIViewControllerBasedStatusBarAppearance</key><false/>
++	<key>UIRequiresFullScreen</key><true/>
++	<key>UIFileSharingEnabled</key><true/>
++</dict>
++</plist>
+diff --git a/ios-legacy/Resources/LaunchImage-Landscape.png b/ios-legacy/Resources/LaunchImage-Landscape.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..5483aea676ffc249bc57e09ca1c3faede8d0624a
+GIT binary patch
+literal 2367
+zcmeAS@N?(olHy`uVBq!ia0y~yU;#3j8911Ll<AG8C<X>jHcuDFkcv5P4;nH81rIIw
+z>YvNYzW~S_1*0J_8UmvsFd71*Aut*OqaiSiL!d#NnN@~?QDKq}JII%wu6{1-oD!M<
+DzQ7S*
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/LaunchImage-Landscape@2x.png b/ios-legacy/Resources/LaunchImage-Landscape@2x.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ba5893fab3c7641a2fae8b66d0979160d47322d
+GIT binary patch
+literal 9238
+zcmeI&u?fOZ5XSNESx5*Z1K2u&o!Ch9iM}R^*y{p<Wy+wHodY<74q%lz#0|s&QbgYy
+zBly4Oj)Q}{Uw!9QK2PFaEGcmdyOttfb`^De+SlWe)PFgfZHnu=GR8N{OLPB3VSqpY
+z0R#|0009ILKmY**5I_I{1Q0*~0R#|0009ILKmY**5I_KdRtuER(=>btDEn?7Rod!X
+YSRR4@6<DSRnPyNA1A&|6_BPoaf9V<+<p2Nx
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/LaunchImage-Portrait.png b/ios-legacy/Resources/LaunchImage-Portrait.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..a95fab4ea723f43a231c620bd230c185162b563e
+GIT binary patch
+literal 2367
+zcmeAS@N?(olHy`uVBq!ia0y~yU<NW-7&w@K)J>O_;S3C%Y@RNTAr*7p9yDYG3LaYU
+z)jyY)e*us=3PwX<Gz3ONU^E0qLtr!nMnhmYhkzXqn+yY^#GzFtAYXdA`njxgN@xNA
+Do;ea1
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/LaunchImage-Portrait@2x.png b/ios-legacy/Resources/LaunchImage-Portrait@2x.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..3cf664ea545fdd88efbba220be608ee2f002b178
+GIT binary patch
+literal 9239
+zcmeI&F$%&!5J1scMOi`u7FM>Fo+7d#ZWDso2o`#RSXwSx*?9oZU<yy*C2RywAmRyv
+zyWS%Br<q}3VCL0xEQ>seMv;glc4p=xeP3$P9iOUewGkOVtw|TV^XsORZ@N=czjYWO
+z5I_I{1Q0*~0R#|0009ILKmY**5I_I{1Q0*~0R#|0009ILK%mtE?s4dbX8=i?`y?)Z
+dWvdTjc?AAa;L{syMXlU$8P2y^VJ_44{tJ?}7rOue
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/entitlements.plist b/ios-legacy/Resources/entitlements.plist
+new file mode 100644
+index 0000000..42cfb9c
+--- /dev/null
++++ b/ios-legacy/Resources/entitlements.plist
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>get-task-allow</key>
++	<true/>
++</dict>
++</plist>
+diff --git a/ios-legacy/Sources/AppDelegate.h b/ios-legacy/Sources/AppDelegate.h
+new file mode 100644
+index 0000000..e9945c7
+--- /dev/null
++++ b/ios-legacy/Sources/AppDelegate.h
+@@ -0,0 +1,4 @@
++#import <UIKit/UIKit.h>
++@interface AppDelegate : UIResponder <UIApplicationDelegate>
++@property (nonatomic, strong) UIWindow *window;
++@end
+diff --git a/ios-legacy/Sources/AppDelegate.m b/ios-legacy/Sources/AppDelegate.m
+new file mode 100644
+index 0000000..393d6be
+--- /dev/null
++++ b/ios-legacy/Sources/AppDelegate.m
+@@ -0,0 +1,61 @@
++#import "AppDelegate.h"
++#import "MenuViewController.h"
++#import "WL4Session.h"
++#import <AVFoundation/AVFoundation.h>
++#include "WL4Log.h"
++#include "audio.h"
++
++/* iOS 7-9.3 build: no block timers (iOS 10), no UIAlertController (8). */
++@implementation AppDelegate {
++    NSTimer *_autosave;
++}
++
++- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
++    WL4Session *s = WL4Session.shared;
++
++    NSFileManager *fm = NSFileManager.defaultManager;
++    NSString *prev = [s.documentsPath stringByAppendingPathComponent:@"wl4.prev.log"];
++    if ([fm fileExistsAtPath:s.logPath]) { [fm removeItemAtPath:prev error:nil]; [fm moveItemAtPath:s.logPath toPath:prev error:nil]; }
++    wl4_log_open(s.logPath.fileSystemRepresentation);
++
++    AVAudioSession *as = [AVAudioSession sharedInstance];
++    [as setCategory:AVAudioSessionCategoryPlayback error:nil];
++    [as setActive:YES error:nil];
++    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioInterruption:)
++                                                 name:AVAudioSessionInterruptionNotification object:as];
++
++    [s adoptRomsFromDocuments];
++    _autosave = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(autosaveTick:) userInfo:nil repeats:YES];
++
++    self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
++    self.window.rootViewController = [MenuViewController new];
++    [self.window makeKeyAndVisible];
++    return YES;
++}
++
++- (void)autosaveTick:(NSTimer *)t { [WL4Session.shared persistSave]; }
++
++- (void)audioInterruption:(NSNotification *)n {
++    NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
++    if (type == AVAudioSessionInterruptionTypeBegan) {
++        WL4Session.shared.interrupted = YES;
++    } else {
++        [[AVAudioSession sharedInstance] setActive:YES error:nil];
++        wl4_audio_request_restart();
++        WL4Session.shared.interrupted = NO;
++    }
++}
++
++- (void)applicationDidBecomeActive:(UIApplication *)application {
++    [[AVAudioSession sharedInstance] setActive:YES error:nil];
++    wl4_audio_request_restart();
++    WL4Session.shared.appActive = YES;
++}
++- (void)applicationWillResignActive:(UIApplication *)application {
++    WL4Session.shared.appActive = NO;
++    [WL4Session.shared persistSave];
++}
++- (void)applicationDidEnterBackground:(UIApplication *)application { [WL4Session.shared persistSave]; }
++- (void)applicationWillTerminate:(UIApplication *)application { [WL4Session.shared persistSave]; }
++
++@end
+diff --git a/ios-legacy/Sources/GameView.h b/ios-legacy/Sources/GameView.h
+new file mode 100644
+index 0000000..7ef2c3b
+--- /dev/null
++++ b/ios-legacy/Sources/GameView.h
+@@ -0,0 +1,18 @@
++#import <UIKit/UIKit.h>
++
++typedef NS_ENUM(NSInteger, WL4ScaleMode) {
++    WL4ScaleSharp = 0,     /* fit the screen, nearest-neighbour */
++    WL4ScaleSmooth = 1,    /* fit the screen, bilinear */
++    WL4ScaleInteger = 2,   /* largest integer multiple of device pixels, nearest-neighbour (black borders) */
++};
++
++/* Where the 240x160 picture goes inside `bounds`: landscape = centred, portrait = full width below the top safe area. */
++CGRect WL4GameRect(CGRect bounds, UIEdgeInsets safe, WL4ScaleMode mode, CGFloat screenScale);
++
++/* Shows the core's framebuffer.  A CADisplayLink pulls wl4_copy_frame() and hands it to a CALayer as a CGImage -
++ * 240x160 is tiny, so this is cheap and needs no GL/Metal. */
++@interface GameView : UIView
++@property (nonatomic) WL4ScaleMode scaleMode;     /* persisted in NSUserDefaults */
++- (void)start;
++- (void)stop;
++@end
+diff --git a/ios-legacy/Sources/GameView.m b/ios-legacy/Sources/GameView.m
+new file mode 100644
+index 0000000..9c3e40a
+--- /dev/null
++++ b/ios-legacy/Sources/GameView.m
+@@ -0,0 +1,101 @@
++#import "GameView.h"
++#import <QuartzCore/QuartzCore.h>
++#include "host.h"
++
++/* iOS 7: no safe-area insets; the status bar is hidden, so `safe` is normally zero. */
++CGRect WL4GameRect(CGRect b, UIEdgeInsets safe, WL4ScaleMode mode, CGFloat sc) {
++    BOOL land = b.size.width > b.size.height;
++    CGFloat availW = b.size.width;
++    CGFloat availH = land ? b.size.height : b.size.width * 160.0 / 240.0;
++    CGFloat s = MIN(availW / 240.0, availH / 160.0);
++    if (mode == WL4ScaleInteger && sc > 0) s = MAX(1.0, floor(s * sc)) / sc;
++    CGFloat w = 240.0 * s, h = 160.0 * s;
++    CGFloat x = b.origin.x + (b.size.width - w) / 2.0;
++    CGFloat y = land ? b.origin.y + (b.size.height - h) / 2.0 : b.origin.y + safe.top;
++    return CGRectMake(x, y, w, h);
++}
++
++@implementation GameView {
++    CALayer *_screen;
++    CGContextRef _ctx;
++    CADisplayLink *_link;
++    int _lastFrame;
++}
++
++- (instancetype)initWithFrame:(CGRect)frame {
++    if ((self = [super initWithFrame:frame])) {
++        self.backgroundColor = [UIColor blackColor];
++        self.opaque = YES;
++        _screen = [CALayer layer];
++        _screen.opaque = YES;
++        _screen.backgroundColor = [UIColor blackColor].CGColor;
++        _screen.contentsGravity = kCAGravityResize;
++        [self.layer addSublayer:_screen];
++
++        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++        _ctx = CGBitmapContextCreate(NULL, 240, 160, 8, 240 * 4, cs, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
++        CGColorSpaceRelease(cs);
++
++        _lastFrame = -1;
++        _scaleMode = (WL4ScaleMode)[[NSUserDefaults standardUserDefaults] integerForKey:@"wl4.scale"];
++        [self applyFilter];
++    }
++    return self;
++}
++
++- (void)dealloc {
++    [_link invalidate];
++    if (_ctx) CGContextRelease(_ctx);
++}
++
++- (void)applyFilter {
++    NSString *f = (_scaleMode == WL4ScaleSmooth) ? kCAFilterLinear : kCAFilterNearest;
++    _screen.magnificationFilter = f;
++    _screen.minificationFilter = f;
++}
++
++- (void)setScaleMode:(WL4ScaleMode)m {
++    _scaleMode = m;
++    [[NSUserDefaults standardUserDefaults] setInteger:m forKey:@"wl4.scale"];
++    [self applyFilter];
++    [self setNeedsLayout];
++}
++
++- (void)layoutSubviews {
++    [super layoutSubviews];
++    CGFloat sc = self.window.screen.scale ?: [UIScreen mainScreen].scale;
++    CGRect r = WL4GameRect(self.bounds, UIEdgeInsetsZero, _scaleMode, sc);
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    _screen.frame = r;
++    [CATransaction commit];
++}
++
++- (void)start {
++    if (_link) return;
++    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
++    _link.frameInterval = 1;              /* preferredFramesPerSecond is iOS 10+ */
++    [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
++}
++
++- (void)stop {
++    [_link invalidate];
++    _link = nil;
++}
++
++- (void)tick:(CADisplayLink *)link {
++    uint32_t *px = (uint32_t *)CGBitmapContextGetData(_ctx);
++    if (!px) return;
++    int f = wl4_copy_frame(px);
++    if (f == _lastFrame) return;
++    _lastFrame = f;
++    CGImageRef img = CGBitmapContextCreateImage(_ctx);
++    if (!img) return;
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    _screen.contents = (__bridge id)img;
++    [CATransaction commit];
++    CGImageRelease(img);
++}
++
++@end
+diff --git a/ios-legacy/Sources/GameViewController.h b/ios-legacy/Sources/GameViewController.h
+new file mode 100644
+index 0000000..fd6b944
+--- /dev/null
++++ b/ios-legacy/Sources/GameViewController.h
+@@ -0,0 +1,3 @@
++#import <UIKit/UIKit.h>
++@interface GameViewController : UIViewController
++@end
+diff --git a/ios-legacy/Sources/GameViewController.m b/ios-legacy/Sources/GameViewController.m
+new file mode 100644
+index 0000000..bc58794
+--- /dev/null
++++ b/ios-legacy/Sources/GameViewController.m
+@@ -0,0 +1,131 @@
++#import "GameViewController.h"
++#import "GameView.h"
++#import "PadView.h"
++#import "WL4Session.h"
++#import <GameController/GameController.h>
++
++@interface GameViewController () <UIAlertViewDelegate>
++@end
++
++@implementation GameViewController {
++    GameView *_gv;
++    PadView *_pad;
++    UIButton *_menu;
++}
++
++- (void)viewDidLoad {
++    [super viewDidLoad];
++    self.view.backgroundColor = [UIColor blackColor];
++
++    _gv = [[GameView alloc] initWithFrame:self.view.bounds];
++    _gv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
++    [self.view addSubview:_gv];
++
++    _pad = [[PadView alloc] initWithFrame:self.view.bounds];
++    _pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
++    _pad.scaleMode = _gv.scaleMode;
++    _pad.onKeys = ^(uint16_t k) { WL4Session.shared.touchKeys = k; };
++    [self.view addSubview:_pad];
++
++    _menu = [UIButton buttonWithType:UIButtonTypeCustom];
++    [_menu setTitle:@"MENU" forState:UIControlStateNormal];
++    _menu.titleLabel.font = [UIFont boldSystemFontOfSize:14];
++    [_menu setTitleColor:[UIColor colorWithWhite:1 alpha:0.7] forState:UIControlStateNormal];
++    [_menu addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
++    [self.view addSubview:_menu];
++
++    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++    [nc addObserver:self selector:@selector(controllerConnected:) name:GCControllerDidConnectNotification object:nil];
++    [nc addObserver:self selector:@selector(controllerDisconnected:) name:GCControllerDidDisconnectNotification object:nil];
++    for (GCController *c in [GCController controllers]) [self bindController:c];
++    [self updatePadVisibility];
++}
++
++- (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
++
++- (void)viewDidLayoutSubviews {
++    [super viewDidLayoutSubviews];
++    CGFloat w = self.view.bounds.size.width;
++    _menu.frame = CGRectMake((w - 64) / 2, 2, 64, 36);
++}
++
++- (void)viewWillAppear:(BOOL)animated {
++    [super viewWillAppear:animated];
++    [UIApplication sharedApplication].idleTimerDisabled = YES;
++    [_gv start];
++    WL4Session.shared.gameVisible = YES;
++}
++
++- (void)viewWillDisappear:(BOOL)animated {
++    [super viewWillDisappear:animated];
++    WL4Session.shared.gameVisible = NO;
++    [WL4Session.shared persistSave];
++    [_gv stop];
++    [UIApplication sharedApplication].idleTimerDisabled = NO;
++}
++
++#pragma mark - in-game menu (UIAlertView: UIAlertController needs iOS 8)
++
++- (void)showMenu {
++    WL4Session.shared.userPaused = YES;
++    NSArray *names = @[@"Sharp (fit)", @"Smooth (fit)", @"Integer scale"];
++    UIAlertView *a = [[UIAlertView alloc] initWithTitle:@"Paused" message:nil delegate:self cancelButtonTitle:@"Resume" otherButtonTitles:nil];
++    for (NSInteger i = 0; i < 3; i++)
++        [a addButtonWithTitle:[NSString stringWithFormat:@"%@%@", names[i], _gv.scaleMode == i ? @"  ✓" : @""]];
++    [a addButtonWithTitle:@"Back to menu"];
++    [a show];
++}
++
++- (void)alertView:(UIAlertView *)alertView clickedButtonAtIndex:(NSInteger)idx {
++    WL4Session *s = WL4Session.shared;
++    s.userPaused = NO;
++    if (idx >= 1 && idx <= 3) {
++        _gv.scaleMode = (WL4ScaleMode)(idx - 1);
++        _pad.scaleMode = (WL4ScaleMode)(idx - 1);
++    } else if (idx == 4) {
++        [self dismissViewControllerAnimated:YES completion:nil];
++    }
++}
++
++#pragma mark - MFi controllers (iOS 7+)
++
++- (void)bindController:(GCController *)c {
++    /* Start via the controller's pause button (buttonMenu/buttonOptions only exist on iOS 13+) */
++    c.controllerPausedHandler = ^(GCController *ctl) {
++        WL4Session.shared.padKeys |= WL4KeyStart;
++        [self performSelector:@selector(releaseStart) withObject:nil afterDelay:0.12];
++    };
++    GCExtendedGamepad *g = c.extendedGamepad;
++    if (!g) return;
++    g.valueChangedHandler = ^(GCExtendedGamepad *gp, GCControllerElement *el) {
++        uint16_t k = WL4Session.shared.padKeys & WL4KeyStart;
++        if (gp.buttonA.pressed) k |= WL4KeyA;
++        if (gp.buttonB.pressed || gp.buttonX.pressed) k |= WL4KeyB;
++        if (gp.rightShoulder.pressed || gp.rightTrigger.pressed) k |= WL4KeyR;
++        if (gp.leftShoulder.pressed || gp.leftTrigger.pressed) k |= WL4KeyL;
++        if (gp.buttonY.pressed) k |= WL4KeySelect;
++        float x = gp.leftThumbstick.xAxis.value, y = gp.leftThumbstick.yAxis.value;
++        if (gp.dpad.left.pressed || x < -0.5f) k |= WL4KeyLeft;
++        if (gp.dpad.right.pressed || x > 0.5f) k |= WL4KeyRight;
++        if (gp.dpad.up.pressed || y > 0.5f) k |= WL4KeyUp;
++        if (gp.dpad.down.pressed || y < -0.5f) k |= WL4KeyDown;
++        WL4Session.shared.padKeys = k;
++    };
++}
++- (void)releaseStart { WL4Session.shared.padKeys &= (uint16_t)~WL4KeyStart; }
++
++- (void)controllerConnected:(NSNotification *)n { [self bindController:(GCController *)n.object]; [self updatePadVisibility]; }
++- (void)controllerDisconnected:(NSNotification *)n { WL4Session.shared.padKeys = 0; [self updatePadVisibility]; }
++- (void)updatePadVisibility {
++    BOOL have = NO;
++    for (GCController *c in [GCController controllers]) if (c.extendedGamepad) have = YES;
++    _pad.hidden = have;
++}
++
++#pragma mark - chrome
++
++- (BOOL)prefersStatusBarHidden { return YES; }
++- (BOOL)shouldAutorotate { return YES; }
++- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
++
++@end
+diff --git a/ios-legacy/Sources/MenuViewController.h b/ios-legacy/Sources/MenuViewController.h
+new file mode 100644
+index 0000000..12e3fb7
+--- /dev/null
++++ b/ios-legacy/Sources/MenuViewController.h
+@@ -0,0 +1,3 @@
++#import <UIKit/UIKit.h>
++@interface MenuViewController : UIViewController
++@end
+diff --git a/ios-legacy/Sources/MenuViewController.m b/ios-legacy/Sources/MenuViewController.m
+new file mode 100644
+index 0000000..dfbabf8
+--- /dev/null
++++ b/ios-legacy/Sources/MenuViewController.m
+@@ -0,0 +1,88 @@
++#import "MenuViewController.h"
++#import "GameViewController.h"
++#import "WL4Session.h"
++
++/* iOS 7-9.3: no UIDocumentPicker (8+), no UIStackView (9+), no layout anchors (9+).  ROMs arrive through iTunes File
++ * Sharing / Filza / SSH into Documents/ as *.gba; "Rescan" adopts them. */
++@implementation MenuViewController {
++    UILabel *_title, *_status, *_note;
++    UIButton *_play, *_rescan;
++}
++
++static UIButton *MakeButton(NSString *title, id target, SEL action) {
++    UIButton *b = [UIButton buttonWithType:UIButtonTypeRoundedRect];
++    [b setTitle:title forState:UIControlStateNormal];
++    b.titleLabel.font = [UIFont boldSystemFontOfSize:22];
++    [b addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
++    return b;
++}
++
++static UILabel *MakeLabel(CGFloat size, BOOL bold, UIColor *c) {
++    UILabel *l = [UILabel new];
++    l.numberOfLines = 0;
++    l.textAlignment = NSTextAlignmentCenter;
++    l.textColor = c;
++    l.backgroundColor = [UIColor clearColor];
++    l.font = bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
++    return l;
++}
++
++- (void)viewDidLoad {
++    [super viewDidLoad];
++    self.view.backgroundColor = [UIColor whiteColor];
++    _title = MakeLabel(36, YES, [UIColor blackColor]);
++    _title.text = @"Wario Land 4";
++    _status = MakeLabel(17, NO, [UIColor grayColor]);
++    _note = MakeLabel(13, NO, [UIColor lightGrayColor]);
++    _note.text = @"This app ships no game data. Copy your own .gba into this app's folder with iTunes File Sharing (or Filza), then tap Rescan.";
++    _play = MakeButton(@"Play", self, @selector(play));
++    _rescan = MakeButton(@"Rescan ROM", self, @selector(rescan));
++    for (UIView *v in @[_title, _status, _play, _rescan, _note]) [self.view addSubview:v];
++}
++
++- (void)viewDidLayoutSubviews {
++    [super viewDidLayoutSubviews];
++    CGFloat W = self.view.bounds.size.width, H = self.view.bounds.size.height;
++    CGFloat w = MIN(420, W - 48), x = (W - w) / 2;
++    CGFloat total = 50 + 60 + 50 + 50 + 70 + 4 * 14;
++    CGFloat y = MAX(20, (H - total) / 2);
++    _title.frame = CGRectMake(x, y, w, 50);   y += 50 + 14;
++    _status.frame = CGRectMake(x, y, w, 60);  y += 60 + 14;
++    _play.frame = CGRectMake(x, y, w, 50);    y += 50 + 14;
++    _rescan.frame = CGRectMake(x, y, w, 50);  y += 50 + 14;
++    _note.frame = CGRectMake(x, y, w, 70);
++}
++
++- (void)viewWillAppear:(BOOL)animated {
++    [super viewWillAppear:animated];
++    [self refresh];
++}
++
++- (void)refresh {
++    WL4Session *s = WL4Session.shared;
++    [s adoptRomsFromDocuments];
++    BOOL has = [s hasRom];
++    _play.enabled = has;
++    NSString *rom = has ? @"ROM ready." : @"No ROM found.";
++    _status.text = s.started ? [rom stringByAppendingString:@"\nGame is running in the background (paused)."] : rom;
++}
++
++- (void)alert:(NSString *)title message:(NSString *)msg {
++    [[[UIAlertView alloc] initWithTitle:title message:msg delegate:nil cancelButtonTitle:@"OK" otherButtonTitles:nil] show];
++}
++
++- (void)rescan { [self refresh]; }
++
++- (void)play {
++    NSString *err = [WL4Session.shared startIfNeeded];
++    if (err) { [self alert:@"Can't start" message:err]; return; }
++    GameViewController *vc = [GameViewController new];
++    vc.modalPresentationStyle = UIModalPresentationFullScreen;
++    [self presentViewController:vc animated:YES completion:nil];
++}
++
++- (BOOL)prefersStatusBarHidden { return YES; }
++- (BOOL)shouldAutorotate { return YES; }
++- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
++
++@end
+diff --git a/ios-legacy/Sources/PadView.h b/ios-legacy/Sources/PadView.h
+new file mode 100644
+index 0000000..ef43c17
+--- /dev/null
++++ b/ios-legacy/Sources/PadView.h
+@@ -0,0 +1,9 @@
++#import <UIKit/UIKit.h>
++#import "GameView.h"
++
++/* Translucent on-screen GBA pad (D-pad as four overlapping circles so diagonals work, A/B, L/R, Start/Select).
++ * Multi-touch; sliding a finger between buttons works. */
++@interface PadView : UIView
++@property (nonatomic, copy) void (^onKeys)(uint16_t keys);
++@property (nonatomic) WL4ScaleMode scaleMode;     /* portrait layout depends on where the picture ends */
++@end
+diff --git a/ios-legacy/Sources/PadView.m b/ios-legacy/Sources/PadView.m
+new file mode 100644
+index 0000000..e10cac7
+--- /dev/null
++++ b/ios-legacy/Sources/PadView.m
+@@ -0,0 +1,133 @@
++#import "PadView.h"
++#import "WL4Session.h"
++
++@interface PadButton : NSObject
++@property (nonatomic) uint16_t key;
++@property (nonatomic) CGPoint c;
++@property (nonatomic) CGFloat r;
++@property (nonatomic, copy) NSString *label;
++@end
++@implementation PadButton
++@end
++
++@implementation PadView {
++    NSArray<PadButton *> *_buttons;
++    NSMutableSet<UITouch *> *_active;
++    uint16_t _mask;
++}
++
++static PadButton *B(uint16_t key, NSString *label) {
++    PadButton *b = [PadButton new];
++    b.key = key;
++    b.label = label;
++    return b;
++}
++
++- (instancetype)initWithFrame:(CGRect)frame {
++    if ((self = [super initWithFrame:frame])) {
++        self.multipleTouchEnabled = YES;
++        self.opaque = NO;
++        self.backgroundColor = [UIColor clearColor];
++        _active = [NSMutableSet set];
++        _buttons = @[B(WL4KeyUp, @"▲"), B(WL4KeyDown, @"▼"), B(WL4KeyLeft, @"◀"), B(WL4KeyRight, @"▶"),
++                     B(WL4KeyA, @"A"), B(WL4KeyB, @"B"), B(WL4KeyL, @"L"), B(WL4KeyR, @"R"),
++                     B(WL4KeyStart, @"Start"), B(WL4KeySelect, @"Sel")];
++    }
++    return self;
++}
++
++- (PadButton *)button:(uint16_t)key {
++    for (PadButton *b in _buttons) if (b.key == key) return b;
++    return nil;
++}
++- (void)place:(uint16_t)key x:(CGFloat)x y:(CGFloat)y r:(CGFloat)r {
++    PadButton *b = [self button:key];
++    b.c = CGPointMake(x, y);
++    b.r = r;
++}
++
++- (void)layoutSubviews {
++    [super layoutSubviews];
++    CGRect bd = self.bounds;
++    UIEdgeInsets sa = UIEdgeInsetsZero;                /* iOS 7: no safe area */
++    CGFloat w = bd.size.width, h = bd.size.height;
++    CGFloat u = MIN(w, h) / 7.0;
++    CGFloat sc = self.window.screen.scale ?: [UIScreen mainScreen].scale;
++
++    if (w > h) {                                       /* landscape: pad floats over the picture, like the Android port */
++        CGFloat l = sa.left, rr = sa.right, bot = sa.bottom * 0.5;
++        CGFloat cx = l + 1.9 * u, cy = h - 2.4 * u - bot;
++        [self place:WL4KeyUp x:cx y:cy - 1.2 * u r:0.7 * u];
++        [self place:WL4KeyDown x:cx y:cy + 1.2 * u r:0.7 * u];
++        [self place:WL4KeyLeft x:cx - 1.2 * u y:cy r:0.7 * u];
++        [self place:WL4KeyRight x:cx + 1.2 * u y:cy r:0.7 * u];
++        [self place:WL4KeyA x:w - rr - 1.2 * u y:h - 2.7 * u - bot r:0.8 * u];
++        [self place:WL4KeyB x:w - rr - 2.9 * u y:h - 1.5 * u - bot r:0.8 * u];
++        [self place:WL4KeyL x:l + 1.0 * u y:0.8 * u + sa.top r:0.6 * u];
++        [self place:WL4KeyR x:w - rr - 1.0 * u y:0.8 * u + sa.top r:0.6 * u];
++        [self place:WL4KeySelect x:w / 2 - 1.1 * u y:h - 0.7 * u - bot r:0.5 * u];
++        [self place:WL4KeyStart x:w / 2 + 1.1 * u y:h - 0.7 * u - bot r:0.5 * u];
++    } else {                                           /* portrait: picture on top, pad underneath */
++        CGFloat gameBottom = CGRectGetMaxY(WL4GameRect(bd, sa, _scaleMode, sc));
++        CGFloat region = h - sa.bottom - gameBottom;
++        CGFloat cx = 2.0 * u, cy = gameBottom + region * 0.55;
++        [self place:WL4KeyL x:1.0 * u y:gameBottom + 0.9 * u r:0.6 * u];
++        [self place:WL4KeyR x:w - 1.0 * u y:gameBottom + 0.9 * u r:0.6 * u];
++        [self place:WL4KeyUp x:cx y:cy - 1.2 * u r:0.7 * u];
++        [self place:WL4KeyDown x:cx y:cy + 1.2 * u r:0.7 * u];
++        [self place:WL4KeyLeft x:cx - 1.2 * u y:cy r:0.7 * u];
++        [self place:WL4KeyRight x:cx + 1.2 * u y:cy r:0.7 * u];
++        [self place:WL4KeyA x:w - 1.3 * u y:cy - 0.7 * u r:0.8 * u];
++        [self place:WL4KeyB x:w - 3.0 * u y:cy + 0.5 * u r:0.8 * u];
++        [self place:WL4KeySelect x:w / 2 - 1.1 * u y:h - sa.bottom - 0.8 * u r:0.5 * u];
++        [self place:WL4KeyStart x:w / 2 + 1.1 * u y:h - sa.bottom - 0.8 * u r:0.5 * u];
++    }
++    [self setNeedsDisplay];
++}
++
++- (void)setScaleMode:(WL4ScaleMode)m { _scaleMode = m; [self setNeedsLayout]; }
++
++- (void)drawRect:(CGRect)rect {
++    CGContextRef g = UIGraphicsGetCurrentContext();
++    for (PadButton *b in _buttons) {
++        BOOL down = (_mask & b.key) != 0;
++        CGRect cr = CGRectMake(b.c.x - b.r, b.c.y - b.r, 2 * b.r, 2 * b.r);
++        CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:1 alpha:down ? 0.55 : 0.22].CGColor);
++        CGContextFillEllipseInRect(g, cr);
++        CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.5].CGColor);
++        CGContextSetLineWidth(g, 1.5);
++        CGContextStrokeEllipseInRect(g, CGRectInset(cr, 0.75, 0.75));
++        CGFloat fs = (b.label.length > 2) ? b.r * 0.45 : b.r * 0.7;
++        NSDictionary *at = @{NSFontAttributeName: [UIFont boldSystemFontOfSize:fs],
++                             NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.9]};
++        CGSize ts = [b.label sizeWithAttributes:at];
++        [b.label drawAtPoint:CGPointMake(b.c.x - ts.width / 2, b.c.y - ts.height / 2) withAttributes:at];
++    }
++}
++
++- (void)recompute {
++    uint16_t m = 0;
++    for (UITouch *t in _active) {
++        CGPoint p = [t locationInView:self];
++        for (PadButton *b in _buttons) {
++            CGFloat dx = p.x - b.c.x, dy = p.y - b.c.y, rr = b.r * 1.25;
++            if (dx * dx + dy * dy <= rr * rr) m |= b.key;
++        }
++    }
++    if (m == _mask) return;
++    _mask = m;
++    [self setNeedsDisplay];
++    if (_onKeys) _onKeys(m);
++}
++
++- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [_active unionSet:touches]; [self recompute]; }
++- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self recompute]; }
++- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [_active minusSet:touches]; [self recompute]; }
++- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [_active minusSet:touches]; [self recompute]; }
++
++- (void)setHidden:(BOOL)hidden {
++    [super setHidden:hidden];
++    if (hidden) { [_active removeAllObjects]; [self recompute]; }
++}
++
++@end
+diff --git a/ios-legacy/Sources/WL4Log.c b/ios-legacy/Sources/WL4Log.c
+new file mode 100644
+index 0000000..284d5d5
+--- /dev/null
++++ b/ios-legacy/Sources/WL4Log.c
+@@ -0,0 +1,43 @@
++#include "WL4Log.h"
++#include "host.h"
++#include <fcntl.h>
++#include <signal.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++static void on_fatal_signal(int sig, siginfo_t *si, void *ctx) {
++    (void)ctx;
++    char m[96];
++    int n = snprintf(m, sizeof m, "FATAL native signal %d, fault addr %p\n", sig, si ? si->si_addr : 0);
++    if (n > 0) { (void)!write(STDERR_FILENO, m, (size_t)n); }
++    wl4_ring_write(STDERR_FILENO);
++    signal(sig, SIG_DFL);
++    raise(sig);
++}
++
++void wl4_log_open(const char *path) {
++    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
++    if (fd >= 0) {
++        dup2(fd, STDERR_FILENO);
++        dup2(fd, STDOUT_FILENO);
++        if (fd > STDERR_FILENO) close(fd);
++        setvbuf(stdout, NULL, _IOLBF, 0);
++        setvbuf(stderr, NULL, _IONBF, 0);
++    }
++    char d[1024];
++    snprintf(d, sizeof d, "%s.stall.bin", path);
++    wl4_set_dump_path(d);
++
++    struct sigaction sa;
++    memset(&sa, 0, sizeof sa);
++    sa.sa_sigaction = on_fatal_signal;
++    sa.sa_flags = SA_SIGINFO;
++    sigemptyset(&sa.sa_mask);
++    sigaction(SIGSEGV, &sa, NULL);
++    sigaction(SIGBUS, &sa, NULL);
++    sigaction(SIGABRT, &sa, NULL);
++    sigaction(SIGFPE, &sa, NULL);
++    sigaction(SIGILL, &sa, NULL);
++    fprintf(stderr, "wl4: log opened (%s)\n", path);
++}
+diff --git a/ios-legacy/Sources/WL4Log.h b/ios-legacy/Sources/WL4Log.h
+new file mode 100644
+index 0000000..cf00d81
+--- /dev/null
++++ b/ios-legacy/Sources/WL4Log.h
+@@ -0,0 +1,12 @@
++#ifndef WL4_LOG_H
++#define WL4_LOG_H
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Redirect stdout+stderr into `path` (the port's WL4_LOG/fprintf output lands there) and install a fatal-signal handler
++ * that appends the flight-recorder ring before the process dies.  Also sets the stall/trap dump path (<path>.stall.bin). */
++void wl4_log_open(const char *path);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/ios-legacy/Sources/WL4Session.h b/ios-legacy/Sources/WL4Session.h
+new file mode 100644
+index 0000000..3c62aec
+--- /dev/null
++++ b/ios-legacy/Sources/WL4Session.h
+@@ -0,0 +1,33 @@
++#import <Foundation/Foundation.h>
++
++NS_ASSUME_NONNULL_BEGIN
++
++/* GBA KEYINPUT bit order, same as host.h / the Android port */
++enum {
++    WL4KeyA = 1 << 0, WL4KeyB = 1 << 1, WL4KeySelect = 1 << 2, WL4KeyStart = 1 << 3,
++    WL4KeyRight = 1 << 4, WL4KeyLeft = 1 << 5, WL4KeyUp = 1 << 6, WL4KeyDown = 1 << 7,
++    WL4KeyR = 1 << 8, WL4KeyL = 1 << 9
++};
++
++/* Owns everything that outlives a single screen: ROM + save files, the "should the core run right now" decision,
++ * and the merged key state.  The core (host.c) is started once and then lives until the app is killed - the wasm2c
++ * instance is never freed, so stop/start cycles would leak ~225 MB each. */
++@interface WL4Session : NSObject
+++ (instancetype)shared;
++
++@property (nonatomic, readonly) NSString *documentsPath, *romPath, *savePath, *logPath;
++@property (nonatomic, readonly) BOOL started;
++
++/* pause inputs - the core runs only while the app is active, the game screen is visible, and nothing else pauses it */
++@property (nonatomic) BOOL appActive, gameVisible, userPaused, interrupted;
++/* key sources, merged into one mask for the core */
++@property (nonatomic) uint16_t touchKeys, padKeys;
++
++- (BOOL)hasRom;
++- (void)adoptRomsFromDocuments;                              /* *.gba dropped into Documents via Files/iTunes -> wl4.gba */
++- (nullable NSString *)importRomData:(NSData *)data;         /* nil on success, otherwise a user-visible reason */
++- (nullable NSString *)startIfNeeded;                        /* nil on success, otherwise a user-visible reason */
++- (void)persistSave;                                         /* writes SRAM to Documents/wl4.sav if it changed */
++@end
++
++NS_ASSUME_NONNULL_END
+diff --git a/ios-legacy/Sources/WL4Session.m b/ios-legacy/Sources/WL4Session.m
+new file mode 100644
+index 0000000..b8551d2
+--- /dev/null
++++ b/ios-legacy/Sources/WL4Session.m
+@@ -0,0 +1,110 @@
++#import "WL4Session.h"
++#import "wl4_config.h"      /* generated by CMake: WL4_EXPECT_CODE */
++#include "host.h"
++
++@implementation WL4Session {
++    NSData *_lastSaved;
++    BOOL _started;
++}
++
+++ (instancetype)shared {
++    static WL4Session *s;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{ s = [WL4Session new]; });
++    return s;
++}
++
++- (instancetype)init {
++    if ((self = [super init])) {
++        _documentsPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
++        _romPath = [_documentsPath stringByAppendingPathComponent:@"wl4.gba"];
++        _savePath = [_documentsPath stringByAppendingPathComponent:@"wl4.sav"];
++        _logPath = [_documentsPath stringByAppendingPathComponent:@"wl4.log"];
++    }
++    return self;
++}
++
++#pragma mark - ROM
++
++/* nil = acceptable Wario Land 4 ROM for the version this app was built from */
++static NSString *CheckRom(NSData *d) {
++    if (d.length < 0x100000 || d.length > 0x2000000) return @"That doesn't look like a GBA ROM (unexpected file size).";
++    char code[5] = {0};
++    [d getBytes:code range:NSMakeRange(0xAC, 4)];
++    NSString *got = [NSString stringWithFormat:@"%.4s", code];
++    if (![got isEqualToString:@WL4_EXPECT_CODE]) {
++        return [NSString stringWithFormat:@"Expected Wario Land 4 (%@) but this ROM reports \"%@\".", @WL4_EXPECT_CODE, got];
++    }
++    return nil;
++}
++
++- (BOOL)hasRom {
++    NSData *d = [NSData dataWithContentsOfFile:_romPath options:NSDataReadingMappedIfSafe error:nil];
++    return d && CheckRom(d) == nil;
++}
++
++- (NSString *)importRomData:(NSData *)data {
++    NSString *bad = CheckRom(data);
++    if (bad) return bad;
++    NSError *err = nil;
++    if (![data writeToFile:_romPath options:NSDataWritingAtomic error:&err]) return err.localizedDescription;
++    if (_started) return @"ROM saved. Restart the app to use it (the running game keeps the old one).";
++    return nil;
++}
++
++- (void)adoptRomsFromDocuments {
++    if ([self hasRom]) return;
++    NSFileManager *fm = NSFileManager.defaultManager;
++    for (NSString *name in [fm contentsOfDirectoryAtPath:_documentsPath error:nil]) {
++        if (![name.pathExtension.lowercaseString isEqualToString:@"gba"] || [name isEqualToString:@"wl4.gba"]) continue;
++        NSData *d = [NSData dataWithContentsOfFile:[_documentsPath stringByAppendingPathComponent:name]];
++        if (d && [self importRomData:d] == nil) return;
++    }
++}
++
++#pragma mark - start / save
++
++- (NSString *)startIfNeeded {
++    if (wl4_running()) return nil;
++    if (_started) return @"The game stopped after an error. Use \"Share log\" and relaunch the app.";
++    NSData *rom = [NSData dataWithContentsOfFile:_romPath];
++    if (!rom) return @"No ROM selected.";
++    NSString *bad = CheckRom(rom);
++    if (bad) return bad;
++    NSData *save = [NSData dataWithContentsOfFile:_savePath];
++    if (save.length) { wl4_load_save(save.bytes, save.length); _lastSaved = save; }
++    int rc = wl4_start(rom.bytes, rom.length);      /* copies the ROM */
++    if (rc != 0) return [NSString stringWithFormat:@"The core failed to start (code %d).", rc];
++    _started = YES;
++    [self applyPause];
++    [self pushKeys];
++    return nil;
++}
++
++- (void)persistSave {
++    if (!wl4_running()) return;
++    static uint32_t scratch[240 * 160];
++    if (wl4_copy_frame(scratch) < 30) return;       /* give the game time to set up its SRAM before the first write */
++    uint8_t buf[0x10000];
++    int n = wl4_read_save(buf);
++    NSData *d = [NSData dataWithBytes:buf length:(NSUInteger)n];
++    if (_lastSaved && [d isEqualToData:_lastSaved]) return;
++    if ([d writeToFile:_savePath options:NSDataWritingAtomic error:nil]) _lastSaved = d;
++}
++
++#pragma mark - pause / keys
++
++- (void)applyPause {
++    BOOL pause = !(_appActive && _gameVisible) || _userPaused || _interrupted;
++    if (wl4_running()) wl4_pause(pause ? 1 : 0);
++}
++- (void)pushKeys { wl4_set_keys((uint16_t)(_touchKeys | _padKeys)); }
++
++- (void)setAppActive:(BOOL)v { _appActive = v; [self applyPause]; }
++- (void)setGameVisible:(BOOL)v { _gameVisible = v; [self applyPause]; }
++- (void)setUserPaused:(BOOL)v { _userPaused = v; [self applyPause]; }
++- (void)setInterrupted:(BOOL)v { _interrupted = v; [self applyPause]; }
++- (void)setTouchKeys:(uint16_t)k { _touchKeys = k; [self pushKeys]; }
++- (void)setPadKeys:(uint16_t)k { _padKeys = k; [self pushKeys]; }
++
++@end
+diff --git a/ios-legacy/Sources/main.m b/ios-legacy/Sources/main.m
+new file mode 100644
+index 0000000..e4a9eb6
+--- /dev/null
++++ b/ios-legacy/Sources/main.m
+@@ -0,0 +1,8 @@
++#import <UIKit/UIKit.h>
++#import "AppDelegate.h"
++
++int main(int argc, char *argv[]) {
++    @autoreleasepool {
++        return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
++    }
++}
+diff --git a/ios-legacy/control b/ios-legacy/control
+new file mode 100644
+index 0000000..52de744
+--- /dev/null
++++ b/ios-legacy/control
+@@ -0,0 +1,9 @@
++Package: com.wl4.port.legacy
++Name: Wario Land 4 (legacy)
++Version: 1.0.0-1
++Architecture: iphoneos-arm
++Description: Wario Land 4 decomp port for 32-bit iOS 7.0-9.3.5 (armv7, iPad mini 1). Bring your own ROM.
++Maintainer: wl4port
++Author: wl4port
++Section: Games
++Depends: firmware (>= 7.0)
+diff --git a/ios-legacy/prepare.sh b/ios-legacy/prepare.sh
+new file mode 100755
+index 0000000..887a272
+--- /dev/null
++++ b/ios-legacy/prepare.sh
+@@ -0,0 +1,35 @@
++#!/usr/bin/env bash
++# Gathers everything Theos needs into ios-legacy/gen/ (never committed: it is derived from your ROM).
++#   ./prepare.sh [us|jp]        (run after port/build_wasm.sh)
++set -euo pipefail
++VER=${1:-us}
++HERE=$(cd "$(dirname "$0")" && pwd)
++REPO=$(cd "$HERE/.." && pwd)
++W2C=${W2C:-$REPO/port/build/wasm2c}
++[ -f "$W2C/wl4.c" ] || { echo "missing $W2C/wl4.c - run port/build_wasm.sh first"; exit 1; }
++
++rm -rf "$HERE/gen"; mkdir -p "$HERE/gen/core/host" "$HERE/gen/core/hal" "$HERE/gen/w2c"
++# keep the ../hal/hal.h relative include of host.c working
++cp "$REPO"/port/host/*.c "$REPO"/port/host/*.h "$HERE/gen/core/host/"
++cp "$REPO"/port/hal/*.c  "$REPO"/port/hal/*.h  "$HERE/gen/core/hal/"
++# Theos only globs one level: flatten the .c files into gen/core, headers stay where the includes expect them
++for d in host hal; do for f in "$HERE"/gen/core/$d/*.c; do mv "$f" "$HERE/gen/core/${d}_$(basename "$f")"; done; done
++cp "$HERE"/gen/core/host/*.h "$HERE"/gen/core/hal/*.h "$HERE/gen/core/" 2>/dev/null || true
++# host.c does #include "../hal/hal.h": from gen/core/ that resolves to gen/hal/hal.h
++mkdir -p "$HERE/gen/hal" && cp "$HERE"/gen/core/hal/*.h "$HERE/gen/hal/"
++
++cp "$W2C"/* "$HERE/gen/w2c/"
++# wasm-rt uses _Thread_local; iOS < 8 / armv7 has no TLV support.  Only the single game thread runs wasm, so drop it.
++sed -i -E 's/\b_Thread_local\b//g; s/\b__thread\b//g' "$HERE"/gen/w2c/wasm-rt*.[ch] "$HERE/gen/w2c/wl4.c" "$HERE/gen/w2c/wl4.h" 2>/dev/null || true
++# runtime .c files that wl4.c already #includes must not be compiled twice
++for f in "$HERE"/gen/w2c/wasm-rt-*.c; do
++  [ -f "$f" ] || continue
++  b=$(basename "$f")
++  case "$b" in *-win.c) rm -f "$f"; continue;; esac
++  if grep -qF "\"$b\"" "$HERE/gen/w2c/wl4.c" "$HERE/gen/w2c/wl4.h"; then echo "skip $b (included by wl4.c)"; rm -f "$f"; fi
++done
++python3 "$REPO/port/tools/gen_stubs.py" "$HERE/gen/w2c/wl4.h" "$HERE/gen/stubs.c"
++
++case "$VER" in us) CODE=AWAE;; jp) CODE=AWAJ;; *) echo "VER must be us|jp"; exit 1;; esac
++printf '#define WL4_EXPECT_CODE "%s"\n' "$CODE" > "$HERE/gen/wl4_config.h"
++echo "prepared gen/ for $VER"; ls "$HERE/gen/core" "$HERE/gen/w2c" | head -40
+diff --git a/port/host/host.c b/port/host/host.c
+index b60f09c..be07420 100644
+--- a/port/host/host.c
++++ b/port/host/host.c
+@@ -12,6 +12,18 @@
+ #include <time.h>
+ #include <stdarg.h>
+ #include <unistd.h>
++#ifdef __APPLE__
++#include <mach/mach_time.h>
++/* clock_gettime() only exists on iOS 10+ / macOS 10.12+; mach_absolute_time() works everywhere (iOS 7 legacy build) */
++static void wl4_now(struct timespec *t) {
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info(&tb);
++    uint64_t ns = mach_absolute_time(); if (tb.numer != tb.denom) ns = ns / tb.denom * tb.numer + ns % tb.denom * tb.numer / tb.denom;
++    t->tv_sec = (time_t)(ns / 1000000000ULL); t->tv_nsec = (long)(ns % 1000000000ULL);
++}
++#else
++static void wl4_now(struct timespec *t) { clock_gettime(CLOCK_MONOTONIC, t); }
++#endif
+ /* stderr is piped into logcat (Android) / the log file (iOS) + the log file by jni.c (JNI_OnLoad), so plain fprintf is enough on every platform */
+ #define WL4_LOG(...) wl4_logf(0, "wl4: " __VA_ARGS__)   /* file + logcat + flight-recorder ring */
+ #define WL4_RING(...) wl4_logf(1, __VA_ARGS__)           /* flight-recorder ring only (noisy stuff) */
+@@ -46,7 +58,7 @@ static uint8_t g_save[GBA_SRAM_SIZE]; static int g_haveSave;
+ #define RING_N 160
+ static char g_ring[RING_N][160]; static volatile unsigned g_ringI;
+ static long long g_t0;
+-static long long mono_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000LL + t.tv_nsec / 1000000; }
++static long long mono_ms(void) { struct timespec t; wl4_now(&t); return t.tv_sec * 1000LL + t.tv_nsec / 1000000; }
+ static void wl4_logf(int ringOnly, const char *fmt, ...) {
+     char buf[300]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+     unsigned i = __sync_fetch_and_add(&g_ringI, 1) % RING_N;
+@@ -153,7 +165,7 @@ static void cb_vcount(void) { w2c_wl4_InterruptCallbackCallVCount(&g_inst); }
+ #ifdef __APPLE__
+ /* Darwin has no clock_nanosleep()/TIMER_ABSTIME: sleep for the remaining time instead */
+ static void wl4_sleep_until(const struct timespec *t) {
+-    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
++    struct timespec now; wl4_now(&now);
+     long long ns = (long long)(t->tv_sec - now.tv_sec) * 1000000000LL + (t->tv_nsec - now.tv_nsec);
+     if (ns <= 0) return;
+     struct timespec d; d.tv_sec = (time_t)(ns / 1000000000LL); d.tv_nsec = (long)(ns % 1000000000LL);
+@@ -179,7 +191,7 @@ static void cb_frame(void) {
+     }
+     if (g_stop) { g_running = 0; pthread_exit(NULL); }
+     while (g_paused && !g_stop) { struct timespec ts = {0, 16000000}; nanosleep(&ts, NULL); }
+-    clock_gettime(CLOCK_MONOTONIC, &now);
++    wl4_now(&now);
+     if (!next.tv_sec || (now.tv_sec - next.tv_sec) * 1000000000LL + (now.tv_nsec - next.tv_nsec) > 100000000LL) next = now;
+     next.tv_nsec += 16743000;                           /* 59.7275 Hz */
+     while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+@@ -188,7 +200,7 @@ static void cb_frame(void) {
+ 
+ static void *game_main(void *arg) {
+     (void)arg;
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(WL4_LEGACY)   /* QoS API is iOS 8+ */
+     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+ #endif
+     WL4_LOG("game thread started, rom=%zu bytes", g_romSize);
