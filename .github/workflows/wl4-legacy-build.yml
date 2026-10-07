@@ -37,10 +37,47 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Apply ioslegacy.patch
+      - name: Apply ioslegacy.patch (new files only)
         run: |
           test -f ioslegacy.patch || { echo "::error::ioslegacy.patch must be in the repo root"; exit 1; }
           git apply --whitespace=nowarn ioslegacy.patch
+
+      - name: Patch port/host/host.c (iOS 7 clock/QoS)
+        run: |
+          cat > /tmp/patch_host.py <<'PYEOF'
+          import re,sys
+          p='port/host/host.c'
+          raw=open(p,newline='').read()
+          crlf='\r\n' in raw
+          s=raw.replace('\r\n','\n')
+          if 'wl4_now' not in s:
+              helper='''#ifdef __APPLE__
+          #include <mach/mach_time.h>
+          /* clock_gettime() only exists on iOS 10+; mach_absolute_time() works on iOS 7+ (legacy build) */
+          static void wl4_now(struct timespec *t) {
+              static mach_timebase_info_data_t tb;
+              if (!tb.denom) mach_timebase_info(&tb);
+              uint64_t ns = mach_absolute_time(); if (tb.numer != tb.denom) ns = ns / tb.denom * tb.numer + ns % tb.denom * tb.numer / tb.denom;
+              t->tv_sec = (time_t)(ns / 1000000000ULL); t->tv_nsec = (long)(ns % 1000000000ULL);
+          }
+          #else
+          static void wl4_now(struct timespec *t) { clock_gettime(CLOCK_MONOTONIC, t); }
+          #endif
+          '''
+              incs=list(re.finditer(r'^#include[^\n]*\n',s,re.M))
+              assert incs,'no #include found in host.c'
+              pos=incs[-1].end()
+              s=s[:pos]+'#include <time.h>\n#include <stdint.h>\n'+helper+s[pos:]
+              # call sites (skip the one inside the helper itself)
+              head,tail=s[:pos+len(helper)+40],s[pos+len(helper)+40:]
+              tail=re.sub(r'clock_gettime\s*\(\s*CLOCK_MONOTONIC\s*,\s*([^)]+?)\s*\)',r'wl4_now(\1)',tail)
+              s=head+tail
+          s=re.sub(r'(^[ \t]*)(pthread_set_qos_class_self_np\s*\([^;]*;)',r'\1#if !defined(WL4_LEGACY)\n\1\2\n\1#endif',s,flags=re.M) if 'WL4_LEGACY' not in s else s
+          open(p,'w',newline='').write(s.replace('\n','\r\n') if crlf else s)
+          print('host.c patched; remaining clock_gettime:',len(re.findall(r'clock_gettime',s)))
+          PYEOF
+          python3 /tmp/patch_host.py
+          chmod +x ios-legacy/prepare.sh
 
       - uses: actions/setup-python@v5
         with:
