@@ -688,6 +688,12 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/hblank.c', r'(?s)\(\(volatile struct Dma3Regs_HBlankCallbackCopy\*\)0x040000D4\)->src = callback;.*?InterruptCallbackSetHBlank\(\(void \(\*\)\(\)\)\(1 \| \(\(s32\)\(&gHBlankCallbackTrampoline\)\)\)\);', 'InterruptCallbackSetHBlank(callback);'),
     # diagnostics: log changes of main/sub game mode, stage-exit step and exit type (tags 2..5 of hal_trace_val)
     ('src/main.c', r'^(\s*)TIMER_COUNT_UP\(gMainTimer\);', r'\1TIMER_COUNT_UP(gMainTimer);\n\1{ hal_trace_val(2, (unsigned)gMainGameMode); hal_trace_val(3, (unsigned)(u16)gSubGameMode); hal_trace_val(4, (unsigned)gSpriteAiDropTimer); hal_trace_val(5, (unsigned)gStageExitType); }'),
+    # struct ItemCollection is 4 bytes in the ROM (gCurrentCollection = 0xA8 bytes = 7*6*4, stride 4/24; map_screen.c, minigame.c,
+    # boss_treasure_cutscene.c, save_file.c and stage_entry.c index it with raw byte offsets 16/40/64/... and `*4 + passage*24`).
+    # agbcc pads the all-bitfield struct to 4 bytes, clang gives sizeof == 1, so `gCurrentCollection[p][s].keyzer = TRUE` wrote byte
+    # p*6+s while InitMapScreen tested byte 16: the map never saw the first boss as defeated -> map mode stayed 0 and every exit
+    # of the first passage stayed locked ("can't go further in stage select after the first boss").  Force the same 4-byte layout.
+    ('include/score.h', r'(    u8 keyzer : 1;\n)\};', r'\1    u8 portPad[3];\n};'),
     # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
     ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
     ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
