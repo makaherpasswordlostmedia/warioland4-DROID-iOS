@@ -1,4 +1,4 @@
-name: WL4 iOS legacy (applies ioslegacy.patch, then builds)
+name: WL4 legacy v3 (time shim)
 
 # Branch: ioslegacy.  Target: iPad mini 1 (A5, 32-bit).  Linux runner, Theos + iPhoneOS 9.3 SDK (no Xcode needed).
 # Needs YOUR OWN US ROM via secret WL4_ROM_ID (Google Drive file id).  The .ipa embeds ROM-derived data (make extract),
@@ -29,6 +29,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
+      - name: Check runner glibc (toolchain needs >= 2.38)
+        run: |
+          cat /etc/os-release | head -2
+          V=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')
+          echo "glibc $V"
+          python3 -c "import sys; v=tuple(map(int,'$V'.split('.'))); sys.exit(0 if v>=(2,38) else 1)" || { echo "::error::Runner glibc $V is too old - this is not the ubuntu-24.04 runner"; exit 1; }
+
       - name: Refuse public repos unless overridden
         if: ${{ github.event.repository.private == false && inputs.allow_public_repo != true }}
         run: |
@@ -37,10 +44,50 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Apply ioslegacy.patch
+      - name: Apply ioslegacy.patch (new files only)
         run: |
           test -f ioslegacy.patch || { echo "::error::ioslegacy.patch must be in the repo root"; exit 1; }
           git apply --whitespace=nowarn ioslegacy.patch
+
+      - name: Add iOS 7 time shim (no host.c edits needed)
+        run: |
+          chmod +x ios-legacy/prepare.sh
+          cat > ios-legacy/Sources/legacy_time.h <<'HEOF'
+          /* iOS 7-9 SDK has no clock_gettime / clock_nanosleep / CLOCK_MONOTONIC (added in iOS 10).  Force-included via -include. */
+          #ifndef WL4_LEGACY_TIME_H
+          #define WL4_LEGACY_TIME_H
+          #include <time.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <mach/mach_time.h>
+          #ifndef CLOCK_MONOTONIC
+          #define CLOCK_MONOTONIC 6
+          #define TIMER_ABSTIME 1
+          static inline int clock_gettime(int id, struct timespec *t) {
+              static mach_timebase_info_data_t tb;
+              (void)id;
+              if (!tb.denom) mach_timebase_info(&tb);
+              uint64_t v = mach_absolute_time();
+              uint64_t ns = (tb.numer == tb.denom) ? v : v / tb.denom * tb.numer + v % tb.denom * tb.numer / tb.denom;
+              t->tv_sec = (time_t)(ns / 1000000000ULL);
+              t->tv_nsec = (long)(ns % 1000000000ULL);
+              return 0;
+          }
+          static inline int clock_nanosleep(int id, int flags, const struct timespec *req, struct timespec *rem) {
+              if (flags & TIMER_ABSTIME) {
+                  struct timespec now; clock_gettime(id, &now);
+                  long long ns = (long long)(req->tv_sec - now.tv_sec) * 1000000000LL + (req->tv_nsec - now.tv_nsec);
+                  if (ns <= 0) return 0;
+                  struct timespec d; d.tv_sec = (time_t)(ns / 1000000000LL); d.tv_nsec = (long)(ns % 1000000000LL);
+                  return nanosleep(&d, NULL) ? errno : 0;
+              }
+              return nanosleep(req, rem) ? errno : 0;
+          }
+          #endif
+          #endif
+          HEOF
+          grep -q 'legacy_time.h' ios-legacy/Makefile || sed -i 's|-DWL4_LEGACY=1|-DWL4_LEGACY=1 -include Sources/legacy_time.h|' ios-legacy/Makefile
+          grep -n 'legacy_time' ios-legacy/Makefile
 
       - uses: actions/setup-python@v5
         with:
