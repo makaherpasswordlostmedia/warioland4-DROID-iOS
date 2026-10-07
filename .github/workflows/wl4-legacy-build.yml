@@ -200,6 +200,9 @@ jobs:
           #include <stdint.h>
           #include <string.h>
           #include <stdio.h>
+          #include <pthread.h>
+          #include <sched.h>
+          #include <time.h>
           #include <AudioToolbox/AudioToolbox.h>
 
           #define RING_FRAMES 16384u
@@ -211,13 +214,14 @@ jobs:
           static _Atomic int g_rate = 13379, g_paused, g_flush, g_needRestart;
           static double g_pos; static int g_primed; static int16_t g_last[2];
           static AudioUnit g_au; static int g_retry, g_pushes;
+          static _Atomic uint32_t g_underruns;
 
           static void render(int16_t *out, int frames) {
               if (atomic_load_explicit(&g_paused, memory_order_relaxed)) { memset(out, 0, (size_t)frames * 4); g_primed = 0; return; }
               uint32_t w = atomic_load_explicit(&g_w, memory_order_acquire), r = atomic_load_explicit(&g_r, memory_order_relaxed);
               if (atomic_exchange_explicit(&g_flush, 0, memory_order_relaxed)) { r = w; g_pos = 0; g_primed = 0; }
               int srcRate = atomic_load_explicit(&g_rate, memory_order_relaxed);
-              double base = (double)srcRate / (double)OUT_RATE, target = srcRate * 0.040;
+              double base = (double)srcRate / (double)OUT_RATE, target = srcRate * 0.100;
               if (!g_primed) {
                   if ((double)(w - r) >= target) g_primed = 1;
                   else { memset(out, 0, (size_t)frames * 4); atomic_store_explicit(&g_r, r, memory_order_release); return; }
@@ -228,7 +232,7 @@ jobs:
               for (int i = 0; i < frames; i++) {
                   if (w - r < 2) {
                       g_last[0] = (int16_t)(g_last[0] / 2); g_last[1] = (int16_t)(g_last[1] / 2);
-                      out[2 * i] = g_last[0]; out[2 * i + 1] = g_last[1]; g_primed = 0; continue;
+                      out[2 * i] = g_last[0]; out[2 * i + 1] = g_last[1]; g_primed = 0; atomic_fetch_add_explicit(&g_underruns, 1, memory_order_relaxed); continue;
                   }
                   const int16_t *a = g_ring[r & RING_MASK], *b = g_ring[(r + 1) & RING_MASK];
                   float f = (float)g_pos;
@@ -284,13 +288,28 @@ jobs:
           }
 
           void wl4_audio_push(const int8_t *right, const int8_t *left, int count, int rate) {
-              if (++g_pushes == 1) fprintf(stderr, "wl4: audio: first push, %d samples @ %d Hz\n", count, rate);
+              if (++g_pushes == 1) {
+                  struct sched_param sp; sp.sched_priority = 46;           /* game thread: highest normal priority (iOS 7 has no QoS API) */
+                  int prc = pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+                  fprintf(stderr, "wl4: audio: first push, %d samples @ %d Hz, prio rc=%d\n", count, rate, prc);
+              }
+              {   /* every ~5 s of game time: pushes/s shows the real game speed (60 = full speed), underruns show starvation */
+                  static struct timespec t0; static int n0;
+                  if (g_pushes % 300 == 0) {
+                      struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+                      if (t0.tv_sec || t0.tv_nsec) {
+                          double dt = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+                          fprintf(stderr, "wl4: audio: %.1f pushes/s (60=full speed), underruns so far %u\n", (g_pushes - n0) / dt, (unsigned)atomic_load(&g_underruns));
+                      }
+                      t0 = t1; n0 = g_pushes;
+                  }
+              }
               if (!g_au) wl4_audio_poll();                       /* self-start / retry even if host.c never calls start/poll */
               if (!g_au && g_pushes == 1) open_stream();
               atomic_store_explicit(&g_rate, rate > 4000 ? rate : 13379, memory_order_relaxed);
               if (atomic_load_explicit(&g_paused, memory_order_relaxed)) return;
               uint32_t w = atomic_load_explicit(&g_w, memory_order_relaxed), r = atomic_load_explicit(&g_r, memory_order_acquire);
-              uint32_t used = w - r, cap = (uint32_t)atomic_load_explicit(&g_rate, memory_order_relaxed) / 8;
+              uint32_t used = w - r, cap = (uint32_t)atomic_load_explicit(&g_rate, memory_order_relaxed) / 4;
               if (cap > RING_FRAMES) cap = RING_FRAMES;
               uint32_t room = used < cap ? cap - used : 0;
               if ((uint32_t)count > room) count = (int)room;
