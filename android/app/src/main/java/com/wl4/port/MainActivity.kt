@@ -17,6 +17,7 @@ class MainActivity : AppCompatActivity() {
     private val logFile get() = File(filesDir, "wl4.log")
     private val prevLogFile get() = File(filesDir, "wl4.prev.log")
     private val prev2LogFile get() = File(filesDir, "wl4.prev2.log")
+    private val saveFile get() = File(filesDir, "wl4.sav")
     private val stallDump get() = File(filesDir, "wl4.log.stall.bin")   // written natively on stall / wasm trap
 
     /* Newest first: current, previous, the one before.  The native side truncates wl4.log on every start of this
@@ -52,6 +53,33 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "Saved to Downloads", Toast.LENGTH_LONG).show()
     }
 
+
+    /* ---- save export / import (64 KB raw SRAM image, same format as a .sav from an emulator) ---- */
+    private fun currentSave(): ByteArray? =
+        if (Native.running()) Native.readSave() else saveFile.takeIf { it.exists() }?.readBytes()
+    private fun exportSave() {
+        if (currentSave() == null) { Toast.makeText(this, "No save yet - play and save in-game first", Toast.LENGTH_LONG).show(); return }
+        startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE); type = "application/octet-stream"; putExtra(Intent.EXTRA_TITLE, "wl4.sav")
+        }, REQ_EXPORT_SAVE)
+    }
+    private fun importSave() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }, REQ_IMPORT_SAVE)
+    }
+    private fun doExportSave(uri: Uri) {
+        val bytes = currentSave() ?: return
+        contentResolver.openOutputStream(uri, "wt")?.use { it.write(bytes) }
+        Toast.makeText(this, "Save exported (${bytes.size / 1024} KB)", Toast.LENGTH_LONG).show()
+    }
+    private fun doImportSave(uri: Uri) {
+        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return
+        if (bytes.size < 0x2000 || bytes.size > 0x20000) { Toast.makeText(this, "Not a save file (${bytes.size} bytes)", Toast.LENGTH_LONG).show(); return }
+        if (Native.running()) Native.stop()          // the running game would overwrite the imported file on pause
+        if (saveFile.exists()) saveFile.copyTo(File(filesDir, "wl4.sav.bak"), overwrite = true)
+        saveFile.writeBytes(bytes)
+        Toast.makeText(this, "Save imported (${bytes.size / 1024} KB). Press Play.", Toast.LENGTH_LONG).show()
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         // rotate: keep the last two sessions in which the game really started, before the native side truncates wl4.log
@@ -71,13 +99,17 @@ class MainActivity : AppCompatActivity() {
         val share = Button(this).apply { text = "Share log"; setOnClickListener { shareLog() } }
         val save = Button(this).apply { text = "Save log to Downloads"; setOnClickListener { saveLogToDownloads() } }
         val dump = Button(this).apply { text = "Save stall dump to Downloads"; setOnClickListener { saveStallDump() } }
-        col.addView(status); col.addView(pick); col.addView(play); col.addView(share); col.addView(save); col.addView(dump); setContentView(col)
+        val expSave = Button(this).apply { text = "Export save"; setOnClickListener { exportSave() } }
+        val impSave = Button(this).apply { text = "Import save"; setOnClickListener { importSave() } }
+        col.addView(status); col.addView(pick); col.addView(play); col.addView(expSave); col.addView(impSave); col.addView(share); col.addView(save); col.addView(dump); setContentView(col)
         refresh()
     }
     private fun refresh() { status.text = if (romFile.exists()) "ROM ready (${romFile.length() / 1024} KB)" else "No ROM selected.\nThe app does not ship any game data." }
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
         val uri: Uri = data?.data ?: return
+        if (res != RESULT_OK) return
+        when (req) { REQ_EXPORT_SAVE -> { doExportSave(uri); return }; REQ_IMPORT_SAVE -> { doImportSave(uri); return } }
         contentResolver.openInputStream(uri)?.use { i -> val bytes = i.readBytes()
             if (bytes.size < 0x100000 || bytes.size > 0x2000000) { Toast.makeText(this, "Not a GBA ROM", Toast.LENGTH_LONG).show(); return }
             val code = String(bytes, 0xAC, 4)       // game code in header
@@ -85,4 +117,5 @@ class MainActivity : AppCompatActivity() {
             romFile.writeBytes(bytes) }
         refresh()
     }
+    companion object { const val REQ_EXPORT_SAVE = 2; const val REQ_IMPORT_SAVE = 3 }
 }
