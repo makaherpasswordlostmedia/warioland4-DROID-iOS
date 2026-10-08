@@ -713,6 +713,14 @@ PATCHES = [   # (relative path, regex, replacement)
      r'                                    gSaveFlag = 1;\n'
      r'                                    gCollectedKeyzer = 0;\n'
      r'                                }\n\2'),
+    # `T alias(args) asm("real_symbol");` aliases re-declare an existing function with a different prototype (bubble.c even with an
+    # unprototyped `()`).  Under clang/wasm a call through such a declaration is emitted with the wrong signature and wasm-ld
+    # replaces it with `real_symbol_bitcast_invalid` (= `unreachable`, wasm trap 5: stage 3 start, bubble spawner -> func_8023BFC).
+    # One-line #defines keep line numbers intact and call the real, correctly prototyped function (C converts the arguments).
+    ('src/sprite_ai/bubble.c', r'void BubbleCollisionCheck\(\) asm\("func_8023BFC"\);', '#define BubbleCollisionCheck func_8023BFC'),
+    ('src/sprite_ai/aerodent.c', r'void SpriteUtilCheckCollisionAtPositionOld\(u32, u32\) asm\("func_8023BFC"\);', '#define SpriteUtilCheckCollisionAtPositionOld func_8023BFC'),
+    ('src/sprite_ai/hoggus.c', r'void SpriteSpawnAsChildWide\([^)]*\) asm\("SpriteSpawnAsChild"\);', '#define SpriteSpawnAsChildWide SpriteSpawnAsChild'),
+    ('src/sprite_ai/cuckoo_condor.c', r'extern void SpriteUtilFindOwnSlotU32\(u32 roomSlot\) asm\("SpriteUtilFindOwnSlot"\);', '#define SpriteUtilFindOwnSlotU32 SpriteUtilFindOwnSlot'),
     # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
     ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
     ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
