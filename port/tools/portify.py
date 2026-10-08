@@ -696,6 +696,23 @@ PATCHES = [   # (relative path, regex, replacement)
     ('include/score.h', r'(    u8 keyzer : 1;\n)\};', r'\1    u8 portPad[3];\n};'),
     # diagnostics: tag 0 = 100 + mapMode*10 + currentPassage while the map screen runs (mode must become 1 after the first boss)
     ('src/map_screen.c', r'(int UpdateMapScreen\(void\)\n\{\n)', r'\1    hal_trace_val(0, 100 + (unsigned)gUnk_3003C95 * 10 + (unsigned)gCurrentPassage);\n'),
+    # boss clear: BOSS_DEFEATED (bit 0x20 of gCurrentCollection[p][4]) is only ever set by AutosaveBossClear(), which is called from the
+    # Keyzer->TimeUp secondary sprite when gTimerState == 11.  The map reads that flag to pick the passage-connection table (mode 1),
+    # and it stayed 0 in the port (trace[0] = 100 after the first boss).  Log whether AutosaveBossClear runs (tag 6 = 300 + passage*10 + keyzer)
+    # and, if the boss exit (type 5) is reached without it having run (stage number still STAGE_BOSS), do its essential part here.
+    ('src/autosave.c', r'\A', '#include "port.h"\n'),
+    ('src/autosave.c', r'(void AutosaveBossClear\(void\)\n\{\n)', r'\1    hal_trace_val(6, 300 + (unsigned)gCurrentPassage * 10 + (unsigned)(gCollectedKeyzer & 1));\n'),
+    ('src/main.c', r'(#include "stage_select\.h"\n)', r'\1#include "score.h"\n'),
+    ('src/main.c', r'(                            case 5:\n)(                                if \(gCurrentPassageTemp == PASSAGE_ENTRY\))',
+     r'\1                                if (gCurrentStageNumber == STAGE_BOSS && gCurrentPassage <= PASSAGE_SAPPHIRE) {\n'
+     r'                                    hal_trace_val(6, 400 + (unsigned)gCurrentPassage);\n'
+     r'                                    gCurrentCollection[gCurrentPassage][STAGE_BOSS].BOSS_DEFEATED = TRUE;\n'
+     r'                                    gCurrentPassageTemp = gCurrentPassage;\n'
+     r'                                    gCurrentStageNumber = STAGE_MAX;\n'
+     r'                                    BuildMainSaveWorkingBuffer();\n'
+     r'                                    gSaveFlag = 1;\n'
+     r'                                    gCollectedKeyzer = 0;\n'
+     r'                                }\n\2'),
     # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
     ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
     ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
