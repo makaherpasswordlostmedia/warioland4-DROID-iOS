@@ -724,6 +724,11 @@ PATCHES = [   # (relative path, regex, replacement)
     # catbat.c: `(u32)&gBossDefeatTimer` -- gBossDefeatTimer is an array (an IWRAM address macro here), `&` on it is not an lvalue,
     # so clang rejected the whole file: SpriteCatbat & co. were missing from the wasm (stub "unimplemented import SpriteCatbat").
     ('src/sprite_ai/catbat.c', r'\(u32\)&gBossDefeatTimer', '(u32)gBossDefeatTimer'),
+    # DrawBossTreasureCutsceneSprites: the only C for it is a 75%-match WIP decompilation (compiled because NON_MATCHING is
+    # defined) full of `new_varNN` temporaries.  Since boss_treasure_cutscene.c compiles again it runs after every boss
+    # and trapped with wasm trap 1 (out-of-bounds) right after its FixedInverse/FixedMul affine setup.  Skip the drawing
+    # (treasure/particle/sparkle sprites) until it is ported properly; the cutscene logic itself keeps running.
+    ('src/boss_treasure_cutscene.c', r'(void DrawBossTreasureCutsceneSprites\(void\)\n\{\n)', r'\1  if (1) return; /* port: WIP C traps, see portify.py */\n'),
     # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
     ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
     ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
