@@ -721,6 +721,9 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/sprite_ai/aerodent.c', r'void SpriteUtilCheckCollisionAtPositionOld\(u32, u32\) asm\("func_8023BFC"\);', '#define SpriteUtilCheckCollisionAtPositionOld func_8023BFC'),
     ('src/sprite_ai/hoggus.c', r'void SpriteSpawnAsChildWide\([^)]*\) asm\("SpriteSpawnAsChild"\);', '#define SpriteSpawnAsChildWide SpriteSpawnAsChild'),
     ('src/sprite_ai/cuckoo_condor.c', r'extern void SpriteUtilFindOwnSlotU32\(u32 roomSlot\) asm\("SpriteUtilFindOwnSlot"\);', '#define SpriteUtilFindOwnSlotU32 SpriteUtilFindOwnSlot'),
+    # catbat.c: `(u32)&gBossDefeatTimer` -- gBossDefeatTimer is an array (an IWRAM address macro here), `&` on it is not an lvalue,
+    # so clang rejected the whole file: SpriteCatbat & co. were missing from the wasm (stub "unimplemented import SpriteCatbat").
+    ('src/sprite_ai/catbat.c', r'\(u32\)&gBossDefeatTimer', '(u32)gBossDefeatTimer'),
     # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
     ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
     ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
@@ -761,8 +764,9 @@ def _ld_macro(m):
     if name not in LDSYMS or not ty: return m.group(0)
     addr = '0x%08X' % LDSYMS[name]
     if not dims: body = f'(*({ty} *){addr})'
-    elif len(dims) == 1: body = f'(({ty} *){addr})'
-    else: body = f'(({ty} (*){"".join(dims[1:])}){addr})'
+    # lvalue of the real array type (not an rvalue pointer): `&gArr` is then valid too (catbat.c, aerodent.c,
+    # boss_treasure_cutscene.c, stage_ejection.c take the address of such arrays and clang rejected those whole files)
+    else: body = f'(*({ty} (*){"".join(dims)}){addr})'
     LD_REWRITTEN[name] += 1
     return f'#undef {name}\n#define {name} {body}'
 
