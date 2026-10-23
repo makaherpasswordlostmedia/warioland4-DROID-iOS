@@ -1,6 +1,6 @@
-name: WL4 iOS legacy (applies ioslegacy.patch, then builds)
+name: WL4 iOS 5 build
 
-# Branch: ioslegacy.  Target: iPad mini 1 (A5, 32-bit).  Linux runner, Theos + iPhoneOS 9.3 SDK (no Xcode needed).
+# Branch: ioslegacy.  Target: 32-bit armv7 devices on iOS 5.0+ (iPhone 3GS/4/4S, iPad 1/2/3, iPod touch 3/4; also runs on 6-9.3.5).  Linux runner, Theos + iPhoneOS 9.3 SDK (no Xcode needed).
 # Needs YOUR OWN US ROM via secret WL4_ROM_ID (Google Drive file id).  The .ipa embeds ROM-derived data (make extract),
 # so the job refuses to run in a public repo unless overridden.  Output: unsigned .ipa + .deb.
 
@@ -29,6 +29,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
+      - name: Check runner glibc (toolchain needs >= 2.38)
+        run: |
+          cat /etc/os-release | head -2
+          V=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')
+          echo "glibc $V"
+          python3 -c "import sys; v=tuple(map(int,'$V'.split('.'))); sys.exit(0 if v>=(2,38) else 1)" || { echo "::error::Runner glibc $V is too old - this is not the ubuntu-24.04 runner"; exit 1; }
+
       - name: Refuse public repos unless overridden
         if: ${{ github.event.repository.private == false && inputs.allow_public_repo != true }}
         run: |
@@ -42,42 +49,71 @@ jobs:
           test -f ioslegacy.patch || { echo "::error::ioslegacy.patch must be in the repo root"; exit 1; }
           git apply --whitespace=nowarn ioslegacy.patch
 
-      - name: Patch port/host/host.c (iOS 7 clock/QoS)
+      - name: Apply ios5.patch (iOS 5 compatibility on top of ioslegacy.patch)
         run: |
-          cat > /tmp/patch_host.py <<'PYEOF'
-          import re,sys
-          p='port/host/host.c'
-          raw=open(p,newline='').read()
-          crlf='\r\n' in raw
-          s=raw.replace('\r\n','\n')
-          if 'wl4_now' not in s:
-              helper='''#ifdef __APPLE__
-          #include <mach/mach_time.h>
-          /* clock_gettime() only exists on iOS 10+; mach_absolute_time() works on iOS 7+ (legacy build) */
-          static void wl4_now(struct timespec *t) {
-              static mach_timebase_info_data_t tb;
-              if (!tb.denom) mach_timebase_info(&tb);
-              uint64_t ns = mach_absolute_time(); if (tb.numer != tb.denom) ns = ns / tb.denom * tb.numer + ns % tb.denom * tb.numer / tb.denom;
-              t->tv_sec = (time_t)(ns / 1000000000ULL); t->tv_nsec = (long)(ns % 1000000000ULL);
-          }
-          #else
-          static void wl4_now(struct timespec *t) { clock_gettime(CLOCK_MONOTONIC, t); }
-          #endif
-          '''
-              incs=list(re.finditer(r'^#include[^\n]*\n',s,re.M))
-              assert incs,'no #include found in host.c'
-              pos=incs[-1].end()
-              s=s[:pos]+'#include <time.h>\n#include <stdint.h>\n'+helper+s[pos:]
-              # call sites (skip the one inside the helper itself)
-              head,tail=s[:pos+len(helper)+40],s[pos+len(helper)+40:]
-              tail=re.sub(r'clock_gettime\s*\(\s*CLOCK_MONOTONIC\s*,\s*([^)]+?)\s*\)',r'wl4_now(\1)',tail)
-              s=head+tail
-          s=re.sub(r'(^[ \t]*)(pthread_set_qos_class_self_np\s*\([^;]*;)',r'\1#if !defined(WL4_LEGACY)\n\1\2\n\1#endif',s,flags=re.M) if 'WL4_LEGACY' not in s else s
-          open(p,'w',newline='').write(s.replace('\n','\r\n') if crlf else s)
-          print('host.c patched; remaining clock_gettime:',len(re.findall(r'clock_gettime',s)))
-          PYEOF
-          python3 /tmp/patch_host.py
+          test -f ios5.patch || { echo "::error::ios5.patch must be in the repo root"; exit 1; }
+          git apply --whitespace=nowarn ios5.patch
+          ls ios-legacy/Sources ios-legacy/Resources
+
+      - name: Host test for rt_shim.c (division / int64->float helpers)
+        run: |
+          gcc -O2 -o /tmp/rt_test ios-legacy/tests/rt_shim_test.c
+          /tmp/rt_test
+
+      - name: Add iOS 7 time shim (no host.c edits needed)
+        run: |
           chmod +x ios-legacy/prepare.sh
+          cat > ios-legacy/Sources/legacy_time.h <<'HEOF'
+          /* iOS 7-9 SDK has no clock_gettime / clock_nanosleep / CLOCK_MONOTONIC (added in iOS 10).  Force-included via -include. */
+          #ifndef WL4_LEGACY_TIME_H
+          #define WL4_LEGACY_TIME_H
+          #include <time.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <mach/mach_time.h>
+          #ifndef CLOCK_MONOTONIC
+          #define CLOCK_MONOTONIC 6
+          #define TIMER_ABSTIME 1
+          static inline int clock_gettime(int id, struct timespec *t) {
+              static mach_timebase_info_data_t tb;
+              (void)id;
+              if (!tb.denom) mach_timebase_info(&tb);
+              uint64_t v = mach_absolute_time();
+              uint64_t ns = (tb.numer == tb.denom) ? v : v / tb.denom * tb.numer + v % tb.denom * tb.numer / tb.denom;
+              t->tv_sec = (time_t)(ns / 1000000000ULL);
+              t->tv_nsec = (long)(ns % 1000000000ULL);
+              return 0;
+          }
+          static inline int clock_nanosleep(int id, int flags, const struct timespec *req, struct timespec *rem) {
+              if (flags & TIMER_ABSTIME) {
+                  struct timespec now; clock_gettime(id, &now);
+                  long long ns = (long long)(req->tv_sec - now.tv_sec) * 1000000000LL + (req->tv_nsec - now.tv_nsec);
+                  if (ns <= 0) return 0;
+                  struct timespec d; d.tv_sec = (time_t)(ns / 1000000000LL); d.tv_nsec = (long)(ns % 1000000000LL);
+                  return nanosleep(&d, NULL) ? errno : 0;
+              }
+              return nanosleep(req, rem) ? errno : 0;
+          }
+          #endif
+          #endif
+          HEOF
+          grep -q 'legacy_time.h' ios-legacy/Makefile || sed -i 's|-DWL4_LEGACY=1|-DWL4_LEGACY=1 -include Sources/legacy_time.h|' ios-legacy/Makefile
+          grep -n 'legacy_time' ios-legacy/Makefile
+
+      - name: Make AppDelegate independent of audio.h version
+        run: |
+          python3 - <<'PYEOF'
+          p = "ios-legacy/Sources/AppDelegate.m"
+          t = open(p).read()
+          shim = ('#include "audio.h"\n'
+                  '/* some audio.h versions lack this: declare it and provide a weak no-op (a real definition in audio.c wins) */\n'
+                  'void wl4_audio_request_restart(void);\n'
+                  '__attribute__((weak)) void wl4_audio_request_restart(void) {}\n')
+          assert '#include "audio.h"\n' in t
+          t = t.replace('#include "audio.h"\n', shim, 1)
+          open(p, "w").write(t)
+          PYEOF
+          grep -n "wl4_audio_request_restart" ios-legacy/Sources/AppDelegate.m | head -3
 
       - uses: actions/setup-python@v5
         with:
@@ -165,6 +201,142 @@ jobs:
           chmod +x ios-legacy/prepare.sh
           ./ios-legacy/prepare.sh "$VER"
 
+      - name: Use legacy audio (RemoteIO, self-starting)
+        run: |
+          cat > ios-legacy/Sources/audio_legacy.c <<'AEOF'
+          /* Legacy iOS 7-9 audio: lock-free ring (game thread -> RemoteIO callback) + linear resampler with drift control.
+           * Replaces port/host/audio.c in the legacy build.  Self-starting: the RemoteIO unit is opened on the first push, so it
+           * works no matter whether host.c calls wl4_audio_start()/poll(). */
+          #include <stdatomic.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <stdio.h>
+          #include <pthread.h>
+          #include <sched.h>
+          #include <time.h>
+          #include <AudioToolbox/AudioToolbox.h>
+
+          #define RING_FRAMES 16384u
+          #define RING_MASK   (RING_FRAMES - 1)
+          #define OUT_RATE    48000
+
+          static int16_t g_ring[RING_FRAMES][2];
+          static _Atomic uint32_t g_w, g_r;
+          static _Atomic int g_rate = 13379, g_paused, g_flush, g_needRestart;
+          static double g_pos; static int g_primed; static int16_t g_last[2];
+          static AudioUnit g_au; static int g_retry, g_pushes;
+          static _Atomic uint32_t g_underruns;
+
+          static void render(int16_t *out, int frames) {
+              if (atomic_load_explicit(&g_paused, memory_order_relaxed)) { memset(out, 0, (size_t)frames * 4); g_primed = 0; return; }
+              uint32_t w = atomic_load_explicit(&g_w, memory_order_acquire), r = atomic_load_explicit(&g_r, memory_order_relaxed);
+              if (atomic_exchange_explicit(&g_flush, 0, memory_order_relaxed)) { r = w; g_pos = 0; g_primed = 0; }
+              int srcRate = atomic_load_explicit(&g_rate, memory_order_relaxed);
+              double base = (double)srcRate / (double)OUT_RATE, target = srcRate * 0.100;
+              if (!g_primed) {
+                  if ((double)(w - r) >= target) g_primed = 1;
+                  else { memset(out, 0, (size_t)frames * 4); atomic_store_explicit(&g_r, r, memory_order_release); return; }
+              }
+              double err = ((double)(w - r) - target) / target;
+              double adj = err * 0.02; if (adj > 0.01) adj = 0.01; if (adj < -0.01) adj = -0.01;
+              double ratio = base * (1.0 + adj);
+              for (int i = 0; i < frames; i++) {
+                  if (w - r < 2) {
+                      g_last[0] = (int16_t)(g_last[0] / 2); g_last[1] = (int16_t)(g_last[1] / 2);
+                      out[2 * i] = g_last[0]; out[2 * i + 1] = g_last[1]; g_primed = 0; atomic_fetch_add_explicit(&g_underruns, 1, memory_order_relaxed); continue;
+                  }
+                  const int16_t *a = g_ring[r & RING_MASK], *b = g_ring[(r + 1) & RING_MASK];
+                  float f = (float)g_pos;
+                  g_last[0] = (int16_t)(a[0] + (b[0] - a[0]) * f); g_last[1] = (int16_t)(a[1] + (b[1] - a[1]) * f);
+                  out[2 * i] = g_last[0]; out[2 * i + 1] = g_last[1];
+                  g_pos += ratio;
+                  while (g_pos >= 1.0) { g_pos -= 1.0; r++; if (w - r < 2) break; }
+              }
+              atomic_store_explicit(&g_r, r, memory_order_release);
+          }
+
+          static OSStatus au_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
+              (void)ref; (void)flags; (void)ts; (void)bus;
+              if (io->mNumberBuffers < 1 || !io->mBuffers[0].mData) return noErr;
+              render((int16_t *)io->mBuffers[0].mData, (int)frames);
+              return noErr;
+          }
+
+          static void open_stream(void) {
+              if (g_au) return;
+              AudioComponentDescription d; memset(&d, 0, sizeof d);
+              d.componentType = kAudioUnitType_Output; d.componentSubType = kAudioUnitSubType_RemoteIO; d.componentManufacturer = kAudioUnitManufacturer_Apple;
+              AudioComponent c = AudioComponentFindNext(NULL, &d);
+              if (!c || AudioComponentInstanceNew(c, &g_au) != noErr) { g_au = NULL; fprintf(stderr, "wl4: audio: RemoteIO unavailable\n"); return; }
+              AudioStreamBasicDescription f; memset(&f, 0, sizeof f);
+              f.mSampleRate = OUT_RATE; f.mFormatID = kAudioFormatLinearPCM;
+              f.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+              f.mBitsPerChannel = 16; f.mChannelsPerFrame = 2; f.mFramesPerPacket = 1; f.mBytesPerFrame = 4; f.mBytesPerPacket = 4;
+              AURenderCallbackStruct cb; cb.inputProc = au_render; cb.inputProcRefCon = NULL;
+              OSStatus e1 = AudioUnitSetProperty(g_au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
+              OSStatus e2 = AudioUnitSetProperty(g_au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
+              OSStatus e3 = AudioUnitInitialize(g_au);
+              OSStatus e4 = (e1 == noErr && e2 == noErr && e3 == noErr) ? AudioOutputUnitStart(g_au) : -1;
+              atomic_store(&g_flush, 1);
+              fprintf(stderr, "wl4: audio: RemoteIO %d Hz fmt=%d cb=%d init=%d start=%d\n", OUT_RATE, (int)e1, (int)e2, (int)e3, (int)e4);
+              if (e4 != noErr) { AudioComponentInstanceDispose(g_au); g_au = NULL; }
+          }
+          static void close_stream(void) {
+              if (!g_au) return;
+              AudioOutputUnitStop(g_au); AudioUnitUninitialize(g_au); AudioComponentInstanceDispose(g_au); g_au = NULL;
+          }
+
+          void wl4_audio_request_restart(void) { atomic_store(&g_needRestart, 1); }
+          void wl4_audio_start(void) { atomic_store(&g_w, 0); atomic_store(&g_r, 0); g_pos = 0; g_primed = 0; atomic_store(&g_paused, 0); atomic_store(&g_needRestart, 0); g_retry = 0; open_stream(); }
+          void wl4_audio_stop(void) { close_stream(); }
+          void wl4_audio_pause(int paused) {
+              atomic_store_explicit(&g_paused, paused, memory_order_relaxed);
+              if (!paused) atomic_store_explicit(&g_flush, 1, memory_order_relaxed);
+          }
+          void wl4_audio_poll(void) {
+              if (atomic_exchange(&g_needRestart, 0)) { close_stream(); open_stream(); }
+              else if (!g_au && ++g_retry % 120 == 0) open_stream();
+          }
+
+          void wl4_audio_push(const int8_t *right, const int8_t *left, int count, int rate) {
+              if (++g_pushes == 1) {
+                  struct sched_param sp; sp.sched_priority = 46;           /* game thread: highest normal priority (iOS 7 has no QoS API) */
+                  int prc = pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+                  fprintf(stderr, "wl4: audio: first push, %d samples @ %d Hz, prio rc=%d\n", count, rate, prc);
+              }
+              {   /* every ~5 s of game time: pushes/s shows the real game speed (60 = full speed), underruns show starvation */
+                  static struct timespec t0; static int n0;
+                  if (g_pushes % 300 == 0) {
+                      struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+                      if (t0.tv_sec || t0.tv_nsec) {
+                          double dt = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+                          fprintf(stderr, "wl4: audio: %.1f pushes/s (60=full speed), underruns so far %u\n", (g_pushes - n0) / dt, (unsigned)atomic_load(&g_underruns));
+                      }
+                      t0 = t1; n0 = g_pushes;
+                  }
+              }
+              if (!g_au) wl4_audio_poll();                       /* self-start / retry even if host.c never calls start/poll */
+              if (!g_au && g_pushes == 1) open_stream();
+              atomic_store_explicit(&g_rate, rate > 4000 ? rate : 13379, memory_order_relaxed);
+              if (atomic_load_explicit(&g_paused, memory_order_relaxed)) return;
+              uint32_t w = atomic_load_explicit(&g_w, memory_order_relaxed), r = atomic_load_explicit(&g_r, memory_order_acquire);
+              uint32_t used = w - r, cap = (uint32_t)atomic_load_explicit(&g_rate, memory_order_relaxed) / 4;
+              if (cap > RING_FRAMES) cap = RING_FRAMES;
+              uint32_t room = used < cap ? cap - used : 0;
+              if ((uint32_t)count > room) count = (int)room;
+              for (int i = 0; i < count; i++) {
+                  uint32_t k = (w + (uint32_t)i) & RING_MASK;
+                  g_ring[k][0] = (int16_t)(left[i] * 256);
+                  g_ring[k][1] = (int16_t)(right[i] * 256);
+              }
+              atomic_store_explicit(&g_w, w + (uint32_t)count, memory_order_release);
+          }
+          AEOF
+          rm -f ios-legacy/gen/core/host_audio.c
+          grep -q audio_legacy.c ios-legacy/Makefile || sed -i 's|Sources/WL4Log.c|Sources/WL4Log.c Sources/audio_legacy.c|' ios-legacy/Makefile
+          grep -n audio_legacy ios-legacy/Makefile
+          ls ios-legacy/gen/core
+
       - name: Install Theos + iOS toolchain
         run: |
           set -euo pipefail
@@ -182,6 +354,15 @@ jobs:
           done
           find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          # Deployment target < 6.0 + -fobjc-arc: clang insists on lib/arc/libarclite_iphoneos.a (Apple's ARC back-deploy
+          # library, not shipped with this toolchain).  The code uses no []-subscripting / other arclite-only features
+          # (checked by "Verify Mach-O"), so an archive with one empty object is enough.
+          TC="$THEOS/toolchain/linux/iphone"
+          mkdir -p "$TC/lib/arc" /tmp/arclite
+          echo 'void wl4_arclite_stub(void) {}' > /tmp/arclite/stub.c
+          "$TC/bin/clang" -target armv7-apple-ios5.0 -isysroot "$SDK" -c /tmp/arclite/stub.c -o /tmp/arclite/stub.o
+          "$TC/bin/llvm-ar" --format=darwin rcs "$TC/lib/arc/libarclite_iphoneos.a" /tmp/arclite/stub.o
+          ls -la "$TC/lib/arc"
 
       - name: Build with Theos
         working-directory: ios-legacy
@@ -193,13 +374,27 @@ jobs:
           make package FINALPACKAGE=1 V=1 2>&1 | tee ../build-theos.log | tail -80
           ls -la packages
 
-      - name: Verify Mach-O (armv7, min iOS 7.0)
+      - name: Verify Mach-O (armv7, min iOS 5.0)
         working-directory: ios-legacy
         run: |
-          BIN="$(find .theos -type f -name WL4Legacy | head -n1)"
-          file "$BIN" || true
-          OTOOL="$(ls "$THEOS"/toolchain/linux/iphone/bin/*otool* 2>/dev/null | head -n1)"
-          [ -n "$OTOOL" ] && "$OTOOL" -hv -l "$BIN" | grep -E "cputype|ARM|LC_VERSION_MIN|version|minos" | head -10 || true
+          set -euo pipefail
+          BIN="$(find .theos/obj -type f -path '*WL4Legacy.app/WL4Legacy' | head -n1)"
+          [ -n "$BIN" ] || { echo "::error::binary not found"; exit 1; }
+          TCB="$THEOS/toolchain/linux/iphone/bin"
+          export PATH="$TCB:$PATH"
+          otool -hv "$BIN" | tail -2
+          MINOS=$(otool -l "$BIN" | grep -A2 LC_VERSION_MIN_IPHONEOS | awk '/version/{print $2}')
+          echo "min iOS: $MINOS"
+          [ "$MINOS" = "5.0" ] || { echo "::error::min iOS is $MINOS, expected 5.0"; exit 1; }
+          # arclite is an empty stand-in: the app must not use anything that needs the real one
+          if strings -a "$BIN" | grep -E "objectAtIndexedSubscript|objectForKeyedSubscript|setObject:atIndexedSubscript|setObject:forKeyedSubscript"; then
+            echo "::error::[]-subscripting found: it crashes on iOS 5 without the real libarclite"; exit 1
+          fi
+          echo "--- imports that are not Objective-C/UIKit symbols (review for anything newer than iOS 5):"
+          nm -u "$BIN" | grep -v -E "_OBJC_|^_NS|^_UI|^_CG|^_CA|^_kCA|^_kCG|^_AV|^_kAudio|^_objc_" || true
+          echo "--- compiler-rt helpers (must be defined in the binary, not imported):"
+          nm -u "$BIN" | grep -E "^___(u?div|u?mod|float|fix)" && { echo "::error::unresolved compiler-rt helper"; exit 1; } || echo "none imported"
+          nm -gU "$BIN" | grep -E "^[0-9a-f]+ [TtSs] ___(u?div|u?mod|float)" || true
 
       - name: Pack .ipa
         working-directory: ios-legacy
@@ -209,12 +404,12 @@ jobs:
           [ -n "$APP" ] || { echo "::error::WL4Legacy.app not found"; exit 1; }
           rm -rf ipa && mkdir -p ipa/Payload
           cp -a "$APP" ipa/Payload/
-          (cd ipa && zip -qr "../packages/WL4-${VER}-armv7-ios7.ipa" Payload)
+          (cd ipa && zip -qr "../packages/WL4-${VER}-armv7-ios5.ipa" Payload)
           ls -la packages
 
       - uses: actions/upload-artifact@v4
         with:
-          name: WL4-${{ env.VER }}-ios-legacy-armv7
+          name: WL4-${{ env.VER }}-ios5-armv7
           path: |
             ios-legacy/packages/*.ipa
             ios-legacy/packages/*.deb
@@ -223,7 +418,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: build-logs-ios-legacy
+          name: build-logs-ios5
           path: |
             port-build.log
             build-theos.log

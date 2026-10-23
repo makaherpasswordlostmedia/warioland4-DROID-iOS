@@ -1,0 +1,517 @@
+diff --git a/ios-legacy/Makefile b/ios-legacy/Makefile
+index c8617d1..ef0e6ab 100644
+--- a/ios-legacy/Makefile
++++ b/ios-legacy/Makefile
+@@ -1,9 +1,11 @@
+-# Wario Land 4 - legacy iOS port (armv7, iOS 7.0 - 9.3.5; target device: iPad mini 1 / A5).
++# Wario Land 4 - legacy iOS port (armv7, iOS 5.0 - 9.3.5; devices: iPhone 3GS/4/4S, iPad 1/2/3, iPod touch 3/4, iPad mini 1).
++# iOS 5 notes: ARC with a deployment target < 6.0 makes clang link libarclite (the CI step creates an empty stand-in, the
++# code uses no []-subscripting), and Sources/rt_shim.c supplies the compiler-rt division helpers.
+ # Built on Linux with Theos + the iPhoneOS 9.3 SDK (same toolchain as the Crash Bandicoot armv7 port).
+ # Run ./prepare.sh first: it gathers the portable core + wasm2c output into gen/.  See ../.github/workflows/wl4-ios-legacy.yml.
+ export THEOS_DEVICE_IP =
+ ARCHS = armv7
+-TARGET = iphone:clang:9.3:7.0
++TARGET = iphone:clang:9.3:5.0
+ INSTALL_TARGET_PROCESSES = WL4Legacy
+ 
+ include $(THEOS)/makefiles/common.mk
+@@ -11,7 +13,7 @@ include $(THEOS)/makefiles/common.mk
+ APPLICATION_NAME = WL4Legacy
+ 
+ WL4Legacy_FILES = $(wildcard gen/core/*.c) $(wildcard gen/w2c/*.c) gen/stubs.c \
+-	Sources/WL4Log.c Sources/main.m Sources/AppDelegate.m Sources/WL4Session.m \
++	Sources/WL4Log.c Sources/rt_shim.c Sources/main.m Sources/AppDelegate.m Sources/WL4Session.m \
+ 	Sources/MenuViewController.m Sources/GameViewController.m Sources/GameView.m Sources/PadView.m
+ 
+ # UI files are ARC; the C core is not (ADDITIONAL_OBJCFLAGS only touches .m).
+@@ -29,6 +31,6 @@ WL4Legacy_LDFLAGS = -framework UIKit -framework Foundation -framework QuartzCore
+ 
+ WL4Legacy_CODESIGN_FLAGS = -SResources/entitlements.plist
+ WL4Legacy_PLIST = Resources/Info.plist
+-WL4Legacy_RESOURCE_FILES = $(wildcard Resources/LaunchImage*.png)
++WL4Legacy_RESOURCE_FILES = $(wildcard Resources/LaunchImage*.png) $(wildcard Resources/Default*.png)
+ 
+ include $(THEOS_MAKE_PATH)/application.mk
+diff --git a/ios-legacy/Resources/Default-Landscape@2x~ipad.png b/ios-legacy/Resources/Default-Landscape@2x~ipad.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..97299d134a2d9dcd729bd116075af8422acaa1c2
+GIT binary patch
+literal 9251
+zcmeI$Jqp4=5QgE2hOh<_dn>_PXd%k_lO_bw-qu2}v@>XB=SlPocHTe~u@+IW7W~;g
+zhT;9183qQ1r<`RHcLKlUi%1Z4bx%Z@))SR8W&EmFMJm@wH~Q1#ZR<E@n65sXhq4O<
+z0R#|0009ILKmY**5I_I{1Trm<9u|4~43P47-%bVu0R#|0009ILKmY**5I_I{1hOtL
+mDuxC73vl1FyH~RvK>&fj6L`AeM4Z#^e6goTtyr&{!}$-v;%zYi
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/Default-Landscape~ipad.png b/ios-legacy/Resources/Default-Landscape~ipad.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..31b12afa7c992889f5f8bd0ba62750d0c7a2167a
+GIT binary patch
+literal 2367
+zcmeAS@N?(olHy`uVBq!ia0y~yU;#3j8911Ll<AG8C<X>jHcuDFkcwMx4;nH81rIIw
+z>YvNYzW~S_1*0J_8UmvsFd71*Aut*OqaiSiL!d#NnN@~?QMc??2*{V7u6{1-oD!M<
+D{*4le
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/Default-Portrait@2x~ipad.png b/ios-legacy/Resources/Default-Portrait@2x~ipad.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff8b0c4752343f4fc027269db2922fb2d8958b40
+GIT binary patch
+literal 9251
+zcmeI$KMny=5XbR(EZJ<bs8tdda0KM}^P0^@s1ztwt5j~NbQ1Tlg-+)bvW|f0HQ09y
+zoA0lg$t06ZKIQDfVBmXoPegn()FY8{*1F;rvJ#!5g-G*mbZ5N2JugaS!+8HmUanmr
+z2q1s}0tg_000IagfB*srAdqW;INcWQGe8>OYd@S21Q0*~0R#|0009ILKmY**5Xig0
+mvRZNMFTi<ElUBQATY>-re<v`jtwg2g$H881dVxN6=bIm86>J~?
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/Default-Portrait~ipad.png b/ios-legacy/Resources/Default-Portrait~ipad.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..57482f3ab96f6aa672f2e9bb14840b2654bc28ac
+GIT binary patch
+literal 2367
+zcmeAS@N?(olHy`uVBq!ia0y~yU<NW-7&w@K)J>O_;S3C%Y@RNTAr-gY9yDYG3LaYU
+z)jyY)e*us=3PwX<Gz3ONU^E0qLtr!nMnhmYhkzXqn+yY^s9H=q$d{h3elF{r5}E+U
+CY!RCP
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/Default.png b/ios-legacy/Resources/Default.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..852b4a58d8f0ed23f95059e8a7d455132f1840dc
+GIT binary patch
+literal 526
+zcmeAS@N?(olHy`uVBq!ia0y~yU~~ZD2OLa5k?42I!a&YdPZ!6Kid%0FGBN@Mn-u=9
+j&+~8qF-O6W4FP>NE>8x=O15{OKwj{4^>bP0l+XkKz33C9
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/Default@2x.png b/ios-legacy/Resources/Default@2x.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..382684e16c130a2a396319afc9778ecd641d6a93
+GIT binary patch
+literal 1866
+zcmeAS@N?(olHy`uVBq!ia0y~yU}|7sU_QXX1QgL~h+o6Nz%J<N;uunK>+L~CMxbDm
+y!vFPo9u6SpC>RZa(GVC7fzc2c4S^990{U#KDGZFkmDS83PkXxhxvX<aXaWEg;u2s0
+
+literal 0
+HcmV?d00001
+
+diff --git a/ios-legacy/Resources/Info.plist b/ios-legacy/Resources/Info.plist
+index 05db45a..1ec8f44 100644
+--- a/ios-legacy/Resources/Info.plist
++++ b/ios-legacy/Resources/Info.plist
+@@ -4,14 +4,14 @@
+ <dict>
+ 	<key>CFBundleDevelopmentRegion</key><string>en</string>
+ 	<key>CFBundleExecutable</key><string>WL4Legacy</string>
+-	<key>CFBundleIdentifier</key><string>com.wl4.port.legacy</string>
++	<key>CFBundleIdentifier</key><string>com.wl4.port.ios5</string>
+ 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+ 	<key>CFBundleName</key><string>WL4</string>
+ 	<key>CFBundleDisplayName</key><string>Wario Land 4</string>
+ 	<key>CFBundlePackageType</key><string>APPL</string>
+ 	<key>CFBundleShortVersionString</key><string>1.0.0</string>
+ 	<key>CFBundleVersion</key><string>1</string>
+-	<key>MinimumOSVersion</key><string>7.0</string>
++	<key>MinimumOSVersion</key><string>5.0</string>
+ 	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string></array>
+ 	<key>LSRequiresIPhoneOS</key><true/>
+ 	<key>UIDeviceFamily</key><array><integer>2</integer><integer>1</integer></array>
+diff --git a/ios-legacy/Sources/AppDelegate.m b/ios-legacy/Sources/AppDelegate.m
+index 393d6be..d78e65c 100644
+--- a/ios-legacy/Sources/AppDelegate.m
++++ b/ios-legacy/Sources/AppDelegate.m
+@@ -5,7 +5,13 @@
+ #include "WL4Log.h"
+ #include "audio.h"
+ 
+-/* iOS 7-9.3 build: no block timers (iOS 10), no UIAlertController (8). */
++/* iOS 5.0-9.3 build: no block timers (iOS 10), no UIAlertController (8).
++ * iOS 5 has no AVAudioSessionInterruptionNotification (added in 6): there the interruptions arrive through the
++ * (since deprecated) AVAudioSessionDelegate callbacks instead. */
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++@interface AppDelegate () <AVAudioSessionDelegate>
++@end
++
+ @implementation AppDelegate {
+     NSTimer *_autosave;
+ }
+@@ -20,9 +26,13 @@
+ 
+     AVAudioSession *as = [AVAudioSession sharedInstance];
+     [as setCategory:AVAudioSessionCategoryPlayback error:nil];
++    if (&AVAudioSessionInterruptionNotification != NULL) {          /* iOS 6+ (weak-imported symbol) */
++        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioInterruption:)
++                                                     name:AVAudioSessionInterruptionNotification object:as];
++    } else {                                                        /* iOS 5 */
++        as.delegate = self;
++    }
+     [as setActive:YES error:nil];
+-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioInterruption:)
+-                                                 name:AVAudioSessionInterruptionNotification object:as];
+ 
+     [s adoptRomsFromDocuments];
+     _autosave = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(autosaveTick:) userInfo:nil repeats:YES];
+@@ -36,14 +46,17 @@
+ - (void)autosaveTick:(NSTimer *)t { [WL4Session.shared persistSave]; }
+ 
+ - (void)audioInterruption:(NSNotification *)n {
+-    NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+-    if (type == AVAudioSessionInterruptionTypeBegan) {
+-        WL4Session.shared.interrupted = YES;
+-    } else {
+-        [[AVAudioSession sharedInstance] setActive:YES error:nil];
+-        wl4_audio_request_restart();
+-        WL4Session.shared.interrupted = NO;
+-    }
++    NSUInteger type = [[n.userInfo objectForKey:AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];   /* no [] subscripting: iOS 5 */
++    if (type == AVAudioSessionInterruptionTypeBegan) [self beginInterruption];
++    else [self endInterruption];
++}
++
++/* AVAudioSessionDelegate (iOS 5; harmless duplicates of the notification path on 6+, where no delegate is set) */
++- (void)beginInterruption { WL4Session.shared.interrupted = YES; }
++- (void)endInterruption {
++    [[AVAudioSession sharedInstance] setActive:YES error:nil];
++    wl4_audio_request_restart();
++    WL4Session.shared.interrupted = NO;
+ }
+ 
+ - (void)applicationDidBecomeActive:(UIApplication *)application {
+diff --git a/ios-legacy/Sources/GameViewController.m b/ios-legacy/Sources/GameViewController.m
+index bc58794..9f596f9 100644
+--- a/ios-legacy/Sources/GameViewController.m
++++ b/ios-legacy/Sources/GameViewController.m
+@@ -4,9 +4,15 @@
+ #import "WL4Session.h"
+ #import <GameController/GameController.h>
+ 
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
+ @interface GameViewController () <UIAlertViewDelegate>
+ @end
+ 
++/* GameController.framework is iOS 7+ and weak-linked: on iOS 5/6 the class (and the GCController* notification names,
++ * which would turn addObserver:name:nil into "observe everything") must never be touched. */
++static BOOL HaveGameController(void) { return NSClassFromString(@"GCController") != nil; }
++
+ @implementation GameViewController {
+     GameView *_gv;
+     PadView *_pad;
+@@ -34,10 +40,12 @@
+     [_menu addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
+     [self.view addSubview:_menu];
+ 
+-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+-    [nc addObserver:self selector:@selector(controllerConnected:) name:GCControllerDidConnectNotification object:nil];
+-    [nc addObserver:self selector:@selector(controllerDisconnected:) name:GCControllerDidDisconnectNotification object:nil];
+-    for (GCController *c in [GCController controllers]) [self bindController:c];
++    if (HaveGameController()) {
++        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++        [nc addObserver:self selector:@selector(controllerConnected:) name:GCControllerDidConnectNotification object:nil];
++        [nc addObserver:self selector:@selector(controllerDisconnected:) name:GCControllerDidDisconnectNotification object:nil];
++        for (GCController *c in [GCController controllers]) [self bindController:c];
++    }
+     [self updatePadVisibility];
+ }
+ 
+@@ -68,14 +76,17 @@
+ 
+ - (void)showMenu {
+     WL4Session.shared.userPaused = YES;
+-    NSArray *names = @[@"Sharp (fit)", @"Smooth (fit)", @"Integer scale"];
++    NSArray *names = [NSArray arrayWithObjects:@"Sharp (fit)", @"Smooth (fit)", @"Integer scale", nil];
+     UIAlertView *a = [[UIAlertView alloc] initWithTitle:@"Paused" message:nil delegate:self cancelButtonTitle:@"Resume" otherButtonTitles:nil];
+     for (NSInteger i = 0; i < 3; i++)
+-        [a addButtonWithTitle:[NSString stringWithFormat:@"%@%@", names[i], _gv.scaleMode == i ? @"  ✓" : @""]];
++        [a addButtonWithTitle:[NSString stringWithFormat:@"%@%@", _gv.scaleMode == i ? @"• " : @"", [names objectAtIndex:(NSUInteger)i]]];
+     [a addButtonWithTitle:@"Back to menu"];
+     [a show];
+ }
+ 
++/* iOS dismisses a visible alert with "cancel" when the app goes to the background: don't stay paused forever */
++- (void)alertViewCancel:(UIAlertView *)alertView { WL4Session.shared.userPaused = NO; }
++
+ - (void)alertView:(UIAlertView *)alertView clickedButtonAtIndex:(NSInteger)idx {
+     WL4Session *s = WL4Session.shared;
+     s.userPaused = NO;
+@@ -118,7 +129,8 @@
+ - (void)controllerDisconnected:(NSNotification *)n { WL4Session.shared.padKeys = 0; [self updatePadVisibility]; }
+ - (void)updatePadVisibility {
+     BOOL have = NO;
+-    for (GCController *c in [GCController controllers]) if (c.extendedGamepad) have = YES;
++    if (HaveGameController())
++        for (GCController *c in [GCController controllers]) if (c.extendedGamepad) have = YES;
+     _pad.hidden = have;
+ }
+ 
+@@ -126,6 +138,8 @@
+ 
+ - (BOOL)prefersStatusBarHidden { return YES; }
+ - (BOOL)shouldAutorotate { return YES; }
++/* iOS 5 (and 6+ only if the new method is missing) asks this one; the phone/pad keeps the same "all but upside down" rule */
++- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o { return o != UIInterfaceOrientationPortraitUpsideDown; }
+ - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
+ 
+ @end
+diff --git a/ios-legacy/Sources/MenuViewController.m b/ios-legacy/Sources/MenuViewController.m
+index dfbabf8..fe840d2 100644
+--- a/ios-legacy/Sources/MenuViewController.m
++++ b/ios-legacy/Sources/MenuViewController.m
+@@ -2,7 +2,7 @@
+ #import "GameViewController.h"
+ #import "WL4Session.h"
+ 
+-/* iOS 7-9.3: no UIDocumentPicker (8+), no UIStackView (9+), no layout anchors (9+).  ROMs arrive through iTunes File
++/* iOS 5-9.3: no UIDocumentPicker (8+), no UIStackView (9+), no layout anchors (9+).  ROMs arrive through iTunes File
+  * Sharing / Filza / SSH into Documents/ as *.gba; "Rescan" adopts them. */
+ @implementation MenuViewController {
+     UILabel *_title, *_status, *_note;
+@@ -37,7 +37,8 @@ static UILabel *MakeLabel(CGFloat size, BOOL bold, UIColor *c) {
+     _note.text = @"This app ships no game data. Copy your own .gba into this app's folder with iTunes File Sharing (or Filza), then tap Rescan.";
+     _play = MakeButton(@"Play", self, @selector(play));
+     _rescan = MakeButton(@"Rescan ROM", self, @selector(rescan));
+-    for (UIView *v in @[_title, _status, _play, _rescan, _note]) [self.view addSubview:v];
++    [self.view addSubview:_title]; [self.view addSubview:_status]; [self.view addSubview:_play];
++    [self.view addSubview:_rescan]; [self.view addSubview:_note];
+ }
+ 
+ - (void)viewDidLayoutSubviews {
+@@ -83,6 +84,7 @@ static UILabel *MakeLabel(CGFloat size, BOOL bold, UIColor *c) {
+ 
+ - (BOOL)prefersStatusBarHidden { return YES; }
+ - (BOOL)shouldAutorotate { return YES; }
++- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o { return o != UIInterfaceOrientationPortraitUpsideDown; }   /* iOS 5 */
+ - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
+ 
+ @end
+diff --git a/ios-legacy/Sources/PadView.m b/ios-legacy/Sources/PadView.m
+index e10cac7..c72c874 100644
+--- a/ios-legacy/Sources/PadView.m
++++ b/ios-legacy/Sources/PadView.m
+@@ -1,6 +1,11 @@
+ #import "PadView.h"
+ #import "WL4Session.h"
+ 
++/* iOS 5: NSFontAttributeName / sizeWithAttributes: / drawAtPoint:withAttributes: are iOS 7+ (the NSString UIKit
++ * additions that take a UIFont are iOS 2+, deprecated later but still there), and the arrow glyphs would come out as
++ * colour emoji, so the D-pad arrows are drawn as paths. */
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
+ @interface PadButton : NSObject
+ @property (nonatomic) uint16_t key;
+ @property (nonatomic) CGPoint c;
+@@ -29,9 +34,9 @@ static PadButton *B(uint16_t key, NSString *label) {
+         self.opaque = NO;
+         self.backgroundColor = [UIColor clearColor];
+         _active = [NSMutableSet set];
+-        _buttons = @[B(WL4KeyUp, @"▲"), B(WL4KeyDown, @"▼"), B(WL4KeyLeft, @"◀"), B(WL4KeyRight, @"▶"),
++        _buttons = [NSArray arrayWithObjects:B(WL4KeyUp, @""), B(WL4KeyDown, @""), B(WL4KeyLeft, @""), B(WL4KeyRight, @""),
+                      B(WL4KeyA, @"A"), B(WL4KeyB, @"B"), B(WL4KeyL, @"L"), B(WL4KeyR, @"R"),
+-                     B(WL4KeyStart, @"Start"), B(WL4KeySelect, @"Sel")];
++                     B(WL4KeyStart, @"Start"), B(WL4KeySelect, @"Sel"), nil];
+     }
+     return self;
+ }
+@@ -97,11 +102,23 @@ static PadButton *B(uint16_t key, NSString *label) {
+         CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.5].CGColor);
+         CGContextSetLineWidth(g, 1.5);
+         CGContextStrokeEllipseInRect(g, CGRectInset(cr, 0.75, 0.75));
++        CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.9].CGColor);
++        if (b.label.length == 0) {                         /* D-pad arrow: triangle pointing away from the pad centre */
++            CGFloat a = b.r * 0.45, dx = 0, dy = 0;
++            if (b.key == WL4KeyUp) dy = -1; else if (b.key == WL4KeyDown) dy = 1;
++            else if (b.key == WL4KeyLeft) dx = -1; else dx = 1;
++            CGContextBeginPath(g);
++            CGContextMoveToPoint(g, b.c.x + dx * a, b.c.y + dy * a);                          /* tip */
++            CGContextAddLineToPoint(g, b.c.x - dx * a * 0.6 + dy * a, b.c.y - dy * a * 0.6 + dx * a);
++            CGContextAddLineToPoint(g, b.c.x - dx * a * 0.6 - dy * a, b.c.y - dy * a * 0.6 - dx * a);
++            CGContextClosePath(g);
++            CGContextFillPath(g);
++            continue;
++        }
+         CGFloat fs = (b.label.length > 2) ? b.r * 0.45 : b.r * 0.7;
+-        NSDictionary *at = @{NSFontAttributeName: [UIFont boldSystemFontOfSize:fs],
+-                             NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.9]};
+-        CGSize ts = [b.label sizeWithAttributes:at];
+-        [b.label drawAtPoint:CGPointMake(b.c.x - ts.width / 2, b.c.y - ts.height / 2) withAttributes:at];
++        UIFont *font = [UIFont boldSystemFontOfSize:fs];
++        CGSize ts = [b.label sizeWithFont:font];
++        [b.label drawAtPoint:CGPointMake(b.c.x - ts.width / 2, b.c.y - ts.height / 2) withFont:font];
+     }
+ }
+ 
+diff --git a/ios-legacy/Sources/WL4Session.m b/ios-legacy/Sources/WL4Session.m
+index b8551d2..be9dadb 100644
+--- a/ios-legacy/Sources/WL4Session.m
++++ b/ios-legacy/Sources/WL4Session.m
+@@ -16,7 +16,8 @@
+ 
+ - (instancetype)init {
+     if ((self = [super init])) {
+-        _documentsPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
++        NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
++        _documentsPath = docs.count ? [docs objectAtIndex:0] : NSHomeDirectory();
+         _romPath = [_documentsPath stringByAppendingPathComponent:@"wl4.gba"];
+         _savePath = [_documentsPath stringByAppendingPathComponent:@"wl4.sav"];
+         _logPath = [_documentsPath stringByAppendingPathComponent:@"wl4.log"];
+@@ -67,7 +68,8 @@ static NSString *CheckRom(NSData *d) {
+ - (NSString *)startIfNeeded {
+     if (wl4_running()) return nil;
+     if (_started) return @"The game stopped after an error. Use \"Share log\" and relaunch the app.";
+-    NSData *rom = [NSData dataWithContentsOfFile:_romPath];
++    /* mapped: a 16 MB ROM must not sit in the heap three times on a 256 MB device (wl4_start copies it anyway) */
++    NSData *rom = [NSData dataWithContentsOfFile:_romPath options:NSDataReadingMappedIfSafe error:nil];
+     if (!rom) return @"No ROM selected.";
+     NSString *bad = CheckRom(rom);
+     if (bad) return bad;
+diff --git a/ios-legacy/Sources/rt_shim.c b/ios-legacy/Sources/rt_shim.c
+new file mode 100644
+index 0000000..d76c1d0
+--- /dev/null
++++ b/ios-legacy/Sources/rt_shim.c
+@@ -0,0 +1,87 @@
++/* Compiler-runtime helpers for armv7 without hardware divide (Cortex-A8/A9: iPhone 3GS-4S, iPad 1/2/3).
++ *
++ * clang lowers 32/64-bit division and 64-bit<->float conversion to calls into the compiler runtime.  iOS 7+ gets those
++ * from libSystem; whether the iOS 5 libSystem exports them is not something this build can verify, and a missing symbol
++ * is a hard "Symbol not found" at launch.  Defining them inside the executable removes the question (with two-level
++ * namespaces the executable's own definition always wins, so on newer systems this simply shadows libSystem's copy).
++ *
++ * Only shifts, compares and subtractions are used below, so nothing here can compile into a call to itself.
++ * Build with -fno-builtin.  `make test-rt` style check: compile with -DWL4_RT_TEST on a host and compare to / and %. */
++#include <stdint.h>
++
++#ifdef WL4_RT_TEST
++#define RT(n) t##n
++#else
++#define RT(n) n
++#endif
++
++static uint32_t udivmod32(uint32_t n, uint32_t d, uint32_t *rem) {
++    if (d == 0) { if (rem) *rem = n; return 0; }
++    if (d > n) { if (rem) *rem = n; return 0; }
++    int shift = __builtin_clz(d) - __builtin_clz(n);
++    uint32_t q = 0;
++    d <<= shift;
++    for (int i = shift; i >= 0; i--) {
++        q <<= 1;
++        if (n >= d) { n -= d; q |= 1; }
++        d >>= 1;
++    }
++    if (rem) *rem = n;
++    return q;
++}
++
++static uint64_t udivmod64(uint64_t n, uint64_t d, uint64_t *rem) {
++    if (d == 0 || d > n) { if (rem) *rem = n; return 0; }
++    if ((n >> 32) == 0) {                                   /* both fit in 32 bits: fast path */
++        uint32_t r32; uint32_t q32 = udivmod32((uint32_t)n, (uint32_t)d, &r32);
++        if (rem) *rem = r32;
++        return q32;
++    }
++    uint32_t nh = (uint32_t)(n >> 32), dh = (uint32_t)(d >> 32);
++    int clzn = nh ? __builtin_clz(nh) : 32 + __builtin_clz((uint32_t)n);
++    int clzd = dh ? __builtin_clz(dh) : 32 + __builtin_clz((uint32_t)d);
++    int shift = clzd - clzn;
++    uint64_t q = 0;
++    d <<= shift;
++    for (int i = shift; i >= 0; i--) {
++        q <<= 1;
++        if (n >= d) { n -= d; q |= 1; }
++        d >>= 1;
++    }
++    if (rem) *rem = n;
++    return q;
++}
++
++uint32_t RT(__udivsi3)(uint32_t a, uint32_t b) { return udivmod32(a, b, 0); }
++uint32_t RT(__umodsi3)(uint32_t a, uint32_t b) { uint32_t r; udivmod32(a, b, &r); return r; }
++int32_t  RT(__divsi3)(int32_t a, int32_t b) {
++    uint32_t ua = a < 0 ? 0u - (uint32_t)a : (uint32_t)a, ub = b < 0 ? 0u - (uint32_t)b : (uint32_t)b;
++    uint32_t q = udivmod32(ua, ub, 0);
++    return (int32_t)(((a < 0) != (b < 0)) ? 0u - q : q);
++}
++int32_t  RT(__modsi3)(int32_t a, int32_t b) {
++    uint32_t ua = a < 0 ? 0u - (uint32_t)a : (uint32_t)a, ub = b < 0 ? 0u - (uint32_t)b : (uint32_t)b, r;
++    udivmod32(ua, ub, &r);
++    return (int32_t)(a < 0 ? 0u - r : r);
++}
++uint64_t RT(__udivdi3)(uint64_t a, uint64_t b) { return udivmod64(a, b, 0); }
++uint64_t RT(__umoddi3)(uint64_t a, uint64_t b) { uint64_t r; udivmod64(a, b, &r); return r; }
++int64_t  RT(__divdi3)(int64_t a, int64_t b) {
++    uint64_t ua = a < 0 ? 0ull - (uint64_t)a : (uint64_t)a, ub = b < 0 ? 0ull - (uint64_t)b : (uint64_t)b;
++    uint64_t q = udivmod64(ua, ub, 0);
++    return (int64_t)(((a < 0) != (b < 0)) ? 0ull - q : q);
++}
++int64_t  RT(__moddi3)(int64_t a, int64_t b) {
++    uint64_t ua = a < 0 ? 0ull - (uint64_t)a : (uint64_t)a, ub = b < 0 ? 0ull - (uint64_t)b : (uint64_t)b, r;
++    udivmod64(ua, ub, &r);
++    return (int64_t)(a < 0 ? 0ull - r : r);
++}
++
++/* 64-bit integer -> double/float: hi * 2^32 is exact, `lo` is exact, so the single add rounds once (correct rounding for
++ * double; the float variants go through double and may differ from compiler-rt in the last bit in rare double-rounding cases). */
++double RT(__floatundidf)(uint64_t a) { return (double)(uint32_t)(a >> 32) * 4294967296.0 + (double)(uint32_t)a; }
++double RT(__floatdidf)(int64_t a) {
++    return a < 0 ? -RT(__floatundidf)(0ull - (uint64_t)a) : RT(__floatundidf)((uint64_t)a);
++}
++float RT(__floatundisf)(uint64_t a) { return (float)RT(__floatundidf)(a); }
++float RT(__floatdisf)(int64_t a)    { return (float)RT(__floatdidf)(a); }
+diff --git a/ios-legacy/control b/ios-legacy/control
+index 52de744..fb4ece2 100644
+--- a/ios-legacy/control
++++ b/ios-legacy/control
+@@ -1,9 +1,9 @@
+-Package: com.wl4.port.legacy
+-Name: Wario Land 4 (legacy)
++Package: com.wl4.port.ios5
++Name: Wario Land 4 (iOS 5)
+ Version: 1.0.0-1
+ Architecture: iphoneos-arm
+-Description: Wario Land 4 decomp port for 32-bit iOS 7.0-9.3.5 (armv7, iPad mini 1). Bring your own ROM.
++Description: Wario Land 4 decomp port for 32-bit iOS 5.0-9.3.5 (armv7: iPhone 3GS/4/4S, iPad 1/2/3, iPad mini 1). Bring your own ROM.
+ Maintainer: wl4port
+ Author: wl4port
+ Section: Games
+-Depends: firmware (>= 7.0)
++Depends: firmware (>= 5.0)
+diff --git a/ios-legacy/tests/rt_shim_test.c b/ios-legacy/tests/rt_shim_test.c
+new file mode 100644
+index 0000000..3a55fdd
+--- /dev/null
++++ b/ios-legacy/tests/rt_shim_test.c
+@@ -0,0 +1,24 @@
++/* Host-side check of Sources/rt_shim.c against the CPU's own / and %.  gcc -O2 -o /tmp/rt_test ios-legacy/tests/rt_shim_test.c && /tmp/rt_test */
++#define WL4_RT_TEST 1
++#include "../Sources/rt_shim.c"
++#include <stdio.h>
++#include <stdlib.h>
++static uint64_t s=88172645463325252ull; static uint64_t rnd(void){s^=s<<13;s^=s>>7;s^=s<<17;return s;}
++int main(void){
++  long bad=0;
++  for(long i=0;i<3000000;i++){
++    uint64_t a=rnd(), b=rnd();
++    int sh=rnd()%64; int sh2=rnd()%64; a>>=sh; b>>=sh2; if(i%7==0) b&=0xffff; if(i%11==0){a=(uint32_t)a;b=(uint32_t)b;}
++    if(i%101==0){ a=(i&1)?0x8000000000000000ull:a; }
++    uint32_t a32=(uint32_t)a,b32=(uint32_t)b;
++    if(b32){ if(t__udivsi3(a32,b32)!=a32/b32||t__umodsi3(a32,b32)!=a32%b32)bad++;
++      if(!(((int32_t)a32==INT32_MIN)&&((int32_t)b32==-1))){
++        if(t__divsi3(a32,b32)!=(int32_t)a32/(int32_t)b32||t__modsi3(a32,b32)!=(int32_t)a32%(int32_t)b32)bad++; } }
++    if(b){ if(t__udivdi3(a,b)!=a/b||t__umoddi3(a,b)!=a%b)bad++;
++      if(!(((int64_t)a==INT64_MIN)&&((int64_t)b==-1))){
++        if(t__divdi3(a,b)!=(int64_t)a/(int64_t)b||t__moddi3(a,b)!=(int64_t)a%(int64_t)b)bad++; } }
++    if(t__floatundidf(a)!=(double)a)bad++;
++    if(t__floatdidf((int64_t)a)!=(double)(int64_t)a)bad++;
++  }
++  printf("bad=%ld\n",bad); return bad!=0;
++}
