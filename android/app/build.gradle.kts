@@ -11,7 +11,17 @@ android {
         externalNativeBuild { cmake { arguments += "-DWL4_PORT_DIR=${rootDir.parentFile}/port" } }
     }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
-    buildTypes { release { isMinifyEnabled = false } }
+    // Fixed signing key: CI runners generate a fresh debug keystore every run, so every APK had a different signature and
+    // Android refused to update in place (uninstall -> app data and save lost).  Same key => install over the old app.
+    signingConfigs {
+        create("fixed") {
+            storeFile = file("wl4-debug.jks"); storePassword = "wl4debug"; keyAlias = "wl4"; keyPassword = "wl4debug"
+        }
+    }
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("fixed") }
+        release { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("fixed") }
+    }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
 }
