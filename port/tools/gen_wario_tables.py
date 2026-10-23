@@ -227,6 +227,15 @@ SSAI_HELPERS = {
     'ApplyBugleNotePulseAffine', 'PlayAllJewelPiecesCollectedJingle', 'ApplyJewelPieceIconAffine',
     'ClampFallingSecondarySpriteAtBottom',
 }
+# AI functions that exist in the C source but are NOT in the ROM table (the table has 85 distinct targets, the source 89
+# candidates).  Zipping unmatched lists shifted every entry from ClearCurrentSecondarySprite onward by one: the ROM entry
+# after Animation36 is only 12 bytes (= ClearCurrentSecondarySprite), the next ones are 1184/168/2012/944 bytes
+# (= Keyzer/Coin50Points/TimeUp/CDIcon), so e.g. the Keyzer->TimeUp sprite ran the wrong function and AutosaveBossClear()
+# never ran (boss never flagged defeated -> first passage never unlocked).  The table ends at FallingVariantE.
+SSAI_NOT_IN_TABLE = {
+    'UpdateTimedSecondarySpriteAnimation37', 'UpdateFallingSecondarySpriteVariantF',
+    'UpdateFallingSecondarySpriteVariantG', 'UpdateFallingSecondarySpriteVariantH',
+}
 
 
 def secondary_sprite_ai():
@@ -235,15 +244,15 @@ def secondary_sprite_ai():
     for i, l in enumerate(lines[:-1]):
         if lines[i + 1].strip() == '{' and not l.startswith((' ', '\t', '#')):
             m = re.match(r'^(\S+) (\w+)\((.*)\)$', l)
-            if m and m.group(2) not in SSAI_HELPERS:
+            if m and m.group(2) not in SSAI_HELPERS and m.group(2) not in SSAI_NOT_IN_TABLE:
                 ai.append(m.group(2))
     names = ['UpdateBigBoardSecondarySprite'] + ai
     w = words(SSAI_ROM, SSAI_LEN)
     if any(x & 1 == 0 or not (0x08000000 <= x < 0x08800000) for x in w):
         die('sSecondarySpriteAITable: non-Thumb or out-of-ROM address (wrong ROM / wrong offset?)')
     uniq = sorted(set(w))
-    if len(uniq) > len(names):
-        die(f'sSecondarySpriteAITable: {len(uniq)} unique targets but only {len(names)} candidate functions')
+    if len(uniq) != len(names):
+        die(f'sSecondarySpriteAITable: {len(uniq)} unique targets but {len(names)} candidate functions')
     lut = dict(zip(uniq, names))
     return [lut[x] for x in w]
 

@@ -688,6 +688,47 @@ PATCHES = [   # (relative path, regex, replacement)
     ('src/hblank.c', r'(?s)\(\(volatile struct Dma3Regs_HBlankCallbackCopy\*\)0x040000D4\)->src = callback;.*?InterruptCallbackSetHBlank\(\(void \(\*\)\(\)\)\(1 \| \(\(s32\)\(&gHBlankCallbackTrampoline\)\)\)\);', 'InterruptCallbackSetHBlank(callback);'),
     # diagnostics: log changes of main/sub game mode, stage-exit step and exit type (tags 2..5 of hal_trace_val)
     ('src/main.c', r'^(\s*)TIMER_COUNT_UP\(gMainTimer\);', r'\1TIMER_COUNT_UP(gMainTimer);\n\1{ hal_trace_val(2, (unsigned)gMainGameMode); hal_trace_val(3, (unsigned)(u16)gSubGameMode); hal_trace_val(4, (unsigned)gSpriteAiDropTimer); hal_trace_val(5, (unsigned)gStageExitType); }'),
+    # struct ItemCollection is 4 bytes in the ROM (gCurrentCollection = 0xA8 bytes = 7*6*4, stride 4/24; map_screen.c, minigame.c,
+    # boss_treasure_cutscene.c, save_file.c and stage_entry.c index it with raw byte offsets 16/40/64/... and `*4 + passage*24`).
+    # agbcc pads the all-bitfield struct to 4 bytes, clang gives sizeof == 1, so `gCurrentCollection[p][s].keyzer = TRUE` wrote byte
+    # p*6+s while InitMapScreen tested byte 16: the map never saw the first boss as defeated -> map mode stayed 0 and every exit
+    # of the first passage stayed locked ("can't go further in stage select after the first boss").  Force the same 4-byte layout.
+    ('include/score.h', r'(    u8 keyzer : 1;\n)\};', r'\1    u8 portPad[3];\n};'),
+    # diagnostics: tag 0 = 100 + mapMode*10 + currentPassage while the map screen runs (mode must become 1 after the first boss)
+    ('src/map_screen.c', r'(int UpdateMapScreen\(void\)\n\{\n)', r'\1    hal_trace_val(0, 100 + (unsigned)gUnk_3003C95 * 10 + (unsigned)gCurrentPassage);\n'),
+    # boss clear: BOSS_DEFEATED (bit 0x20 of gCurrentCollection[p][4]) is only ever set by AutosaveBossClear(), which is called from the
+    # Keyzer->TimeUp secondary sprite when gTimerState == 11.  The map reads that flag to pick the passage-connection table (mode 1),
+    # and it stayed 0 in the port (trace[0] = 100 after the first boss).  Log whether AutosaveBossClear runs (tag 6 = 300 + passage*10 + keyzer)
+    # and, if the boss exit (type 5) is reached without it having run (stage number still STAGE_BOSS), do its essential part here.
+    ('src/autosave.c', r'\A', '#include "port.h"\n'),
+    ('src/autosave.c', r'(void AutosaveBossClear\(void\)\n\{\n)', r'\1    hal_trace_val(6, 300 + (unsigned)gCurrentPassage * 10 + (unsigned)(gCollectedKeyzer & 1));\n'),
+    ('src/main.c', r'(#include "stage_select\.h"\n)', r'\1#include "score.h"\n'),
+    ('src/main.c', r'(                            case 5:\n)(                                if \(gCurrentPassageTemp == PASSAGE_ENTRY\))',
+     r'\1                                if (gCurrentStageNumber == STAGE_BOSS && gCurrentPassage <= PASSAGE_SAPPHIRE) {\n'
+     r'                                    hal_trace_val(6, 400 + (unsigned)gCurrentPassage);\n'
+     r'                                    gCurrentCollection[gCurrentPassage][STAGE_BOSS].BOSS_DEFEATED = TRUE;\n'
+     r'                                    gCurrentPassageTemp = gCurrentPassage;\n'
+     r'                                    gCurrentStageNumber = STAGE_MAX;\n'
+     r'                                    BuildMainSaveWorkingBuffer();\n'
+     r'                                    gSaveFlag = 1;\n'
+     r'                                    gCollectedKeyzer = 0;\n'
+     r'                                }\n\2'),
+    # `T alias(args) asm("real_symbol");` aliases re-declare an existing function with a different prototype (bubble.c even with an
+    # unprototyped `()`).  Under clang/wasm a call through such a declaration is emitted with the wrong signature and wasm-ld
+    # replaces it with `real_symbol_bitcast_invalid` (= `unreachable`, wasm trap 5: stage 3 start, bubble spawner -> func_8023BFC).
+    # One-line #defines keep line numbers intact and call the real, correctly prototyped function (C converts the arguments).
+    ('src/sprite_ai/bubble.c', r'void BubbleCollisionCheck\(\) asm\("func_8023BFC"\);', '#define BubbleCollisionCheck func_8023BFC'),
+    ('src/sprite_ai/aerodent.c', r'void SpriteUtilCheckCollisionAtPositionOld\(u32, u32\) asm\("func_8023BFC"\);', '#define SpriteUtilCheckCollisionAtPositionOld func_8023BFC'),
+    ('src/sprite_ai/hoggus.c', r'void SpriteSpawnAsChildWide\([^)]*\) asm\("SpriteSpawnAsChild"\);', '#define SpriteSpawnAsChildWide SpriteSpawnAsChild'),
+    ('src/sprite_ai/cuckoo_condor.c', r'extern void SpriteUtilFindOwnSlotU32\(u32 roomSlot\) asm\("SpriteUtilFindOwnSlot"\);', '#define SpriteUtilFindOwnSlotU32 SpriteUtilFindOwnSlot'),
+    # catbat.c: `(u32)&gBossDefeatTimer` -- gBossDefeatTimer is an array (an IWRAM address macro here), `&` on it is not an lvalue,
+    # so clang rejected the whole file: SpriteCatbat & co. were missing from the wasm (stub "unimplemented import SpriteCatbat").
+    ('src/sprite_ai/catbat.c', r'\(u32\)&gBossDefeatTimer', '(u32)gBossDefeatTimer'),
+    # DrawBossTreasureCutsceneSprites: the only C for it is a 75%-match WIP decompilation (compiled because NON_MATCHING is
+    # defined) full of `new_varNN` temporaries.  Since boss_treasure_cutscene.c compiles again it runs after every boss
+    # and trapped with wasm trap 1 (out-of-bounds) right after its FixedInverse/FixedMul affine setup.  Skip the drawing
+    # (treasure/particle/sparkle sprites) until it is ported properly; the cutscene logic itself keeps running.
+    ('src/boss_treasure_cutscene.c', r'(void DrawBossTreasureCutsceneSprites\(void\)\n\{\n)', r'\1  if (1) return; /* port: WIP C traps, see portify.py */\n'),
     # diagnostics for the vortex exit: tag 6 = gCollectedKeyzer when the portal is entered, tag 7 = entering-sprite countdown
     ('src/sprite_ai/vortex.c', r'^(\s*)gUnk_3000C0E = 1;', r'\1gUnk_3000C0E = 1;\n\1{ hal_trace_val(6, 100 + (unsigned)gCollectedKeyzer); }'),
     ('src/sprite_ai/vortex.c', r'(void SpriteWarioEnteringVortex\(void\)\n\{\n(?:.*\n)*?\s*TIMER_COUNT_DOWN\(gCurrentSprite\.work0\);)', r'\1\n            { hal_trace_val(7, (unsigned)gCurrentSprite.work0); }'),
@@ -728,8 +769,9 @@ def _ld_macro(m):
     if name not in LDSYMS or not ty: return m.group(0)
     addr = '0x%08X' % LDSYMS[name]
     if not dims: body = f'(*({ty} *){addr})'
-    elif len(dims) == 1: body = f'(({ty} *){addr})'
-    else: body = f'(({ty} (*){"".join(dims[1:])}){addr})'
+    # lvalue of the real array type (not an rvalue pointer): `&gArr` is then valid too (catbat.c, aerodent.c,
+    # boss_treasure_cutscene.c, stage_ejection.c take the address of such arrays and clang rejected those whole files)
+    else: body = f'(*({ty} (*){"".join(dims)}){addr})'
     LD_REWRITTEN[name] += 1
     return f'#undef {name}\n#define {name} {body}'
 
