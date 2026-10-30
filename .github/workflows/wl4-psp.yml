@@ -1,0 +1,1156 @@
+name: Build Wario Land 4 PSP port (EBOOT.PBP)
+
+# Repo layout expected: the pret-style decomp at the root (src/, include/, asm/, asset_database.yaml, ...)
+# with port/ and android/ from this port copied on top.
+#
+# ROM: the build needs YOUR OWN US ROM (md5 5fe47355a33e3fabec2a1607af88a404).  Either
+#   - commit baserom_us.gba to a PRIVATE repo, or
+#   - add the repo secret WL4_ROM_URL (a direct download link only you can reach).
+# `make extract` turns ROM data into C includes that get compiled into the EBOOT, so the artifact is
+# ROM-derived: this workflow refuses to run in a public repo unless you explicitly override that.
+
+on:
+  workflow_dispatch:
+    inputs:
+      psp_opt:
+        description: "gcc -O level for the PSP build of the giant wl4.c (-O1 compiles faster / uses less RAM)"
+        default: "-O2"
+      allow_public_repo:
+        description: "I understand the EBOOT embeds ROM-derived data and the artifact is downloadable from a public repo"
+        type: boolean
+        default: false
+      run_host_smoke_test:
+        description: "Run the game natively on the runner through the PSP memory map before building the EBOOT"
+        type: boolean
+        default: true
+      wabt_version:
+        description: "Override wabt version (leave blank to use the default below)"
+        default: ""
+      opt_level:
+        description: "Clang -O level for the wasm32 compile (0/1/2). Lower values use less RAM but produce larger .wasm."
+        default: "2"
+
+env:
+  WASI_SDK_VERSION: "24"
+  WABT_VERSION: "1.0.36"
+  ROM_MD5_US: "5fe47355a33e3fabec2a1607af88a404"
+  NDK_VERSION: "26.3.11579264"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Refuse public repos unless overridden
+        if: ${{ github.event.repository.private == false && inputs.allow_public_repo != true }}
+        run: |
+          echo "::error::This repo is public. The EBOOT embeds data extracted from your ROM; rerun with allow_public_repo=true only if you accept that."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PSP port files (embedded in this workflow)
+        run: |
+          mkdir -p port/psp port/hal port/tools
+          cat > port/hal/hal.h <<'WL4EOF'
+          /* GBA hardware abstraction layer for the Wario Land 4 native port.
+           *
+           * The decomp is compiled to wasm32 (so pointers/struct layouts match the GBA),
+           * converted to C with wasm2c, and run against one linear memory.  The GBA
+           * address space (EWRAM/IWRAM/IO/PAL/VRAM/OAM/ROM) lives at its *real* addresses
+           * inside that memory, so the game's hardware pokes (*(vu16*)0x4000000 ...)
+           * are ordinary loads/stores.  This HAL reads those regions to produce video
+           * and audio, and implements the BIOS calls. */
+          #ifndef WL4_HAL_H
+          #define WL4_HAL_H
+          #include <stdint.h>
+          #include <stddef.h>
+
+          #define GBA_W 240
+          #define GBA_H 160
+          #define GBA_ROM_BASE 0x08000000u
+          #define GBA_SRAM_BASE 0x0E000000u
+          #define GBA_SRAM_SIZE 0x10000u
+          #define GBA_MEM_MIN  0x0E010000u   /* linear memory must cover SRAM */
+
+          /* ---- core ---- */
+          void hal_init(uint8_t *mem, size_t memSize);          /* mem = wasm linear memory */
+          int  hal_load_rom(const uint8_t *rom, size_t size, uint32_t rom_image_addr);   /* ROM -> 0x08000000 and rom_image */
+          void hal_set_keys(uint16_t pressed);                  /* active-high: bit0=A ... bit9=L (KEYINPUT order) */
+          void hal_run_frame(void);                             /* finish the current frame */
+          void hal_step_line(void);                             /* advance one scanline */
+          uint16_t hal_poll_vcount(void);                       /* game busy-waits on REG_VCOUNT */                             /* 228 scanlines, fires IRQ callbacks */
+          uint8_t *hal_sram(void);                              /* 64KB battery save at 0x0E000000 */
+          const uint32_t *hal_framebuffer(void);                /* 240x160 XRGB8888 */
+
+          /* callbacks into the game (wired to the wasm2c exports by the glue) */
+          typedef struct {
+              void (*vblank)(void);
+              void (*hblank)(void);
+              void (*vcount)(void);
+              void (*frame_done)(void);                         /* host: present + pace + audio */
+          } HalCallbacks;
+          void hal_set_callbacks(const HalCallbacks *cb);
+
+          /* ---- memory helpers (little endian, bounds are the caller's job) ---- */
+          extern uint8_t *g_mem;
+          #ifdef WL4_MEMMAP
+          /* PSP / low-memory build: no flat 226 MB linear memory.  The GBA address space is a table of 16 MB "regions"
+           * (see memmap.c); every access is base[region] + (addr & mask).  The same translation is compiled into the
+           * wasm2c output (tools/patch_w2c_psp.py), so the game and the HAL see one consistent memory. */
+          #include "wl4_psp_mem.h"
+          extern uint8_t *g_io, *g_pal, *g_vram, *g_oam;          /* direct pointers for the PPU */
+          static inline uint8_t  rd8 (uint32_t a){ return *wl4_ptr(a); }
+          static inline uint16_t rd16(uint32_t a){ return *(const uint16_t *)wl4_ptr(a & ~1u); }
+          static inline uint32_t rd32(uint32_t a){ return *(const uint32_t *)wl4_ptr(a & ~3u); }
+          static inline void wr8 (uint32_t a, uint8_t v){ *wl4_ptr(a) = v; }
+          static inline void wr16(uint32_t a, uint16_t v){ *(uint16_t *)wl4_ptr(a & ~1u) = v; }
+          static inline void wr32(uint32_t a, uint32_t v){ *(uint32_t *)wl4_ptr(a & ~3u) = v; }
+          int  wl4_memmap_init(uint32_t data_size, uint32_t rom_image_off);   /* 0 = ok; see memmap.c */
+          extern volatile int g_hal_skip_render;                  /* host: skip PPU work for the next frame (frame skip) */
+          #else
+          static inline uint8_t  rd8 (uint32_t a){ return g_mem[a]; }
+          static inline uint16_t rd16(uint32_t a){ return (uint16_t)(g_mem[a] | g_mem[a+1] << 8); }
+          static inline uint32_t rd32(uint32_t a){ return rd16(a) | (uint32_t)rd16(a+2) << 16; }
+          static inline void wr8 (uint32_t a, uint8_t v){ g_mem[a]=v; }
+          static inline void wr16(uint32_t a, uint16_t v){ g_mem[a]=(uint8_t)v; g_mem[a+1]=(uint8_t)(v>>8); }
+          static inline void wr32(uint32_t a, uint32_t v){ wr16(a,(uint16_t)v); wr16(a+2,(uint16_t)(v>>16)); }
+          #endif
+
+          /* ---- IO register addresses ---- */
+          enum {
+              IO_DISPCNT=0x04000000, IO_DISPSTAT=0x04000004, IO_VCOUNT=0x04000006,
+              IO_BG0CNT=0x04000008, IO_BG0HOFS=0x04000010, IO_BG2PA=0x04000020, IO_BG2X=0x04000028,
+              IO_BG3PA=0x04000030, IO_BG3X=0x04000038,
+              IO_WIN0H=0x04000040, IO_WIN1H=0x04000042, IO_WIN0V=0x04000044, IO_WIN1V=0x04000046,
+              IO_WININ=0x04000048, IO_WINOUT=0x0400004A, IO_MOSAIC=0x0400004C,
+              IO_BLDCNT=0x04000050, IO_BLDALPHA=0x04000052, IO_BLDY=0x04000054,
+              IO_KEYINPUT=0x04000130, IO_IE=0x04000200, IO_IF=0x04000202, IO_IME=0x04000208,
+              PAL_BASE=0x05000000, VRAM_BASE=0x06000000, OAM_BASE=0x07000000
+          };
+
+          void hal_io_write(unsigned addr, unsigned size);      /* store hook for the IO page */
+
+          /* ---- PPU ---- */
+          void ppu_render_scanline(int y, uint32_t *dst240);
+
+          /* ---- DMA (called through the macro overrides in port/include/gba/macro.h) ---- */
+          void hal_dma_set(int ch, uint32_t src, uint32_t dst, uint32_t cnt_ctrl);   /* cnt | ctl<<16 */
+
+          /* ---- BIOS HLE (also exported to the wasm module as imports) ---- */
+          void     bios_CpuSet(uint32_t src, uint32_t dst, uint32_t ctl);
+          void     bios_CpuFastSet(uint32_t src, uint32_t dst, uint32_t ctl);
+          void     bios_LZ77UnComp(uint32_t src, uint32_t dst);
+          void     bios_RLUnComp(uint32_t src, uint32_t dst);
+          int32_t  bios_Div(int32_t num, int32_t den, int32_t *mod, uint32_t *absResult);
+          uint16_t bios_Sqrt(uint32_t v);
+          uint16_t bios_ArcTan(int16_t t);
+          uint16_t bios_ArcTan2(int16_t x, int16_t y);
+          void     bios_ObjAffineSet(uint32_t src, uint32_t dst, int32_t count, int32_t stride);
+          void     bios_BgAffineSet(uint32_t src, uint32_t dst, int32_t count);
+          #endif
+          WL4EOF
+          cat > port/hal/hal.c <<'WL4EOF'
+          #include "hal.h"
+          #include <string.h>
+
+          uint8_t *g_mem;
+          static size_t g_memSize;
+          static uint16_t g_keys;
+          static uint32_t g_fb[GBA_W * GBA_H];
+          static HalCallbacks g_cb;
+          volatile int g_hal_stage, g_hal_line;      /* watchdog breadcrumbs: where the host thread is inside hal_step_line */
+          volatile unsigned g_hal_irq_calls[3];     /* vblank / hblank / vcount callbacks entered */
+          void ppu_frame_start(void);
+          void hal_step_line(void);
+          static void dma_timed(int timing);
+
+          #ifdef WL4_MEMMAP
+          volatile int g_hal_skip_render;
+          void hal_init(uint8_t *mem, size_t size) { (void)mem; (void)size; g_keys = 0; memset(g_fb, 0, sizeof g_fb); memset(g_rg[0xE].base, 0xFF, GBA_SRAM_SIZE); wr16(IO_KEYINPUT, 0x03FF); }
+          int hal_load_rom(const uint8_t *rom, size_t size, uint32_t rom_image_addr) {
+              (void)rom_image_addr; if (size > 0x800000) return -1; memcpy(g_rg[8].base, rom, size); return 0;
+          }
+          #else
+          void hal_init(uint8_t *mem, size_t size) { g_mem = mem; g_memSize = size; g_keys = 0; memset(g_fb, 0, sizeof g_fb); if (size >= GBA_MEM_MIN) memset(mem + GBA_SRAM_BASE, 0xFF, GBA_SRAM_SIZE); wr16(IO_KEYINPUT, 0x03FF); }
+          int hal_load_rom(const uint8_t *rom, size_t size, uint32_t rom_image_addr) {
+              if (size > 0x02000000 || GBA_ROM_BASE + size > g_memSize || rom_image_addr + size > g_memSize) return -1;
+              memcpy(g_mem + GBA_ROM_BASE, rom, size);
+              memcpy(g_mem + rom_image_addr, rom, size);
+              return 0;
+          }
+          #endif
+          void hal_set_keys(uint16_t pressed) { g_keys = pressed & 0x03FF; }
+          void hal_set_callbacks(const HalCallbacks *cb) { g_cb = *cb; }
+          const uint32_t *hal_framebuffer(void) { return g_fb; }
+
+          static void raise_irq(uint16_t flag, void (*cb)(void)) {
+              uint16_t ie = rd16(IO_IE);
+              if (!(ie & flag) || !(rd16(IO_IME) & 1)) return;
+              wr16(IO_IF, rd16(IO_IF) | flag);                      /* game's handler clears it in crt0's irq_handler path */
+              g_hal_irq_calls[flag == 1 ? 0 : flag == 2 ? 1 : 2]++; g_hal_stage = 10 + (int)flag;
+              if (cb) cb();
+              g_hal_stage = 20 + (int)flag;
+              wr16(IO_IF, rd16(IO_IF) & ~flag);
+          }
+
+          /* Time advances one scanline at a time: either because the game halts (hal_run_frame
+           * finishes the frame) or because it busy-waits on VCOUNT (hal_poll_vcount). */
+          static int g_line;
+          void hal_step_line(void) {
+              int line = g_line;
+              g_hal_line = line; g_hal_stage = 1;
+              if (line == 0) { ppu_frame_start(); wr16(IO_KEYINPUT, (uint16_t)(~g_keys & 0x03FF)); }
+              uint16_t st = rd16(IO_DISPSTAT);
+              wr16(IO_VCOUNT, (uint16_t)line);
+              int vcmatch = ((st >> 8) == line);
+              wr16(IO_DISPSTAT, (uint16_t)((st & ~7) | (line >= 160 && line < 227 ? 1 : 0) | (vcmatch ? 4 : 0)));
+              if (vcmatch && (st & 0x20)) raise_irq(0x0004, g_cb.vcount);
+              if (line < GBA_H) {
+                  g_hal_stage = 2;
+          #ifdef WL4_MEMMAP
+                  if (!g_hal_skip_render)
+          #endif
+                  ppu_render_scanline(line, g_fb + line * GBA_W);
+                  g_hal_stage = 3; dma_timed(2);
+                  wr16(IO_DISPSTAT, rd16(IO_DISPSTAT) | 2);
+                  if (st & 0x10) raise_irq(0x0002, g_cb.hblank);
+                  wr16(IO_DISPSTAT, rd16(IO_DISPSTAT) & ~2);
+              } else if (line == GBA_H) { g_hal_stage = 4; dma_timed(1); g_hal_stage = 5; if (st & 0x08) raise_irq(0x0001, g_cb.vblank); }
+              g_hal_stage = 6;
+              g_line = line + 1;
+              if (g_line == 228) { g_line = 0; g_hal_stage = 7; if (g_cb.frame_done) g_cb.frame_done(); }
+              g_hal_stage = 8;
+          }
+          void hal_run_frame(void) { do hal_step_line(); while (g_line != 0); }
+          uint16_t hal_poll_vcount(void) { hal_step_line(); return (uint16_t)g_line; }
+
+          /* ---- DMA ------------------------------------------------------------------
+           * The decomp funnels DMA through DmaSet(); port/include/gba/macro.h turns that
+           * into a call to hal_dma_set().  Immediate transfers run now; VBlank/HBlank
+           * timed ones are latched and replayed from hal_run_frame(). */
+          typedef struct { uint32_t src, dst, cnt; uint16_t ctl; int active; } DmaCh;
+          static DmaCh dma[4];
+
+          static void dma_xfer(DmaCh *c, uint32_t units) {
+              int w32 = (c->ctl >> 10) & 1, dc = (c->ctl >> 5) & 3, sc = (c->ctl >> 7) & 3, step = w32 ? 4 : 2;
+              for (uint32_t i = 0; i < units; i++) {
+                  if (w32) wr32(c->dst, rd32(c->src)); else wr16(c->dst, rd16(c->src));
+                  c->src += sc == 0 ? step : sc == 1 ? -step : 0;
+                  c->dst += (dc == 0 || dc == 3) ? step : dc == 1 ? -step : 0;
+              }
+          }
+          static uint32_t dma_units(int ch, uint32_t cnt) { cnt &= (ch == 3) ? 0xFFFF : 0x3FFF; return cnt ? cnt : (ch == 3 ? 0x10000 : 0x4000); }
+
+          void hal_dma_set(int ch, uint32_t src, uint32_t dst, uint32_t cntctl) {
+              DmaCh *c = &dma[ch]; c->src = src; c->dst = dst; c->cnt = cntctl & 0xFFFF; c->ctl = (uint16_t)(cntctl >> 16);
+              if (!(c->ctl & 0x8000)) { c->active = 0; return; }
+              int timing = (c->ctl >> 12) & 3;
+              if (timing == 0) {
+                  dma_xfer(c, dma_units(ch, c->cnt)); c->ctl &= ~0x8000; c->active = 0;
+                  wr16(0x040000B0 + 12 * ch + 10, c->ctl);          /* busy-wait loops see the enable bit drop */
+              }
+              else if (timing == 3) c->active = 0;                 /* sound FIFO DMA: handled by the audio core */
+              else c->active = timing;                             /* 1 = VBlank, 2 = HBlank */
+          }
+          static void dma_timed(int timing) {
+              for (int i = 0; i < 4; i++) {
+                  DmaCh *c = &dma[i]; if (c->active != timing) continue;
+                  uint32_t savedDst = c->dst;
+                  dma_xfer(c, timing == 2 ? (c->cnt ? c->cnt : 1) : dma_units(i, c->cnt));
+                  if (timing == 2 && ((c->ctl >> 5) & 3) == 3) c->dst = savedDst;
+                  if (!((c->ctl >> 9) & 1)) { c->active = 0; c->ctl &= ~0x8000; }
+                  else if (((c->ctl >> 5) & 3) == 3 && timing == 1) c->dst = savedDst;
+              }
+          }
+
+          #ifdef WL4_MEMMAP
+          uint8_t *hal_sram(void) { return g_rg[0xE].base; }
+          #else
+          uint8_t *hal_sram(void) { return g_mem + GBA_SRAM_BASE; }
+          #endif
+
+          /* Called by the wasm2c store helper for every store into 0x04000000..0x040003FF. */
+          void hal_io_write(unsigned addr, unsigned size) {
+              if (addr >= 0x040000B0 && addr < 0x040000E0) {
+                  unsigned off = (addr - 0x040000B0) % 12, ch = (addr - 0x040000B0) / 12, base = 0x040000B0 + ch * 12;
+                  if (off + size > 10) hal_dma_set((int)ch, rd32(base), rd32(base + 4), rd32(base + 8));
+              }
+          }
+          WL4EOF
+          cat > port/hal/ppu.c <<'WL4EOF'
+          /* Scanline software PPU: modes 0-5, text/affine BG, regular+affine OBJ,
+           * WIN0/WIN1/OBJWIN, alpha + brightness blending.  (Mosaic: TODO.) */
+          #include "hal.h"
+          #include <string.h>
+
+          #define TRANSP 0xFFFFFFFFu
+          static uint32_t affRefX[2], affRefY[2];          /* BG2/BG3 internal reference points */
+
+          void ppu_frame_start(void) {
+              affRefX[0] = rd32(IO_BG2X) & 0x0FFFFFFF;  affRefY[0] = rd32(IO_BG2X + 4) & 0x0FFFFFFF;
+              affRefX[1] = rd32(IO_BG3X) & 0x0FFFFFFF;  affRefY[1] = rd32(IO_BG3X + 4) & 0x0FFFFFFF;
+              for (int i = 0; i < 2; i++) { if (affRefX[i] & 0x08000000) affRefX[i] |= 0xF0000000; if (affRefY[i] & 0x08000000) affRefY[i] |= 0xF0000000; }
+          }
+          #ifdef WL4_MEMMAP
+          static inline uint32_t pal(uint32_t idx) { return ((const uint16_t *)g_pal)[idx] & 0x7FFF; }
+          #define OAM16(a)  (*(const uint16_t *)(g_oam + ((a) - OAM_BASE)))
+          #define VRAM8(a)  (g_vram[(a) - VRAM_BASE])
+          #else
+          static uint32_t pal(uint32_t idx) { return rd16(PAL_BASE + idx * 2) & 0x7FFF; }
+          #define OAM16(a)  rd16(a)
+          #define VRAM8(a)  rd8(a)
+          #endif
+
+          #ifdef WL4_MEMMAP
+          /* tile-at-a-time version of bg_text (same output) */
+          static void bg_text(int n, int y, uint32_t *out) {
+              const uint16_t cnt = rd16(IO_BG0CNT + n * 2);
+              const uint32_t cbase = ((cnt >> 2) & 3) * 0x4000, sbase = ((cnt >> 8) & 0x1F) * 0x800;
+              const int bpp8 = (cnt >> 7) & 1, size = cnt >> 14;
+              const int hofs = rd16(IO_BG0HOFS + n * 4) & 0x1FF, vofs = rd16(IO_BG0HOFS + n * 4 + 2) & 0x1FF;
+              const int wmask = (size & 1) ? 511 : 255, hmask = (size & 2) ? 511 : 255;
+              const int py = (y + vofs) & hmask, ty = py >> 3, iyb = py & 7;
+              const uint16_t *palp = (const uint16_t *)g_pal;
+              int x = 0, px = hofs & wmask;
+              while (x < GBA_W) {
+                  const int tx = px >> 3, ix0 = px & 7;
+                  const int sb = (size == 1) ? (tx >> 5) : (size == 2) ? (ty >> 5) : (size == 3) ? ((tx >> 5) + ((ty >> 5) << 1)) : 0;
+                  const uint16_t e = *(const uint16_t *)(g_vram + sbase + sb * 0x800 + (((ty & 31) << 5) + (tx & 31)) * 2);
+                  const int iy = (e & 0x800) ? 7 - iyb : iyb, hflip = e & 0x400;
+                  const uint32_t tile = e & 0x3FF;
+                  int run = 8 - ix0; if (x + run > GBA_W) run = GBA_W - x;
+                  if (bpp8) {
+                      const uint32_t a = cbase + tile * 64 + iy * 8;
+                      if (a >= 0x10000) { for (int k = 0; k < run; k++) out[x + k] = TRANSP; }
+                      else for (int k = 0; k < run; k++) { int ix = ix0 + k; if (hflip) ix = 7 - ix; uint32_t c = g_vram[a + ix]; out[x + k] = c ? (palp[c] & 0x7FFF) : TRANSP; }
+                  } else {
+                      const uint32_t a = cbase + tile * 32 + iy * 4;
+                      if (a >= 0x10000) { for (int k = 0; k < run; k++) out[x + k] = TRANSP; }
+                      else {
+                          const uint32_t w = *(const uint32_t *)(g_vram + a), pb = (uint32_t)(e >> 12) * 16;
+                          for (int k = 0; k < run; k++) { int ix = ix0 + k; if (hflip) ix = 7 - ix; uint32_t c = (w >> (ix * 4)) & 15; out[x + k] = c ? (palp[pb + c] & 0x7FFF) : TRANSP; }
+                      }
+                  }
+                  x += run; px = (px + run) & wmask;
+              }
+          }
+          #else
+          static void bg_text(int n, int y, uint32_t *out) {
+              uint16_t cnt = rd16(IO_BG0CNT + n * 2);
+              uint32_t cbase = VRAM_BASE + ((cnt >> 2) & 3) * 0x4000, sbase = VRAM_BASE + ((cnt >> 8) & 0x1F) * 0x800;
+              int bpp8 = (cnt >> 7) & 1, size = cnt >> 14;
+              int hofs = rd16(IO_BG0HOFS + n * 4) & 0x1FF, vofs = rd16(IO_BG0HOFS + n * 4 + 2) & 0x1FF;
+              int wmask = (size & 1) ? 511 : 255, hmask = (size & 2) ? 511 : 255;
+              int py = (y + vofs) & hmask;
+              for (int x = 0; x < GBA_W; x++) {
+                  int px = (x + hofs) & wmask, tx = px >> 3, ty = py >> 3;
+                  int sb = (size == 1) ? (tx >> 5) : (size == 2) ? (ty >> 5) : (size == 3) ? ((tx >> 5) + ((ty >> 5) << 1)) : 0;
+                  uint16_t e = rd16(sbase + sb * 0x800 + (((ty & 31) << 5) + (tx & 31)) * 2);
+                  int ix = px & 7, iy = py & 7; if (e & 0x400) ix = 7 - ix; if (e & 0x800) iy = 7 - iy;
+                  uint32_t tile = e & 0x3FF, c;
+                  if (bpp8) { uint32_t a = cbase + tile * 64 + iy * 8 + ix; if (a >= VRAM_BASE + 0x10000) { out[x] = TRANSP; continue; } c = rd8(a); out[x] = c ? pal(c) : TRANSP; }
+                  else { uint32_t a = cbase + tile * 32 + iy * 4 + (ix >> 1); if (a >= VRAM_BASE + 0x10000) { out[x] = TRANSP; continue; } c = (rd8(a) >> ((ix & 1) * 4)) & 15; out[x] = c ? pal((e >> 12) * 16 + c) : TRANSP; }
+              }
+          }
+          #endif
+          static void bg_affine(int n, int mode_slot, uint32_t *out) {      /* n = 2 or 3; mode_slot 0/1 */
+              uint16_t cnt = rd16(IO_BG0CNT + n * 2);
+              uint32_t cbase = VRAM_BASE + ((cnt >> 2) & 3) * 0x4000, sbase = VRAM_BASE + ((cnt >> 8) & 0x1F) * 0x800;
+              int dim = 128 << (cnt >> 14), wrap = (cnt >> 13) & 1;
+              uint32_t reg = n == 2 ? IO_BG2PA : IO_BG3PA;
+              int32_t pa = (int16_t)rd16(reg), pb = (int16_t)rd16(reg + 2), pc = (int16_t)rd16(reg + 4), pd = (int16_t)rd16(reg + 6);
+              int32_t X = (int32_t)affRefX[mode_slot], Y = (int32_t)affRefY[mode_slot];
+              for (int x = 0; x < GBA_W; x++, X += pa, Y += pc) {
+                  int32_t u = X >> 8, v = Y >> 8;
+                  if (wrap) { u &= dim - 1; v &= dim - 1; } else if (u < 0 || v < 0 || u >= dim || v >= dim) { out[x] = TRANSP; continue; }
+                  uint8_t t = rd8(sbase + (v >> 3) * (dim >> 3) + (u >> 3));
+                  uint8_t c = rd8(cbase + t * 64 + (v & 7) * 8 + (u & 7));
+                  out[x] = c ? pal(c) : TRANSP;
+              }
+              affRefX[mode_slot] += pb; affRefY[mode_slot] += pd;
+          }
+          static void bg_bitmap(int mode, int disp, int y, uint32_t *out) {
+              uint32_t page = (disp & 0x10) ? 0xA000 : 0;
+              int32_t pa = (int16_t)rd16(IO_BG2PA), pb = (int16_t)rd16(IO_BG2PA + 2), pc = (int16_t)rd16(IO_BG2PA + 4), pd = (int16_t)rd16(IO_BG2PA + 6);
+              int32_t X = (int32_t)affRefX[0], Y = (int32_t)affRefY[0];
+              int w = mode == 5 ? 160 : 240, h = mode == 5 ? 128 : 160;
+              for (int x = 0; x < GBA_W; x++, X += pa, Y += pc) {
+                  int32_t u = X >> 8, v = Y >> 8;
+                  if (u < 0 || v < 0 || u >= w || v >= h) { out[x] = TRANSP; continue; }
+                  if (mode == 4) { uint8_t c = rd8(VRAM_BASE + page + v * 240 + u); out[x] = c ? pal(c) : TRANSP; }
+                  else out[x] = rd16(VRAM_BASE + (mode == 5 ? page : 0) + (v * w + u) * 2) & 0x7FFF;
+              }
+              affRefX[0] += pb; affRefY[0] += pd; (void)y;
+          }
+
+          static const uint8_t OBJW[3][4] = {{8,16,32,64},{16,32,32,64},{8,8,16,32}};
+          static const uint8_t OBJH[3][4] = {{8,16,32,64},{8,8,16,32},{16,32,32,64}};
+
+          /* obj line: color | prio<<16 | flags (bit24 semi-transparent) ; objwin mask separately */
+          static int g_anySemi;
+          static void obj_line(int y, int disp, uint32_t *col, uint8_t *prio, uint8_t *semi, uint8_t *objwin) {
+              for (int x = 0; x < GBA_W; x++) { col[x] = TRANSP; prio[x] = 4; semi[x] = 0; objwin[x] = 0; }
+              int oneD = (disp >> 6) & 1; uint32_t tbase = VRAM_BASE + 0x10000; int bitmapMode = (disp & 7) >= 3;
+              for (int i = 0; i < 128; i++) {
+                  uint32_t o = OAM_BASE + i * 8; uint16_t a0 = OAM16(o), a1 = OAM16(o + 2), a2 = OAM16(o + 4);
+                  int affine = (a0 >> 8) & 1, dbl = affine && ((a0 >> 9) & 1);
+                  if (!affine && ((a0 >> 9) & 1)) continue;
+                  int mode = (a0 >> 10) & 3; if (mode == 3) continue;
+                  int shape = a0 >> 14, sz = a1 >> 14; if (shape == 3) continue;
+                  int w = OBJW[shape][sz], h = OBJH[shape][sz], bw = dbl ? w * 2 : w, bh = dbl ? h * 2 : h;
+                  int oy = a0 & 0xFF, ox = a1 & 0x1FF; if (ox >= 256) ox -= 512;
+                  int ly = (y - oy) & 0xFF; if (ly >= bh) continue;
+                  int bpp8 = (a0 >> 13) & 1, tile = a2 & 0x3FF, p = (a2 >> 10) & 3, pb4 = a2 >> 12;
+                  if (bitmapMode && tile < 512) continue;
+                  int32_t pa = 0x100, pbb = 0, pc = 0, pd = 0x100;
+                  if (affine) { uint32_t g = OAM_BASE + ((a1 >> 9) & 31) * 32; pa = (int16_t)OAM16(g + 6); pbb = (int16_t)OAM16(g + 14); pc = (int16_t)OAM16(g + 22); pd = (int16_t)OAM16(g + 30); }
+                  for (int sx = 0; sx < bw; sx++) {
+                      int x = ox + sx; if (x < 0 || x >= GBA_W) continue;
+                      int tx, ty;
+                      if (affine) { int dx = sx - bw / 2, dy = ly - bh / 2; tx = ((pa * dx + pbb * dy) >> 8) + w / 2; ty = ((pc * dx + pd * dy) >> 8) + h / 2; if (tx < 0 || ty < 0 || tx >= w || ty >= h) continue; }
+                      else { tx = (a1 & 0x1000) ? w - 1 - sx : sx; ty = (a1 & 0x2000) ? h - 1 - ly : ly; }
+                      int tw = w >> 3, step = bpp8 ? 2 : 1;
+                      uint32_t tn = oneD ? tile + ((ty >> 3) * tw + (tx >> 3)) * step : tile + (ty >> 3) * 32 + (tx >> 3) * step;
+                      uint32_t addr = tbase + (tn & 0x3FF) * 32, c;
+                      if (bpp8) c = VRAM8(addr + (ty & 7) * 8 + (tx & 7));
+                      else c = (VRAM8(addr + (ty & 7) * 4 + ((tx & 7) >> 1)) >> (((tx & 7) & 1) * 4)) & 15;
+                      if (!c) continue;
+                      if (mode == 2) { objwin[x] = 1; continue; }
+                      if (p >= prio[x]) continue;               /* earlier OAM entry wins ties */
+                      col[x] = pal(256 + (bpp8 ? c : pb4 * 16 + c)); prio[x] = (uint8_t)p; semi[x] = (mode == 1); if (mode == 1) g_anySemi = 1;
+                  }
+              }
+          }
+
+          static inline uint32_t blend(uint32_t a, uint32_t b, int eva, int evb) {
+              int r = ((a & 31) * eva + (b & 31) * evb) >> 4, g = (((a >> 5) & 31) * eva + ((b >> 5) & 31) * evb) >> 4, bl = (((a >> 10) & 31) * eva + ((b >> 10) & 31) * evb) >> 4;
+              if (r > 31) r = 31; if (g > 31) g = 31; if (bl > 31) bl = 31; return r | g << 5 | bl << 10;
+          }
+          static inline uint32_t bright(uint32_t c, int evy, int up) {
+              int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
+              if (up) { r += ((31 - r) * evy) >> 4; g += ((31 - g) * evy) >> 4; b += ((31 - b) * evy) >> 4; }
+              else    { r -= (r * evy) >> 4; g -= (g * evy) >> 4; b -= (b * evy) >> 4; }
+              return r | g << 5 | b << 10;
+          }
+          static inline uint32_t to_xrgb(uint32_t c) {
+              uint32_t r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
+              return 0xFF000000u | ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
+          }
+
+          void ppu_render_scanline(int y, uint32_t *dst) {
+              uint16_t disp = rd16(IO_DISPCNT); int mode = disp & 7;
+              if (disp & 0x80) { for (int x = 0; x < GBA_W; x++) dst[x] = 0xFFFFFFFFu; return; }
+              static uint32_t bg[4][GBA_W], oc[GBA_W]; static uint8_t op[GBA_W], os[GBA_W], ow[GBA_W];
+              int bgOn[4] = {0,0,0,0};
+              for (int n = 0; n < 4; n++) bgOn[n] = (disp >> (8 + n)) & 1;
+              switch (mode) {
+              case 0: for (int n = 0; n < 4; n++) if (bgOn[n]) bg_text(n, y, bg[n]); break;
+              case 1: if (bgOn[0]) bg_text(0, y, bg[0]); if (bgOn[1]) bg_text(1, y, bg[1]); if (bgOn[2]) bg_affine(2, 0, bg[2]); bgOn[3] = 0; break;
+              case 2: if (bgOn[2]) bg_affine(2, 0, bg[2]); if (bgOn[3]) bg_affine(3, 1, bg[3]); bgOn[0] = bgOn[1] = 0; break;
+              case 3: case 4: case 5: bgOn[0] = bgOn[1] = bgOn[3] = 0; if (bgOn[2]) bg_bitmap(mode, disp, y, bg[2]); break;
+              default: bgOn[0]=bgOn[1]=bgOn[2]=bgOn[3]=0; }
+              int objOn = (disp >> 12) & 1; g_anySemi = 0;
+              if (objOn) obj_line(y, disp, oc, op, os, ow); else for (int x = 0; x < GBA_W; x++) { oc[x] = TRANSP; op[x] = 4; os[x] = 0; ow[x] = 0; }
+
+              int w0 = (disp >> 13) & 1, w1 = (disp >> 14) & 1, wo = (disp >> 15) & 1, anyWin = w0 | w1 | wo;
+              uint16_t winin = rd16(IO_WININ), winout = rd16(IO_WINOUT);
+              int x0a = rd16(IO_WIN0H) >> 8, x0b = rd16(IO_WIN0H) & 0xFF, y0a = rd16(IO_WIN0V) >> 8, y0b = rd16(IO_WIN0V) & 0xFF;
+              int x1a = rd16(IO_WIN1H) >> 8, x1b = rd16(IO_WIN1H) & 0xFF, y1a = rd16(IO_WIN1V) >> 8, y1b = rd16(IO_WIN1V) & 0xFF;
+              if (x0b > 240 || x0b < x0a) x0b = 240; if (x1b > 240 || x1b < x1a) x1b = 240;
+              int in0 = w0 && y >= y0a && y < (y0b > 160 || y0b < y0a ? 160 : y0b), in1 = w1 && y >= y1a && y < (y1b > 160 || y1b < y1a ? 160 : y1b);
+
+              uint16_t bld = rd16(IO_BLDCNT), alpha = rd16(IO_BLDALPHA); int bmode = (bld >> 6) & 3;
+              int eva = alpha & 0x1F, evb = (alpha >> 8) & 0x1F, evy = rd16(IO_BLDY) & 0x1F; if (eva > 16) eva = 16; if (evb > 16) evb = 16; if (evy > 16) evy = 16;
+              uint16_t bgcnt[4]; for (int n = 0; n < 4; n++) bgcnt[n] = rd16(IO_BG0CNT + n * 2);
+              uint32_t backdrop = pal(0);
+
+          #ifdef WL4_MEMMAP
+              if (!anyWin && bmode == 0 && !g_anySemi) {              /* common case: plain priority composite */
+                  int blk[4], blp[4], nbl = 0;
+                  for (int p = 0; p < 4; p++) for (int n = 0; n < 4; n++) if (bgOn[n] && (bgcnt[n] & 3) == p) { blk[nbl] = n; blp[nbl] = p; nbl++; }
+                  for (int x = 0; x < GBA_W; x++) {
+                      uint32_t o = oc[x], c = backdrop; int po = (o != TRANSP) ? op[x] : 9, hit = 0;
+                      for (int i = 0; i < nbl; i++) {
+                          if (po <= blp[i]) { c = o; hit = 1; break; }
+                          uint32_t v = bg[blk[i]][x]; if (v != TRANSP) { c = v; hit = 1; break; }
+                      }
+                      if (!hit && po != 9) c = o;
+                      dst[x] = to_xrgb(c);
+                  }
+                  return;
+              }
+          #endif
+              for (int x = 0; x < GBA_W; x++) {
+                  int en = 0x3F;                                        /* bits0-3 BG, 4 OBJ, 5 effects */
+                  if (anyWin) {
+                      if (in0 && x >= x0a && x < x0b) en = winin & 0x3F;
+                      else if (in1 && x >= x1a && x < x1b) en = (winin >> 8) & 0x3F;
+                      else if (wo && ow[x]) en = (winout >> 8) & 0x3F;
+                      else en = winout & 0x3F;
+                  }
+                  uint32_t c1 = backdrop, c2 = backdrop; int l1 = 5, l2 = 5, got = 0, semi = 0;   /* layer 0-3 BG, 4 OBJ, 5 backdrop */
+                  for (int p = 0; p < 4 && got < 2; p++) {
+                      if ((en & 0x10) && oc[x] != TRANSP && op[x] == p) { if (!got) { c1 = oc[x]; l1 = 4; semi = os[x]; } else { c2 = oc[x]; l2 = 4; } got++; if (got == 2) break; }
+                      for (int n = 0; n < 4 && got < 2; n++)
+                          if (bgOn[n] && (en >> n & 1) && (bgcnt[n] & 3) == p && bg[n][x] != TRANSP) { if (!got) { c1 = bg[n][x]; l1 = n; } else { c2 = bg[n][x]; l2 = n; } got++; }
+                  }
+                  uint32_t out = c1;
+                  int first = (bld >> l1) & 1, second = (bld >> (8 + l2)) & 1;
+                  if (l1 == 4 && semi && second) out = blend(c1, c2, eva, evb);                         /* semi-transparent OBJ */
+                  else if ((en & 0x20) && first) {
+                      if (bmode == 1 && second) out = blend(c1, c2, eva, evb);
+                      else if (bmode == 2) out = bright(c1, evy, 1);
+                      else if (bmode == 3) out = bright(c1, evy, 0);
+                  }
+                  dst[x] = to_xrgb(out);
+              }
+          }
+          WL4EOF
+          cat > port/hal/memmap.c <<'WL4EOF'
+          /* Region-table memory for the low-RAM (PSP) build.  See hal.h / wl4_psp_mem.h. */
+          #ifdef WL4_MEMMAP
+          #include "hal.h"
+          #include <stdlib.h>
+          #include <string.h>
+
+          Wl4Region g_rg[16];
+          uint8_t *g_io, *g_pal, *g_vram, *g_oam;
+
+          static uint8_t *alloc_z(size_t n) {                       /* zeroed, 64-byte aligned */
+              uint8_t *p = (uint8_t *)calloc(1, n + 64);
+              return p ? (uint8_t *)(((uintptr_t)p + 63) & ~(uintptr_t)63) : NULL;
+          }
+          static void set(int i, uint8_t *b, uint32_t m) { g_rg[i].base = b; g_rg[i].mask = m; }
+
+          /* data_size: bytes of wasm static memory starting at 0x0A000000 (data + bss + stack)
+           * rom_image_off: offset of `rom_image` inside it.  The ROM region 0x08000000 is an alias of rom_image, so the ROM
+           * is stored exactly once (8 MB) instead of twice. */
+          int wl4_memmap_init(uint32_t data_size, uint32_t rom_image_off) {
+              uint8_t *dummy = alloc_z(0x10000), *ew = alloc_z(0x40000), *iw = alloc_z(0x8000), *io = alloc_z(0x1000),
+                      *pal = alloc_z(0x1000), *vram = alloc_z(0x20000), *oam = alloc_z(0x1000), *sram = alloc_z(0x10000),
+                      *d = alloc_z(data_size);
+              if (!dummy || !ew || !iw || !io || !pal || !vram || !oam || !sram || !d) return -1;
+              for (int i = 0; i < 16; i++) set(i, dummy, 0xFFFF);   /* BIOS, unmapped: reads 0, writes harmless */
+              set(0x2, ew, 0x3FFFF); set(0x3, iw, 0x7FFF); set(0x4, io, 0x3FF); set(0x5, pal, 0x3FF);
+              set(0x6, vram, 0x1FFFF); set(0x7, oam, 0x3FF);
+              set(0x8, d + rom_image_off, 0x7FFFFF); set(0x9, d + rom_image_off, 0x7FFFFF);
+              set(0xA, d, 0xFFFFFF);
+              set(0xE, sram, 0xFFFF);
+              g_io = io; g_pal = pal; g_vram = vram; g_oam = oam;
+              return 0;
+          }
+          #endif
+          WL4EOF
+          cat > port/hal/wl4_psp_mem.h <<'WL4EOF'
+          /* Region table shared by the HAL and the (patched) wasm2c output.  Keep this header dependency-free:
+           * it is #included from the huge generated wl4.c. */
+          #ifndef WL4_PSP_MEM_H
+          #define WL4_PSP_MEM_H
+          #include <stdint.h>
+          typedef struct { uint8_t *base; uint32_t mask; } Wl4Region;
+          extern Wl4Region g_rg[16];                                /* indexed by addr >> 24 */
+          static inline uint8_t *wl4_ptr(uint32_t a) { const Wl4Region *r = &g_rg[(a >> 24) & 15]; return r->base + (a & r->mask); }
+          #endif
+          WL4EOF
+          cat > port/tools/patch_w2c_psp.py <<'WL4EOF'
+          #!/usr/bin/env python3
+          """Retarget the wasm2c output (wl4.c) from one flat 226 MB linear memory to the region table (hal/wl4_psp_mem.h).
+
+           - MEM_ADDR / MEMCHECK / RANGE_CHECK are redefined: every load/store/data-segment write goes through wl4_ptr().
+           - the (huge) memory allocation is shrunk to 1 page; the size fields keep their original values.
+          Run AFTER patch_w2c_io/trace/div.   usage: patch_w2c_psp.py wl4.c"""
+          import re, sys
+          path = sys.argv[1]; src = open(path).read()
+          if 'WL4_PSP_MEMMAP' in src: print('patch_w2c_psp: already patched'); sys.exit(0)
+          lines = src.splitlines(keepends=True)
+          NAMES = ('MEM_ADDR', 'MEM_ADDR_MEMOP', 'MEMCHECK', 'RANGE_CHECK', 'MEMCHECK_DEFAULT32', 'MEMCHECK_DEFAULT64')
+          depth = 0; last_end = -1; i = 0; depth_at = []
+          while i < len(lines):
+              depth_at.append(depth); ln = lines[i]; st = ln.lstrip()
+              if st.startswith('#'):
+                  d = st[1:].lstrip()
+                  if d.startswith(('if', 'ifdef', 'ifndef')): depth += 1
+                  elif d.startswith('endif'): depth -= 1
+                  m = re.match(r'define\s+(\w+)', d)
+                  if m and m.group(1) in NAMES:
+                      j = i
+                      while lines[j].rstrip().endswith('\\'): j += 1; depth_at.append(depth)
+                      last_end = j; i = j
+              i += 1
+          if last_end < 0: sys.exit('patch_w2c_psp: no MEM_ADDR/MEMCHECK macro definitions found (unsupported wabt version)')
+          k = last_end + 1
+          while k < len(lines) and (depth_at[k] != 0 or lines[k].lstrip().startswith('#') and not lines[k].lstrip().startswith(('#define', '#include', '#undef'))): k += 1
+          block = '''/* ---- WL4_PSP_MEMMAP: addresses go through the region table instead of one flat memory ---- */
+          #include "wl4_psp_mem.h"
+          #undef MEM_ADDR
+          #define MEM_ADDR(mem, addr, n) wl4_ptr((uint32_t)(addr))
+          ''' + ('#undef MEM_ADDR_MEMOP\n#define MEM_ADDR_MEMOP(mem, addr, n) wl4_ptr((uint32_t)(addr))\n' if 'MEM_ADDR_MEMOP' in src else '') + '''#undef MEMCHECK
+          #define MEMCHECK(mem, a, t) ((void)0)
+          #undef RANGE_CHECK
+          #define RANGE_CHECK(mem, offset, len) ((void)0)
+          '''
+          lines.insert(k, block); out = ''.join(lines)
+          pat = re.compile(r'wasm_rt_allocate_memory\(\s*([^,]+?)\s*,\s*(\d+)u?\s*,\s*(\d+)u?\s*,\s*(\w+)\s*\)\s*;')
+          def rep(m):
+              mem, pg, mx, is64 = m.groups()
+              return ('wasm_rt_allocate_memory(%s, 1, 1, %s); (%s)->pages = %s; (%s)->max_pages = %s; (%s)->size = %su * 65536u;'
+                      % (mem, is64, mem, pg, mem, mx, mem, pg))
+          out, n = pat.subn(rep, out)
+          if n != 1: sys.exit('patch_w2c_psp: expected exactly one wasm_rt_allocate_memory call, found %d' % n)
+          left = [l.strip() for l in out.splitlines() if re.search(r'(->|\.)data\b', l) and 'MEM_ADDR' not in l and not l.lstrip().startswith(('#', '//', '*', '/*'))]
+          print('patch_w2c_psp: ok (insert at line %d); remaining direct ->data uses: %d' % (k, len(left)))
+          for l in left[:10]: print('   WARNING:', l[:160])
+          open(path, 'w').write(out)
+          WL4EOF
+          cat > port/tools/gen_psp_layout.py <<'WL4EOF'
+          #!/usr/bin/env python3
+          """Read the static layout out of wl4.wasm (needs wasm-objdump from wabt) and write layout.h for the PSP build.
+          usage: gen_psp_layout.py wl4.wasm layout.h rom_size [wasm-objdump]"""
+          import re, subprocess, sys
+          wasm, out, romsize = sys.argv[1], sys.argv[2], int(sys.argv[3], 0)
+          tool = sys.argv[4] if len(sys.argv) > 4 else 'wasm-objdump'
+          txt = subprocess.run([tool, '-x', wasm], capture_output=True, text=True, check=True).stdout
+          glob = {}
+          for m in re.finditer(r'global\[(\d+)\]\s+i32\s+mutable=(\d)\s*(?:<[^>]*>\s*)?-\s*init\s+i32=(-?\w+)', txt):
+              glob[int(m.group(1))] = (int(m.group(2)), int(m.group(3), 0) & 0xFFFFFFFF)
+          m = re.search(r'global\[(\d+)\]\s*->\s*"rom_image"', txt)
+          if not m or int(m.group(1)) not in glob: sys.exit('gen_psp_layout: rom_image export not found')
+          rom = glob[int(m.group(1))][1]
+          mut = [v for k, (mu, v) in sorted(glob.items()) if mu]
+          if not mut: sys.exit('gen_psp_layout: no mutable global (stack pointer) found')
+          sp = mut[0]
+          if not (0x0A000000 <= rom < sp < 0x0E000000): sys.exit('gen_psp_layout: implausible layout rom=%x sp=%x' % (rom, sp))
+          open(out, 'w').write('/* generated by gen_psp_layout.py */\n#define WL4_ROM_IMAGE_ADDR 0x%08Xu\n#define WL4_STATIC_END 0x%08Xu\n#define WL4_ROM_SIZE %du\n' % (rom, sp, romsize))
+          print('layout: rom_image=0x%08X static_end=0x%08X (%.1f MB static)' % (rom, sp, (sp - 0x0A000000) / 1048576))
+          WL4EOF
+          cat > port/psp/prepare.sh <<'WL4EOF'
+          #!/usr/bin/env bash
+          # After port/build_wasm.sh: assemble everything the PSP Makefile needs in port/build/psp/w2c.
+          #   WABT=/path/to/wabt  ./port/psp/prepare.sh [rom_path]
+          set -euo pipefail
+          PORT=$(cd "$(dirname "$0")/.." && pwd); B=$PORT/build; O=$B/psp/w2c
+          ROM=${1:-$PORT/../baserom_us.gba}
+          : "${WABT:?set WABT}"
+          rm -rf "$B/psp"; mkdir -p "$O"
+          cp "$B/wasm2c/"* "$O/"
+          python3 "$PORT/tools/patch_w2c_psp.py" "$O/wl4.c"
+          # PSP newlib has no TLS: wasm-rt's thread-local call-depth counter becomes a plain global
+          sed -i -E 's/\b(_Thread_local|__thread|thread_local)\b//g' "$O"/wasm-rt*.[ch]
+          python3 "$PORT/tools/gen_stubs.py" "$O/wl4.h" "$O/stubs.c"
+          python3 "$PORT/tools/gen_psp_layout.py" "$B/wl4.wasm" "$O/layout.h" "$(stat -c %s "$ROM")" "$WABT/bin/wasm-objdump"
+          # runtime sources (skip files that wl4.c already includes, and the Windows one)
+          RT=""
+          for f in $(ls "$O"/wasm-rt-*.c 2>/dev/null | grep -v -- '-win\.c'); do
+            b=$(basename "$f"); grep -qF "\"$b\"" "$O/wl4.c" "$O/wl4.h" 2>/dev/null || RT="$RT $b"
+          done
+          echo "RT_SRCS = $RT" > "$O/rt.mk"; cat "$O/rt.mk"
+          WL4EOF
+          cat > port/psp/Makefile <<'WL4EOF'
+          # PSP build.  Run inside the pspdev toolchain after prepare.sh.  make [PSP_OPT=-O1] [LARGE=1]
+          PORT = ..
+          W2C  = $(PORT)/build/psp/w2c
+          include $(W2C)/rt.mk
+
+          TARGET = WL4
+          PSP_OPT ?= -O2
+          OBJS = psp_main.o core.o $(PORT)/hal/hal.o $(PORT)/hal/ppu.o $(PORT)/hal/bios.o $(PORT)/hal/memmap.o \
+                 $(W2C)/wl4.o $(W2C)/stubs.o $(RT_SRCS:%.c=$(W2C)/%.o)
+
+          INCDIR = $(W2C) $(PORT)/hal $(PORT)/psp
+          CFLAGS = $(PSP_OPT) -G0 -w -fno-strict-aliasing -fwrapv -DWL4_MEMMAP -DWL4_PSP \
+                   -DWASM_RT_USE_MMAP=0 -DWASM_RT_SKIP_SIGNAL_RECOVERY=1 -DWASM_RT_TRAP_HANDLER=wl4_trap
+          CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+          ASFLAGS = $(CFLAGS)
+          LIBS = -lpspgu -lpspaudio -lpspctrl -lpspdisplay -lpspge -lpspdebug -lpsppower -lm
+
+          EXTRA_TARGETS = EBOOT.PBP
+          PSP_EBOOT_TITLE = Wario Land 4
+          ifeq ($(LARGE),1)
+          PSP_LARGE_MEMORY = 1
+          endif
+          PSPSDK = $(shell psp-config --pspsdk-path)
+          include $(PSPSDK)/lib/build.mak
+          WL4EOF
+          cat > port/psp/core.h <<'WL4EOF'
+          /* Platform-independent core of the PSP port (also used by the native x86 smoke test). */
+          #ifndef WL4_CORE_H
+          #define WL4_CORE_H
+          #include <stdint.h>
+          typedef struct {
+              void     (*present)(const uint32_t *fb240x160, int rendered);   /* once per frame; must block until vsync */
+              uint16_t (*poll_keys)(void);                                    /* GBA KEYINPUT order, active high */
+              uint64_t (*now_us)(void);
+              int      (*exit_requested)(void);
+              void     (*audio_push)(const int8_t *right, const int8_t *left, int n, int rate);
+              void     (*save_sram)(const uint8_t *sram64k);
+              void     (*quit)(void);                                         /* never returns */
+              void     (*fatal)(const char *msg);                             /* never returns */
+          } Wl4Plat;
+          int      wl4_core_init(void);              /* allocate the memory map; 0 = ok */
+          uint8_t *wl4_core_rom_buffer(void);        /* read the ROM (WL4_ROM_SIZE bytes) here before wl4_core_run */
+          void     wl4_core_run(const Wl4Plat *p, const uint8_t *save64k_or_null);   /* runs the game; exits via p->quit */
+          #endif
+          WL4EOF
+          cat > port/psp/core.c <<'WL4EOF'
+          #include "wl4.h"
+          #include "../hal/hal.h"
+          #include "layout.h"          /* generated: WL4_ROM_IMAGE_ADDR, WL4_STATIC_END, WL4_ROM_SIZE */
+          #include "core.h"
+          #include <string.h>
+          #include <stdio.h>
+
+          struct w2c_env { w2c_wl4 *inst; };
+          static w2c_wl4 g_inst;
+          static struct w2c_env g_env;
+          static const Wl4Plat *P;
+          static uint64_t g_tStart; static unsigned g_frames; static int g_skipMode;
+          static uint8_t g_saved[GBA_SRAM_SIZE]; static int g_dirty;
+
+          int wl4_core_init(void) { return wl4_memmap_init(WL4_STATIC_END - 0x0A000000u + 0x10000u, WL4_ROM_IMAGE_ADDR - 0x0A000000u); }
+          uint8_t *wl4_core_rom_buffer(void) { return g_rg[8].base; }
+
+          void wl4_trap(wasm_rt_trap_t code) {
+              char m[64]; snprintf(m, sizeof m, "wasm trap %d", (int)code); P->fatal(m);
+              for (;;) {}
+          }
+
+          /* ---- imports the wasm module expects (same set as host/host.c) ---- */
+          void w2c_env_hal_dma_set(struct w2c_env *e, u32 ch, u32 src, u32 dst, u32 ctl) { (void)e; hal_dma_set((int)ch, src, dst, ctl); }
+          void w2c_env_hal_audio_push(struct w2c_env *e, u32 right, u32 left, u32 n, u32 rate) {
+              (void)e; if (n > 4096) return; P->audio_push((const int8_t *)wl4_ptr(right), (const int8_t *)wl4_ptr(left), (int)n, (int)rate);
+          }
+          void w2c_env_hal_trace_val(struct w2c_env *e, u32 tag, u32 val) { (void)e; (void)tag; (void)val; }
+          void w2c_env_hal_unported_asm(struct w2c_env *e, u32 site) { (void)e; (void)site; }
+          u32  w2c_env_hal_poll_vcount(struct w2c_env *e) { (void)e; return hal_poll_vcount(); }
+          void w2c_env_LZ77UnCompVram(struct w2c_env *e, u32 s, u32 d) { (void)e; bios_LZ77UnComp(s, d); }
+          void w2c_env_LZ77UnCompWram(struct w2c_env *e, u32 s, u32 d) { (void)e; bios_LZ77UnComp(s, d); }
+          void w2c_env_RLUnCompWram(struct w2c_env *e, u32 s, u32 d) { (void)e; bios_RLUnComp(s, d); }
+          void w2c_env_RLUnCompVram(struct w2c_env *e, u32 s, u32 d) { (void)e; bios_RLUnComp(s, d); }
+          void w2c_env_CPUSet(struct w2c_env *e, u32 s, u32 d, u32 c) { (void)e; bios_CpuSet(s, d, c); }
+          void w2c_env_CpuFastSet(struct w2c_env *e, u32 s, u32 d, u32 c) { (void)e; bios_CpuFastSet(s, d, c); }
+          void w2c_env_BgAffineSet(struct w2c_env *e, u32 s, u32 d, u32 n) { (void)e; bios_BgAffineSet(s, d, (int32_t)n); }
+          void w2c_env_ObjAffineSet(struct w2c_env *e, u32 s, u32 d, u32 n, u32 o) { (void)e; bios_ObjAffineSet(s, d, (int32_t)n, (int32_t)o); }
+          void w2c_env_irq_handler(struct w2c_env *e) { (void)e; }
+          void w2c_env_hal_syscall(struct w2c_env *e, u32 num) { (void)e; if (num == 2 || num == 5) hal_run_frame(); }
+
+          static void cb_vblank(void) { w2c_wl4_InterruptCallbackCallVBlank(&g_inst); }
+          static void cb_hblank(void) { w2c_wl4_InterruptCallbackCallHBlank(&g_inst); }
+          static void cb_vcount(void) { w2c_wl4_InterruptCallbackCallVCount(&g_inst); }
+
+          static void flush_save(int force) {
+              const uint8_t *s = hal_sram();
+              if (memcmp(s, g_saved, GBA_SRAM_SIZE) == 0) { if (force) g_dirty = 0; return; }
+              if (!force && !g_dirty) { g_dirty = 1; return; }        /* write only after the data was stable for one check */
+              memcpy(g_saved, s, GBA_SRAM_SIZE); g_dirty = 0; P->save_sram(g_saved);
+          }
+
+          static void cb_frame(void) {
+              uint32_t work = (uint32_t)(P->now_us() - g_tStart);
+              int rendered = !g_hal_skip_render;
+              g_frames++;
+              if (rendered) { if (!g_skipMode && work > 16000) g_skipMode = 1; else if (g_skipMode && work < 11000) g_skipMode = 0; }
+              if (P->poll_keys) hal_set_keys(P->poll_keys());
+              P->present(hal_framebuffer(), rendered);
+              if ((g_frames & 63) == 0) flush_save(0);
+              if (P->exit_requested()) { flush_save(1); P->quit(); }
+              g_hal_skip_render = g_skipMode ? (int)(g_frames & 1) : 0;
+              g_tStart = P->now_us();
+          }
+
+          void wl4_core_run(const Wl4Plat *p, const uint8_t *save) {
+              P = p;
+              wasm_rt_init();
+              g_env.inst = &g_inst;
+              wasm2c_wl4_instantiate(&g_inst, &g_env);
+              hal_init(NULL, 0);
+              HalCallbacks cb = { cb_vblank, cb_hblank, cb_vcount, cb_frame };
+              hal_set_callbacks(&cb);
+              if (save) memcpy(hal_sram(), save, GBA_SRAM_SIZE);
+              memcpy(g_saved, hal_sram(), GBA_SRAM_SIZE);
+              g_tStart = P->now_us();
+              w2c_wl4_AgbMain(&g_inst);
+              P->fatal("AgbMain returned");
+          }
+          WL4EOF
+          cat > port/psp/psp_main.c <<'WL4EOF'
+          /* PSP front end: video (GU), input, audio, save files, exit callback. */
+          #include <pspkernel.h>
+          #include <pspdebug.h>
+          #include <pspdisplay.h>
+          #include <pspctrl.h>
+          #include <pspgu.h>
+          #include <pspaudio.h>
+          #include <psppower.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <stdlib.h>
+          #include "layout.h"
+          #include "core.h"
+
+          PSP_MODULE_INFO("WL4", PSP_MODULE_USER, 1, 0);
+          PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
+          PSP_HEAP_SIZE_KB(-512);
+          #ifdef PSP_MAIN_THREAD_STACK_SIZE_KB
+          PSP_MAIN_THREAD_STACK_SIZE_KB(512);
+          #endif
+
+          static char g_dir[256] = "ms0:/PSP/GAME/WL4/";
+          static volatile int g_exit;
+          static uint8_t g_sram_copy[0x10000];
+
+          /* ---------- log ---------- */
+          static void logf_(const char *m) { char p[300]; snprintf(p, sizeof p, "%swl4.log", g_dir); FILE *f = fopen(p, "a"); if (f) { fputs(m, f); fputc('\n', f); fclose(f); } }
+
+          /* ---------- video ---------- */
+          typedef struct { float u, v, x, y, z; } Vtx;
+          static unsigned int __attribute__((aligned(16))) g_list[65536];
+          static uint32_t __attribute__((aligned(64))) g_tex[256 * 256];
+          static void video_init(void) {
+              sceGuInit(); sceGuStart(GU_DIRECT, g_list);
+              sceGuDrawBuffer(GU_PSM_8888, (void *)0, 512);
+              sceGuDispBuffer(480, 272, (void *)0x88000, 512);
+              sceGuOffset(2048 - 240, 2048 - 136); sceGuViewport(2048, 2048, 480, 272);
+              sceGuScissor(0, 0, 480, 272); sceGuEnable(GU_SCISSOR_TEST);
+              sceGuDisable(GU_DEPTH_TEST); sceGuDisable(GU_BLEND);
+              sceGuFinish(); sceGuSync(0, 0); sceDisplayWaitVblankStart(); sceGuDisplay(GU_TRUE);
+          }
+          static void plat_present(const uint32_t *fb, int rendered) {
+              if (rendered) {
+                  for (int y = 0; y < 160; y++) {
+                      uint32_t *d = g_tex + y * 256; const uint32_t *s = fb + y * 240;
+                      for (int x = 0; x < 240; x++) { uint32_t c = s[x]; d[x] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFF) | ((c & 0xFF) << 16); }
+                  }
+                  sceKernelDcacheWritebackRange(g_tex, 256 * 160 * 4);
+                  sceGuStart(GU_DIRECT, g_list);
+                  sceGuClearColor(0xFF000000); sceGuClear(GU_COLOR_BUFFER_BIT);
+                  sceGuTexMode(GU_PSM_8888, 0, 0, 0); sceGuTexImage(0, 256, 256, 256, g_tex);
+                  sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB); sceGuTexFilter(GU_LINEAR, GU_LINEAR); sceGuEnable(GU_TEXTURE_2D);
+                  Vtx *v = (Vtx *)sceGuGetMemory(2 * sizeof(Vtx));
+                  v[0].u = 0; v[0].v = 0; v[0].x = 36; v[0].y = 0; v[0].z = 0;               /* 240x160 -> 408x272 (x1.7) */
+                  v[1].u = 240.0f / 256; v[1].v = 160.0f / 256; v[1].x = 444; v[1].y = 272; v[1].z = 0;
+                  sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
+                  sceGuFinish(); sceGuSync(0, 0);
+                  sceDisplayWaitVblankStart(); sceGuSwapBuffers();
+              } else sceDisplayWaitVblankStart();
+          }
+
+          /* ---------- input ---------- */
+          static uint16_t plat_keys(void) {
+              SceCtrlData pad; sceCtrlPeekBufferPositive(&pad, 1);
+              uint16_t k = 0; unsigned b = pad.Buttons;
+              if (b & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE)) k |= 1;        /* A */
+              if (b & (PSP_CTRL_SQUARE | PSP_CTRL_TRIANGLE)) k |= 2;     /* B */
+              if (b & PSP_CTRL_SELECT) k |= 4;
+              if (b & PSP_CTRL_START) k |= 8;
+              if ((b & PSP_CTRL_RIGHT) || pad.Lx > 192) k |= 0x10;
+              if ((b & PSP_CTRL_LEFT) || pad.Lx < 64) k |= 0x20;
+              if ((b & PSP_CTRL_UP) || pad.Ly < 64) k |= 0x40;
+              if ((b & PSP_CTRL_DOWN) || pad.Ly > 192) k |= 0x80;
+              if (b & PSP_CTRL_RTRIGGER) k |= 0x100;
+              if (b & PSP_CTRL_LTRIGGER) k |= 0x200;
+              return k;
+          }
+
+          /* ---------- audio: SPSC ring + fixed-point linear resampler to 44.1 kHz ---------- */
+          #define RING 8192u
+          static int16_t g_ring[RING][2];
+          static volatile uint32_t g_w, g_r; static volatile int g_rate = 13379, g_arun = 1;
+          static void plat_audio_push(const int8_t *right, const int8_t *left, int n, int rate) {
+              g_rate = rate > 4000 ? rate : 13379;
+              uint32_t w = g_w, used = w - g_r, cap = (uint32_t)g_rate / 8; if (cap > RING) cap = RING;
+              uint32_t room = used < cap ? cap - used : 0; if ((uint32_t)n > room) n = (int)room;
+              for (int i = 0; i < n; i++) { g_ring[(w + i) & (RING - 1)][0] = (int16_t)(left[i] * 256); g_ring[(w + i) & (RING - 1)][1] = (int16_t)(right[i] * 256); }
+              g_w = w + n;
+          }
+          static void audio_render(int16_t *out, int frames) {
+              static int primed; static uint32_t pos;
+              uint32_t w = g_w, r = g_r; int src = g_rate; int32_t target = src / 25;
+              if (!primed) { if ((int32_t)(w - r) >= target) primed = 1; else { memset(out, 0, (size_t)frames * 4); return; } }
+              int32_t step = (int32_t)(((int64_t)src << 16) / 44100);
+              int32_t adj = (int32_t)(((int64_t)step * ((int32_t)(w - r) - target)) / target / 50), lim = step / 100;
+              if (adj > lim) adj = lim; if (adj < -lim) adj = -lim; step += adj;
+              for (int i = 0; i < frames; i++) {
+                  if ((int32_t)(w - r) < 2) { primed = 0; for (; i < frames; i++) out[2 * i] = out[2 * i + 1] = 0; break; }
+                  const int16_t *a = g_ring[r & (RING - 1)], *b = g_ring[(r + 1) & (RING - 1)]; int32_t f = (int32_t)pos;
+                  out[2 * i] = (int16_t)(a[0] + (((int32_t)b[0] - a[0]) * f >> 16)); out[2 * i + 1] = (int16_t)(a[1] + (((int32_t)b[1] - a[1]) * f >> 16));
+                  pos += (uint32_t)step; r += pos >> 16; pos &= 0xFFFF;
+              }
+              g_r = r;
+          }
+          static int audio_thread(SceSize a, void *b) {
+              (void)a; (void)b; static int16_t buf[1024 * 2] __attribute__((aligned(64)));
+              int ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, 1024, PSP_AUDIO_FORMAT_STEREO);
+              if (ch < 0) return 0;
+              while (g_arun) { audio_render(buf, 1024); sceAudioOutputBlocking(ch, PSP_AUDIO_VOLUME_MAX, buf); }
+              sceAudioChRelease(ch); return 0;
+          }
+
+          /* ---------- save / exit ---------- */
+          static void plat_save(const uint8_t *s) {
+              char p[300]; snprintf(p, sizeof p, "%swl4.sav", g_dir); FILE *f = fopen(p, "wb"); if (!f) { logf_("save: cannot open file"); return; }
+              fwrite(s, 1, 0x10000, f); fclose(f);
+          }
+          static uint64_t plat_now(void) { return sceKernelGetSystemTimeWide(); }
+          static int plat_exit_req(void) { return g_exit; }
+          static void plat_quit(void) { g_arun = 0; sceKernelDelayThread(50000); sceKernelExitGame(); for (;;) sceKernelSleepThread(); }
+          static void plat_fatal(const char *m) {
+              logf_(m);
+              for (int i = 0; i < 120; i++) { sceGuStart(GU_DIRECT, g_list); sceGuClearColor(0xFF0000AA); sceGuClear(GU_COLOR_BUFFER_BIT); sceGuFinish(); sceGuSync(0, 0); sceDisplayWaitVblankStart(); sceGuSwapBuffers(); }
+              plat_quit();
+          }
+          static int exit_cb(int a1, int a2, void *c) { (void)a1; (void)a2; (void)c; g_exit = 1; return 0; }
+          static int cb_thread(SceSize a, void *b) { (void)a; (void)b; int id = sceKernelCreateCallback("exit", exit_cb, NULL); sceKernelRegisterExitCallback(id); sceKernelSleepThreadCB(); return 0; }
+
+          static void die(const char *m) { pspDebugScreenInit(); pspDebugScreenPrintf("%s\n", m); sceKernelDelayThread(6000000); sceKernelExitGame(); for (;;) {} }
+
+          int main(int argc, char **argv) {
+              if (argc > 0 && argv[0]) { strncpy(g_dir, argv[0], sizeof g_dir - 1); char *s = strrchr(g_dir, '/'); if (s) s[1] = 0; }
+              { int t = sceKernelCreateThread("cb", cb_thread, 0x11, 0xFA0, 0, NULL); if (t >= 0) sceKernelStartThread(t, 0, NULL); }
+              scePowerSetClockFrequency(333, 333, 166);
+              if (wl4_core_init()) die("Out of memory (needs ~12 MB free; close plugins or use a PSP-2000+).");
+
+              static const char *names[] = { "baserom.gba", "baserom_us.gba", "wl4.gba", "warioland4.gba", 0 };
+              FILE *f = 0; char p[300];
+              for (int i = 0; names[i] && !f; i++) { snprintf(p, sizeof p, "%s%s", g_dir, names[i]); f = fopen(p, "rb"); }
+              if (!f) die("ROM not found. Put your Wario Land 4 (US) ROM next to EBOOT.PBP as baserom.gba");
+              fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+              if (sz != (long)WL4_ROM_SIZE) { fclose(f); die("Wrong ROM size: this build needs the exact US ROM it was built from."); }
+              if (fread(wl4_core_rom_buffer(), 1, (size_t)sz, f) != (size_t)sz) { fclose(f); die("ROM read error"); }
+              fclose(f);
+
+              const uint8_t *save = 0;
+              snprintf(p, sizeof p, "%swl4.sav", g_dir); f = fopen(p, "rb");
+              if (f) { if (fread(g_sram_copy, 1, 0x10000, f) == 0x10000) save = g_sram_copy; fclose(f); }
+
+              sceCtrlSetSamplingCycle(0); sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+              video_init();
+              { int t = sceKernelCreateThread("audio", audio_thread, 0x12, 0x4000, 0, NULL); if (t >= 0) sceKernelStartThread(t, 0, NULL); }
+              logf_("start");
+              static const Wl4Plat plat = { plat_present, plat_keys, plat_now, plat_exit_req, plat_audio_push, plat_save, plat_quit, plat_fatal };
+              wl4_core_run(&plat, save);
+              return 0;
+          }
+          WL4EOF
+          cat > port/psp/native_test.c <<'WL4EOF'
+          /* Native x86 smoke test of the PSP memory map: runs the real wasm2c game through core.c with the region table.
+           *   native_test <rom> <frames> [out.ppm]            (built by the CI workflow, no PSP needed) */
+          #include "core.h"
+          #include "layout.h"
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <time.h>
+          static int g_frames, g_want; static uint32_t g_fb[240 * 160]; static const char *g_out;
+          static uint64_t now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000ull + t.tv_nsec / 1000; }
+          static void present(const uint32_t *fb, int r) { (void)r; for (int i = 0; i < 240 * 160; i++) g_fb[i] = fb[i]; g_frames++; }
+          static uint16_t keys(void) { return 0; }
+          static int want_exit(void) { return g_frames >= g_want; }
+          static void apush(const int8_t *r, const int8_t *l, int n, int rate) { (void)r; (void)l; (void)n; (void)rate; }
+          static void save(const uint8_t *s) { (void)s; }
+          static void quit(void) {
+              unsigned nz = 0; for (int i = 0; i < 240 * 160; i++) if (g_fb[i] & 0xFFFFFF) nz++;
+              printf("frames=%d non-black pixels=%u/%d\n", g_frames, nz, 240 * 160);
+              if (g_out) { FILE *o = fopen(g_out, "wb"); fprintf(o, "P6\n240 160\n255\n"); for (int i = 0; i < 240 * 160; i++) { fputc(g_fb[i] >> 16, o); fputc(g_fb[i] >> 8, o); fputc(g_fb[i], o); } fclose(o); }
+              exit(nz > 0 ? 0 : 3);
+          }
+          static void fatal(const char *m) { printf("FATAL: %s (frame %d)\n", m, g_frames); exit(1); }
+          int main(int argc, char **argv) {
+              if (argc < 3) return 2; g_want = atoi(argv[2]); g_out = argc > 3 ? argv[3] : NULL;
+              if (wl4_core_init()) return 2;
+              FILE *f = fopen(argv[1], "rb"); if (!f) return 2;
+              if (fread(wl4_core_rom_buffer(), 1, WL4_ROM_SIZE, f) != WL4_ROM_SIZE) return 2; fclose(f);
+              static const Wl4Plat p = { present, keys, now, want_exit, apush, save, quit, fatal };
+              wl4_core_run(&p, NULL); return 0;
+          }
+          WL4EOF
+          chmod +x port/psp/prepare.sh port/tools/*.py
+          cat >> README.md <<'WL4EOF'
+
+          ## PSP port
+          Built by .github/workflows/wl4-psp.yml (all sources are embedded in that workflow).
+          WL4EOF
+
+      # Resolve effective tool versions once so cache keys and install steps agree.
+      - name: Resolve tool versions
+        run: |
+          WABT_EFF="${{ inputs.wabt_version }}"
+          echo "WABT_EFF=${WABT_EFF:-${{ env.WABT_VERSION }}}" >> "$GITHUB_ENV"
+          OPT="${{ inputs.opt_level }}"
+          echo "OPT_LEVEL=${OPT:-2}" >> "$GITHUB_ENV"
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 python3-venv python3-pip \
+            gcc-multilib curl ca-certificates git unzip
+
+      - name: Get ROM
+        env:
+          ROM_ID: ${{ secrets.WL4_ROM_ID }}
+        run: |
+          if [ ! -f baserom_us.gba ]; then
+            if [ -z "$ROM_ID" ]; then
+              echo "::error::Secret WL4_ROM_ID not set. Add your Google Drive file ID as a repo secret."
+              exit 1
+            fi
+            pip install --quiet gdown
+            gdown "$ROM_ID" -O baserom_us.gba
+          fi
+          ls -l baserom_us.gba
+          echo "${ROM_MD5_US}  baserom_us.gba" | md5sum -c - \
+            || { echo "::error::baserom_us.gba MD5 mismatch — wrong ROM version or corrupted download"; exit 1; }
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract assets from ROM (make extract)
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet pyyaml
+          make extract VERSION=us
+          echo "Extracted $(find include/data -type f | wc -l) asset files"
+
+      # ── wasi-sdk ────────────────────────────────────────────────────────────
+      - name: Cache wasi-sdk
+        id: cache-wasi
+        uses: actions/cache@v4
+        with:
+          path: ~/wasi-sdk
+          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}
+
+      - name: Install wasi-sdk
+        if: steps.cache-wasi.outputs.cache-hit != 'true'
+        run: |
+          ARCH=$(uname -m)   # x86_64 on standard runners; aarch64 on arm runners
+          VER="${{ env.WASI_SDK_VERSION }}"
+          # GitHub release assets have used two naming conventions across versions:
+          #   <v>.0-<arch>-linux.tar.gz   (current)
+          #   <v>.0+m-<arch>-linux.tar.gz (older patch releases)
+          BASE="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${VER}"
+          PRIMARY="${BASE}/wasi-sdk-${VER}.0-${ARCH}-linux.tar.gz"
+          FALLBACK="${BASE}/wasi-sdk-${VER}.0+m-${ARCH}-linux.tar.gz"
+          if ! curl -fsSL -o /tmp/wasi.tgz "$PRIMARY"; then
+            echo "::warning::Primary wasi-sdk URL failed; trying fallback naming."
+            curl -fsSL -o /tmp/wasi.tgz "$FALLBACK"
+          fi
+          mkdir -p ~/wasi-sdk
+          tar -xzf /tmp/wasi.tgz -C ~/wasi-sdk --strip-components=1
+          ~/wasi-sdk/bin/clang --version
+
+      # ── wabt (wasm2c) ────────────────────────────────────────────────────────
+      - name: Cache wabt
+        id: cache-wabt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/wabt-install
+            ~/wabt-src
+          # Cache key includes the effective version so an input override busts the cache.
+          key: wabt-${{ env.WABT_EFF }}
+
+      - name: Build wabt (wasm2c) from source
+        if: steps.cache-wabt.outputs.cache-hit != 'true'
+        run: |
+          VER="${{ env.WABT_EFF }}"
+          # Try the exact tag first; fall back to the branch name without "v" prefix.
+          if ! git clone --recursive --depth 1 --branch "${VER}" \
+                https://github.com/WebAssembly/wabt ~/wabt-src 2>/dev/null; then
+            echo "::warning::Tag ${VER} not found; trying v${VER}"
+            git clone --recursive --depth 1 --branch "v${VER}" \
+              https://github.com/WebAssembly/wabt ~/wabt-src
+          fi
+          cmake -S ~/wabt-src -B ~/wabt-src/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$HOME/wabt-install"
+          cmake --build ~/wabt-src/build -j"$(nproc)"
+          cmake --install ~/wabt-src/build
+          ~/wabt-install/bin/wasm2c --version
+
+      # ── portify → wasm32 → wasm2c ───────────────────────────────────────────
+      - name: portify -> wasm32 -> wasm2c
+        env:
+          WASI_SDK: /home/runner/wasi-sdk
+          WABT: /home/runner/wabt-install
+          WABT_SRC: /home/runner/wabt-src
+          OPT_LEVEL: ${{ env.OPT_LEVEL }}
+        run: |
+          set -o pipefail
+          chmod +x port/build_wasm.sh
+          ./port/build_wasm.sh us 2>&1 | tee port-build.log
+          echo "--- failed C files (expected: none)"
+          cat port/build/FAILED.txt
+          echo "--- unported asm sites (expected: none)"
+          cat port/build/ASM_SITES.txt
+          echo "--- audit (expected: empty)"
+          cat port/build/p/AUDIT.txt
+          test -s port/build/wasm2c/wl4.c
+          ls -l port/build/wl4.wasm port/build/wasm2c/wl4.c
+
+      # ── native test of the PSP memory map (no PSP needed) ───────────────────
+      - name: Prepare PSP sources (patch wasm2c output for the region-table memory)
+        env:
+          WABT: /home/runner/wabt-install
+        run: |
+          set -o pipefail
+          chmod +x port/psp/prepare.sh
+          ./port/psp/prepare.sh baserom_us.gba 2>&1 | tee psp-prepare.log
+
+      - name: Native smoke test (x86, PSP memory map)
+        if: ${{ inputs.run_host_smoke_test }}
+        continue-on-error: true
+        run: |
+          set -x
+          O=port/build/psp/w2c; P=port
+          RT=$(sed 's/RT_SRCS = //' $O/rt.mk)
+          for f in $RT; do RTC="$RTC $O/$f"; done
+          gcc -O1 -w -fno-strict-aliasing -m64 \
+            -DWL4_MEMMAP -DWASM_RT_USE_MMAP=0 -DWASM_RT_SKIP_SIGNAL_RECOVERY=1 -DWASM_RT_TRAP_HANDLER=wl4_trap \
+            -I$O -I$P/hal -I$P/psp \
+            $P/psp/native_test.c $P/psp/core.c $P/hal/hal.c $P/hal/ppu.c $P/hal/bios.c $P/hal/memmap.c \
+            $O/stubs.c $O/wl4.c $RTC -o /tmp/psp_native -lm
+          timeout 300 /tmp/psp_native baserom_us.gba 600 /tmp/frame.ppm
+
+      # ── PSP build (pspdev toolchain in docker) ───────────────────────────────
+      - name: Build EBOOT.PBP
+        run: |
+          docker run --rm -v "$PWD":/src -w /src/port/psp \
+            ghcr.io/pspdev/pspdev:latest \
+            make -j2 PSP_OPT="${{ inputs.psp_opt }}" 2>&1 | tee psp-make.log
+          sudo chown -R "$(id -u):$(id -g)" port
+          ls -l port/psp/EBOOT.PBP
+
+      - name: Package
+        run: |
+          mkdir -p dist/PSP/GAME/WL4
+          cp port/psp/EBOOT.PBP dist/PSP/GAME/WL4/
+          echo "Copy your own Wario Land 4 (US, md5 ${ROM_MD5_US}) ROM here as baserom.gba" > dist/PSP/GAME/WL4/PUT_ROM_HERE.txt
+
+      - name: Upload PSP build
+        uses: actions/upload-artifact@v4
+        with:
+          name: wl4-psp
+          path: dist/
+          retention-days: 14
+
+      - name: Upload build diagnostics (no ROM data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wl4-psp-diagnostics
+          path: |
+            port-build.log
+            psp-prepare.log
+            psp-make.log
+            port/build/FAILED.txt
+            port/build/errors.log
+            port/build/ASM_SITES.txt
+          if-no-files-found: ignore
+          retention-days: 14
