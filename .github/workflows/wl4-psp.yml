@@ -663,7 +663,7 @@ jobs:
                  $(W2C)/wl4.o $(W2C)/stubs.o $(RT_SRCS:%.c=$(W2C)/%.o)
 
           INCDIR = $(W2C) $(PORT)/hal $(PORT)/psp
-          CFLAGS = $(PSP_OPT) -G0 -w -fno-strict-aliasing -fwrapv -DWL4_MEMMAP -DWL4_PSP \
+          CFLAGS = $(PSP_OPT) -G0 -w -D__STDC_NO_THREADS__=1 -fno-strict-aliasing -fwrapv -DWL4_MEMMAP -DWL4_PSP \
                    -DWASM_RT_USE_MMAP=0 -DWASM_RT_SKIP_SIGNAL_RECOVERY=1 -DWASM_RT_TRAP_HANDLER=wl4_trap
           CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
           ASFLAGS = $(CFLAGS)
