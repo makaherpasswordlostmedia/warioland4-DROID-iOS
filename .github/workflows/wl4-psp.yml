@@ -1,4 +1,4 @@
-name: Build Wario Land 4 PSP port (EBOOT.PBP) v6
+name: Build Wario Land 4 PSP port (EBOOT.PBP) v7
 
 # Repo layout expected: the pret-style decomp at the root (src/, include/, asm/, asset_database.yaml, ...)
 # with port/ and android/ from this port copied on top.
@@ -53,7 +53,7 @@ jobs:
 
       - name: Install PSP port files (embedded in this workflow)
         run: |
-          echo "WORKFLOW VERSION v6 (PSP-only runtime copy)"
+          echo "WORKFLOW VERSION v7 (no mman/C11 in PSP runtime copy)"
           mkdir -p port/psp port/hal port/tools
           cat > port/hal/hal.h <<'WL4EOF'
           /* GBA hardware abstraction layer for the Wario Land 4 native port.
@@ -654,6 +654,11 @@ jobs:
           sed -i -E 's/\b(_Thread_local|__thread|thread_local)\b//g' "$Q"/wasm-rt*.[ch]
           # PSP newlib has setjmp/longjmp but no sigsetjmp/siglongjmp/sigjmp_buf (no signal handlers are installed anyway)
           sed -i -E 's/\bsigsetjmp\(([^,()]+),[^)]*\)/setjmp(\1)/g; s/\bsiglongjmp\b/longjmp/g; s/\bsigjmp_buf\b/jmp_buf/g' "$Q"/wasm-rt*.[ch]
+          # no C11 threads/atomics on the Allegrex (no ll/sc): use wasm-rt's single-threaded code paths
+          sed -i -E '/^[[:space:]]*#[[:space:]]*define[[:space:]]+WASM_RT_C11_AVAILABLE/d' "$Q"/wasm-rt.h
+          # mmap is not used (WASM_RT_USE_MMAP=0) and the PSP newlib has no <sys/mman.h>
+          sed -i -E '/#[[:space:]]*include[[:space:]]*<sys\/mman\.h>/d' "$Q"/wasm-rt*.[ch]
+          grep -n '#[[:space:]]*include' "$Q"/wasm-rt-impl.c "$Q"/wasm-rt-mem-impl.c "$Q"/wasm-rt-exceptions-impl.c | head -40
           # diagnostics for the next porting step
           echo "--- threads / atomics / lock lines in the PSP copy"
           grep -n 'threads\.h\|C11_AVAILABLE\|NO_THREADS\|NO_ATOMICS\|mtx_\|stdatomic' "$Q"/wasm-rt.h "$Q"/wasm-rt-mem-impl*.[ci]* | head -60 || true
