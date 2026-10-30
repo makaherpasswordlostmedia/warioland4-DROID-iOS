@@ -1,4 +1,4 @@
-name: Build Wario Land 4 PSP port (EBOOT.PBP)
+name: Build Wario Land 4 PSP port (EBOOT.PBP) v5
 
 # Repo layout expected: the pret-style decomp at the root (src/, include/, asm/, asset_database.yaml, ...)
 # with port/ and android/ from this port copied on top.
@@ -53,6 +53,7 @@ jobs:
 
       - name: Install PSP port files (embedded in this workflow)
         run: |
+          echo "WORKFLOW VERSION v5 (threads + sigjmp fixes)"
           mkdir -p port/psp port/hal port/tools
           cat > port/hal/hal.h <<'WL4EOF'
           /* GBA hardware abstraction layer for the Wario Land 4 native port.
@@ -642,6 +643,9 @@ jobs:
           # ...and no C11 <threads.h> either (missing machine/_threads.h in the PSP newlib)
           sed -i -E '/#\s*include\s*<threads\.h>/d' "$O"/wasm-rt*.[ch] "$O"/wl4.[ch]
           grep -n 'threads.h\|thread_local\|_Thread_local' "$O"/wasm-rt*.[ch] "$O"/wl4.h || true
+          # PSP newlib has setjmp/longjmp but no sigsetjmp/siglongjmp/sigjmp_buf (we install no signal handlers anyway)
+          sed -i -E 's/\bsigsetjmp\(([^,()]+),[^)]*\)/setjmp(\1)/g; s/\bsiglongjmp\b/longjmp/g; s/\bsigjmp_buf\b/jmp_buf/g' "$O"/wasm-rt*.[ch]
+          grep -n 'setjmp\|longjmp\|jmp_buf' "$O"/wasm-rt.h || true
           python3 "$PORT/tools/gen_stubs.py" "$O/wl4.h" "$O/stubs.c"
           python3 "$PORT/tools/gen_psp_layout.py" "$B/wl4.wasm" "$O/layout.h" "$(stat -c %s "$ROM")" "$WABT/bin/wasm-objdump"
           # runtime sources (skip files that wl4.c already includes, and the Windows one)
