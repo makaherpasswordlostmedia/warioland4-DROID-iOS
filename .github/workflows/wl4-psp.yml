@@ -1,4 +1,4 @@
-name: Build Wario Land 4 PSP port (EBOOT.PBP) v7
+name: Build Wario Land 4 PSP port (EBOOT.PBP) v8
 
 # Repo layout expected: the pret-style decomp at the root (src/, include/, asm/, asset_database.yaml, ...)
 # with port/ and android/ from this port copied on top.
@@ -53,7 +53,7 @@ jobs:
 
       - name: Install PSP port files (embedded in this workflow)
         run: |
-          echo "WORKFLOW VERSION v7 (no mman/C11 in PSP runtime copy)"
+          echo "WORKFLOW VERSION v8 (GU sprite UVs in texels, edge padding)"
           mkdir -p port/psp port/hal port/tools
           cat > port/hal/hal.h <<'WL4EOF'
           /* GBA hardware abstraction layer for the Wario Land 4 native port.
@@ -837,15 +837,17 @@ jobs:
                   for (int y = 0; y < 160; y++) {
                       uint32_t *d = g_tex + y * 256; const uint32_t *s = fb + y * 240;
                       for (int x = 0; x < 240; x++) { uint32_t c = s[x]; d[x] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFF) | ((c & 0xFF) << 16); }
+                      d[240] = d[239];                                    /* edge padding: bilinear must not blend with black */
                   }
-                  sceKernelDcacheWritebackRange(g_tex, 256 * 160 * 4);
+                  memcpy(g_tex + 160 * 256, g_tex + 159 * 256, 241 * 4);
+                  sceKernelDcacheWritebackRange(g_tex, 256 * 161 * 4);
                   sceGuStart(GU_DIRECT, g_list);
                   sceGuClearColor(0xFF000000); sceGuClear(GU_COLOR_BUFFER_BIT);
                   sceGuTexMode(GU_PSM_8888, 0, 0, 0); sceGuTexImage(0, 256, 256, 256, g_tex);
-                  sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB); sceGuTexFilter(GU_LINEAR, GU_LINEAR); sceGuEnable(GU_TEXTURE_2D);
+                  sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB); sceGuTexFilter(GU_LINEAR, GU_LINEAR); sceGuTexWrap(GU_CLAMP, GU_CLAMP); sceGuEnable(GU_TEXTURE_2D);
                   Vtx *v = (Vtx *)sceGuGetMemory(2 * sizeof(Vtx));
-                  v[0].u = 0; v[0].v = 0; v[0].x = 36; v[0].y = 0; v[0].z = 0;               /* 240x160 -> 408x272 (x1.7) */
-                  v[1].u = 240.0f / 256; v[1].v = 160.0f / 256; v[1].x = 444; v[1].y = 272; v[1].z = 0;
+                  v[0].u = 0; v[0].v = 0; v[0].x = 36; v[0].y = 0; v[0].z = 0;               /* 240x160 -> 408x272 (x1.7); GU_TRANSFORM_2D UVs are in TEXELS, not 0..1 */
+                  v[1].u = 240.0f; v[1].v = 160.0f; v[1].x = 444; v[1].y = 272; v[1].z = 0;
                   sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
                   sceGuFinish(); sceGuSync(0, 0);
                   sceDisplayWaitVblankStart(); sceGuSwapBuffers();
