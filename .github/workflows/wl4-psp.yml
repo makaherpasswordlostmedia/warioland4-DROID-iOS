@@ -1,4 +1,4 @@
-name: Build Wario Land 4 PSP port (EBOOT.PBP) v5
+name: Build Wario Land 4 PSP port (EBOOT.PBP) v6
 
 # Repo layout expected: the pret-style decomp at the root (src/, include/, asm/, asset_database.yaml, ...)
 # with port/ and android/ from this port copied on top.
@@ -53,7 +53,7 @@ jobs:
 
       - name: Install PSP port files (embedded in this workflow)
         run: |
-          echo "WORKFLOW VERSION v5 (threads + sigjmp fixes)"
+          echo "WORKFLOW VERSION v6 (PSP-only runtime copy)"
           mkdir -p port/psp port/hal port/tools
           cat > port/hal/hal.h <<'WL4EOF'
           /* GBA hardware abstraction layer for the Wario Land 4 native port.
@@ -629,23 +629,16 @@ jobs:
           WL4EOF
           cat > port/psp/prepare.sh <<'WL4EOF'
           #!/usr/bin/env bash
-          # After port/build_wasm.sh: assemble everything the PSP Makefile needs in port/build/psp/w2c.
-          #   WABT=/path/to/wabt  ./port/psp/prepare.sh [rom_path]
+          # After port/build_wasm.sh: assemble everything the PSP Makefile needs.
+          #   port/build/psp/w2c      clean patched wasm2c output (used by the native x86 test)
+          #   port/build/psp/w2c_psp  copy with the PSP-newlib adjustments (used by the PSP Makefile)
           set -euo pipefail
-          PORT=$(cd "$(dirname "$0")/.." && pwd); B=$PORT/build; O=$B/psp/w2c
+          PORT=$(cd "$(dirname "$0")/.." && pwd); B=$PORT/build; O=$B/psp/w2c; Q=$B/psp/w2c_psp
           ROM=${1:-$PORT/../baserom_us.gba}
           : "${WABT:?set WABT}"
           rm -rf "$B/psp"; mkdir -p "$O"
           cp "$B/wasm2c/"* "$O/"
           python3 "$PORT/tools/patch_w2c_psp.py" "$O/wl4.c"
-          # PSP newlib has no TLS: wasm-rt's thread-local call-depth counter becomes a plain global
-          sed -i -E 's/\b(_Thread_local|__thread|thread_local)\b//g' "$O"/wasm-rt*.[ch]
-          # ...and no C11 <threads.h> either (missing machine/_threads.h in the PSP newlib)
-          sed -i -E '/#\s*include\s*<threads\.h>/d' "$O"/wasm-rt*.[ch] "$O"/wl4.[ch]
-          grep -n 'threads.h\|thread_local\|_Thread_local' "$O"/wasm-rt*.[ch] "$O"/wl4.h || true
-          # PSP newlib has setjmp/longjmp but no sigsetjmp/siglongjmp/sigjmp_buf (we install no signal handlers anyway)
-          sed -i -E 's/\bsigsetjmp\(([^,()]+),[^)]*\)/setjmp(\1)/g; s/\bsiglongjmp\b/longjmp/g; s/\bsigjmp_buf\b/jmp_buf/g' "$O"/wasm-rt*.[ch]
-          grep -n 'setjmp\|longjmp\|jmp_buf' "$O"/wasm-rt.h || true
           python3 "$PORT/tools/gen_stubs.py" "$O/wl4.h" "$O/stubs.c"
           python3 "$PORT/tools/gen_psp_layout.py" "$B/wl4.wasm" "$O/layout.h" "$(stat -c %s "$ROM")" "$WABT/bin/wasm-objdump"
           # runtime sources (skip files that wl4.c already includes, and the Windows one)
@@ -654,11 +647,21 @@ jobs:
             b=$(basename "$f"); grep -qF "\"$b\"" "$O/wl4.c" "$O/wl4.h" 2>/dev/null || RT="$RT $b"
           done
           echo "RT_SRCS = $RT" > "$O/rt.mk"; cat "$O/rt.mk"
+
+          # ---- PSP-only copy ----
+          cp -r "$O" "$Q"
+          # no TLS in the PSP newlib: wasm-rt's thread-local call-depth counter becomes a plain global
+          sed -i -E 's/\b(_Thread_local|__thread|thread_local)\b//g' "$Q"/wasm-rt*.[ch]
+          # PSP newlib has setjmp/longjmp but no sigsetjmp/siglongjmp/sigjmp_buf (no signal handlers are installed anyway)
+          sed -i -E 's/\bsigsetjmp\(([^,()]+),[^)]*\)/setjmp(\1)/g; s/\bsiglongjmp\b/longjmp/g; s/\bsigjmp_buf\b/jmp_buf/g' "$Q"/wasm-rt*.[ch]
+          # diagnostics for the next porting step
+          echo "--- threads / atomics / lock lines in the PSP copy"
+          grep -n 'threads\.h\|C11_AVAILABLE\|NO_THREADS\|NO_ATOMICS\|mtx_\|stdatomic' "$Q"/wasm-rt.h "$Q"/wasm-rt-mem-impl*.[ci]* | head -60 || true
           WL4EOF
           cat > port/psp/Makefile <<'WL4EOF'
           # PSP build.  Run inside the pspdev toolchain after prepare.sh.  make [PSP_OPT=-O1] [LARGE=1]
           PORT = ..
-          W2C  = $(PORT)/build/psp/w2c
+          W2C  = $(PORT)/build/psp/w2c_psp
           include $(W2C)/rt.mk
 
           TARGET = WL4
@@ -667,7 +670,7 @@ jobs:
                  $(W2C)/wl4.o $(W2C)/stubs.o $(RT_SRCS:%.c=$(W2C)/%.o)
 
           INCDIR = $(W2C) $(PORT)/hal $(PORT)/psp
-          CFLAGS = $(PSP_OPT) -G0 -w -D__STDC_NO_THREADS__=1 -fno-strict-aliasing -fwrapv -DWL4_MEMMAP -DWL4_PSP \
+          CFLAGS = $(PSP_OPT) -G0 -w -D__STDC_NO_THREADS__=1 -D__STDC_NO_ATOMICS__=1 -fno-strict-aliasing -fwrapv -DWL4_MEMMAP -DWL4_PSP \
                    -DWASM_RT_USE_MMAP=0 -DWASM_RT_SKIP_SIGNAL_RECOVERY=1 -DWASM_RT_TRAP_HANDLER=wl4_trap
           CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
           ASFLAGS = $(CFLAGS)
