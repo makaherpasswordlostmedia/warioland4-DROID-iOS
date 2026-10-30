@@ -639,6 +639,9 @@ jobs:
           python3 "$PORT/tools/patch_w2c_psp.py" "$O/wl4.c"
           # PSP newlib has no TLS: wasm-rt's thread-local call-depth counter becomes a plain global
           sed -i -E 's/\b(_Thread_local|__thread|thread_local)\b//g' "$O"/wasm-rt*.[ch]
+          # ...and no C11 <threads.h> either (missing machine/_threads.h in the PSP newlib)
+          sed -i -E '/#\s*include\s*<threads\.h>/d' "$O"/wasm-rt*.[ch] "$O"/wl4.[ch]
+          grep -n 'threads.h\|thread_local\|_Thread_local' "$O"/wasm-rt*.[ch] "$O"/wl4.h || true
           python3 "$PORT/tools/gen_stubs.py" "$O/wl4.h" "$O/stubs.c"
           python3 "$PORT/tools/gen_psp_layout.py" "$B/wl4.wasm" "$O/layout.h" "$(stat -c %s "$ROM")" "$WABT/bin/wasm-objdump"
           # runtime sources (skip files that wl4.c already includes, and the Windows one)
