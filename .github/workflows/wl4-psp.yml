@@ -976,6 +976,7 @@ jobs:
       - name: Resolve tool versions
         run: |
           WABT_EFF="${{ inputs.wabt_version }}"
+          case "$WABT_EFF" in [0-9]*.[0-9]*.[0-9]*) ;; *) WABT_EFF="" ;; esac
           echo "WABT_EFF=${WABT_EFF:-${{ env.WABT_VERSION }}}" >> "$GITHUB_ENV"
           OPT="${{ inputs.opt_level }}"
           echo "OPT_LEVEL=${OPT:-2}" >> "$GITHUB_ENV"
