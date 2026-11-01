@@ -1,4 +1,4 @@
-name: Build Wario Land 4 PSP port (EBOOT.PBP) v8
+name: Build Wario Land 4 PSP port (EBOOT.PBP) v10
 
 # Repo layout expected: the pret-style decomp at the root (src/, include/, asm/, asset_database.yaml, ...)
 # with port/ and android/ from this port copied on top.
@@ -53,7 +53,7 @@ jobs:
 
       - name: Install PSP port files (embedded in this workflow)
         run: |
-          echo "WORKFLOW VERSION v8 (GU sprite UVs in texels, edge padding)"
+          echo "WORKFLOW VERSION v10 (GU-accelerated PPU with software fallback)"
           mkdir -p port/psp port/hal port/tools
           cat > port/hal/hal.h <<'WL4EOF'
           /* GBA hardware abstraction layer for the Wario Land 4 native port.
@@ -111,6 +111,12 @@ jobs:
           static inline void wr32(uint32_t a, uint32_t v){ *(uint32_t *)wl4_ptr(a & ~3u) = v; }
           int  wl4_memmap_init(uint32_t data_size, uint32_t rom_image_off);   /* 0 = ok; see memmap.c */
           extern volatile int g_hal_skip_render;                  /* host: skip PPU work for the next frame (frame skip) */
+          /* optional GPU renderer: begin() runs at line 0 (return 1 = this frame is drawn by the GPU, the software PPU is skipped),
+           * submit() runs at line 160 before VBlank DMA/IRQs touch VRAM/OAM/palette. */
+          typedef struct { int (*begin)(void); void (*submit)(void); } HalGpu;
+          void hal_set_gpu(const HalGpu *g);
+          extern volatile int g_hal_gpu_done;                     /* set when submit() ran this frame; the host clears it when presenting */
+          int hal_hdma_active(void);                              /* an HBlank-timed DMA channel is armed */
           #else
           static inline uint8_t  rd8 (uint32_t a){ return g_mem[a]; }
           static inline uint16_t rd16(uint32_t a){ return (uint16_t)(g_mem[a] | g_mem[a+1] << 8); }
@@ -170,6 +176,17 @@ jobs:
 
           #ifdef WL4_MEMMAP
           volatile int g_hal_skip_render;
+          volatile int g_hal_gpu_done;
+          static const HalGpu *g_gpu; static int g_gpuActive, g_ioDirty; static uint8_t g_ioSnap[0x58];
+          void hal_set_gpu(const HalGpu *g) { g_gpu = g; }
+          static int io_changed(void) { return memcmp(g_ioSnap, g_io, 4) != 0 || memcmp(g_ioSnap + 8, g_io + 8, 0x58 - 8) != 0; }   /* DISPSTAT/VCOUNT are HAL-owned */
+          static void gpu_abort(int line) {               /* register changed mid-frame: redo the lines already skipped in software */
+              g_gpuActive = 0; g_hal_gpu_done = 0;
+              if (g_hal_skip_render) return;
+              uint8_t cur[0x58]; memcpy(cur, g_io, 0x58); memcpy(g_io, g_ioSnap, 0x58);
+              for (int y = 0; y < line; y++) ppu_render_scanline(y, g_fb + y * GBA_W);
+              memcpy(g_io, cur, 0x58);
+          }
           void hal_init(uint8_t *mem, size_t size) { (void)mem; (void)size; g_keys = 0; memset(g_fb, 0, sizeof g_fb); memset(g_rg[0xE].base, 0xFF, GBA_SRAM_SIZE); wr16(IO_KEYINPUT, 0x03FF); }
           int hal_load_rom(const uint8_t *rom, size_t size, uint32_t rom_image_addr) {
               (void)rom_image_addr; if (size > 0x800000) return -1; memcpy(g_rg[8].base, rom, size); return 0;
@@ -203,7 +220,13 @@ jobs:
           void hal_step_line(void) {
               int line = g_line;
               g_hal_line = line; g_hal_stage = 1;
-              if (line == 0) { ppu_frame_start(); wr16(IO_KEYINPUT, (uint16_t)(~g_keys & 0x03FF)); }
+              if (line == 0) {
+                  ppu_frame_start(); wr16(IO_KEYINPUT, (uint16_t)(~g_keys & 0x03FF));
+          #ifdef WL4_MEMMAP
+                  g_gpuActive = 0; g_hal_gpu_done = 0; g_ioDirty = 0;
+                  if (g_gpu && g_gpu->begin()) { g_gpuActive = 1; memcpy(g_ioSnap, g_io, 0x58); }
+          #endif
+              }
               uint16_t st = rd16(IO_DISPSTAT);
               wr16(IO_VCOUNT, (uint16_t)line);
               int vcmatch = ((st >> 8) == line);
@@ -212,14 +235,19 @@ jobs:
               if (line < GBA_H) {
                   g_hal_stage = 2;
           #ifdef WL4_MEMMAP
-                  if (!g_hal_skip_render)
+                  if (g_gpuActive && g_ioDirty) { g_ioDirty = 0; if (io_changed()) gpu_abort(line); }
+                  if (!g_gpuActive && !g_hal_skip_render)
           #endif
                   ppu_render_scanline(line, g_fb + line * GBA_W);
                   g_hal_stage = 3; dma_timed(2);
                   wr16(IO_DISPSTAT, rd16(IO_DISPSTAT) | 2);
                   if (st & 0x10) raise_irq(0x0002, g_cb.hblank);
                   wr16(IO_DISPSTAT, rd16(IO_DISPSTAT) & ~2);
-              } else if (line == GBA_H) { g_hal_stage = 4; dma_timed(1); g_hal_stage = 5; if (st & 0x08) raise_irq(0x0001, g_cb.vblank); }
+              } else if (line == GBA_H) {
+          #ifdef WL4_MEMMAP
+                  if (g_gpuActive) { g_gpu->submit(); g_hal_gpu_done = 1; }
+          #endif
+                  g_hal_stage = 4; dma_timed(1); g_hal_stage = 5; if (st & 0x08) raise_irq(0x0001, g_cb.vblank); }
               g_hal_stage = 6;
               g_line = line + 1;
               if (g_line == 228) { g_line = 0; g_hal_stage = 7; if (g_cb.frame_done) g_cb.frame_done(); }
@@ -275,11 +303,15 @@ jobs:
 
           /* Called by the wasm2c store helper for every store into 0x04000000..0x040003FF. */
           void hal_io_write(unsigned addr, unsigned size) {
+          #ifdef WL4_MEMMAP
+              if (addr >= 0x04000000u && addr < 0x04000058u) g_ioDirty = 1;
+          #endif
               if (addr >= 0x040000B0 && addr < 0x040000E0) {
                   unsigned off = (addr - 0x040000B0) % 12, ch = (addr - 0x040000B0) / 12, base = 0x040000B0 + ch * 12;
                   if (off + size > 10) hal_dma_set((int)ch, rd32(base), rd32(base + 4), rd32(base + 8));
               }
           }
+          int hal_hdma_active(void) { for (int i = 0; i < 4; i++) if (dma[i].active == 2) return 1; return 0; }
           WL4EOF
           cat > port/hal/ppu.c <<'WL4EOF'
           /* Scanline software PPU: modes 0-5, text/affine BG, regular+affine OBJ,
@@ -326,13 +358,20 @@ jobs:
                   if (bpp8) {
                       const uint32_t a = cbase + tile * 64 + iy * 8;
                       if (a >= 0x10000) { for (int k = 0; k < run; k++) out[x + k] = TRANSP; }
-                      else for (int k = 0; k < run; k++) { int ix = ix0 + k; if (hflip) ix = 7 - ix; uint32_t c = g_vram[a + ix]; out[x + k] = c ? (palp[c] & 0x7FFF) : TRANSP; }
+                      else {
+                          const uint8_t *r = g_vram + a; uint32_t *o = out + x;
+                          if (run == 8 && !hflip) { for (int k = 0; k < 8; k++) { uint32_t c = r[k]; o[k] = c ? (palp[c] & 0x7FFF) : TRANSP; } }
+                          else if (run == 8) { for (int k = 0; k < 8; k++) { uint32_t c = r[7 - k]; o[k] = c ? (palp[c] & 0x7FFF) : TRANSP; } }
+                          else for (int k = 0; k < run; k++) { int ix = ix0 + k; if (hflip) ix = 7 - ix; uint32_t c = r[ix]; o[k] = c ? (palp[c] & 0x7FFF) : TRANSP; }
+                      }
                   } else {
                       const uint32_t a = cbase + tile * 32 + iy * 4;
                       if (a >= 0x10000) { for (int k = 0; k < run; k++) out[x + k] = TRANSP; }
                       else {
-                          const uint32_t w = *(const uint32_t *)(g_vram + a), pb = (uint32_t)(e >> 12) * 16;
-                          for (int k = 0; k < run; k++) { int ix = ix0 + k; if (hflip) ix = 7 - ix; uint32_t c = (w >> (ix * 4)) & 15; out[x + k] = c ? (palp[pb + c] & 0x7FFF) : TRANSP; }
+                          const uint32_t w = *(const uint32_t *)(g_vram + a); const uint16_t *pp = palp + (uint32_t)(e >> 12) * 16; uint32_t *o = out + x;
+                          if (run == 8 && !hflip) { for (int k = 0; k < 8; k++) { uint32_t c = (w >> (k * 4)) & 15; o[k] = c ? (pp[c] & 0x7FFF) : TRANSP; } }
+                          else if (run == 8) { for (int k = 0; k < 8; k++) { uint32_t c = (w >> ((7 - k) * 4)) & 15; o[k] = c ? (pp[c] & 0x7FFF) : TRANSP; } }
+                          else for (int k = 0; k < run; k++) { int ix = ix0 + k; if (hflip) ix = 7 - ix; uint32_t c = (w >> (ix * 4)) & 15; o[k] = c ? (pp[c] & 0x7FFF) : TRANSP; }
                       }
                   }
                   x += run; px = (px + run) & wmask;
@@ -390,8 +429,89 @@ jobs:
           static const uint8_t OBJW[3][4] = {{8,16,32,64},{16,32,32,64},{8,8,16,32}};
           static const uint8_t OBJH[3][4] = {{8,16,32,64},{8,8,16,32},{16,32,32,64}};
 
-          /* obj line: color | prio<<16 | flags (bit24 semi-transparent) ; objwin mask separately */
           static int g_anySemi;
+          #ifdef WL4_MEMMAP
+          /* ---- OBJ: OAM is decoded once into a compact list (rebuilt only when OAM changes), then drawn per scanline ---- */
+          typedef struct {
+              int16_t ox; uint16_t tile; uint8_t oy, bh, w, h, bw, p, pb4, bpp8, mode, affine, hflip, vflip;
+              int16_t pa, pb, pc, pd;
+          } Spr;
+          static Spr g_spr[128]; static int g_nspr;
+          static uint8_t g_oamShadow[1024]; static int g_oamValid;
+
+          static void oam_decode(void) {
+              g_nspr = 0;
+              for (int i = 0; i < 128; i++) {
+                  const uint16_t *o = (const uint16_t *)(g_oam + i * 8); uint16_t a0 = o[0], a1 = o[1], a2 = o[2];
+                  int affine = (a0 >> 8) & 1, dbl = affine && ((a0 >> 9) & 1);
+                  if (!affine && ((a0 >> 9) & 1)) continue;
+                  int mode = (a0 >> 10) & 3; if (mode == 3) continue;
+                  int shape = a0 >> 14, sz = a1 >> 14; if (shape == 3) continue;
+                  Spr *s = &g_spr[g_nspr++];
+                  int w = OBJW[shape][sz], h = OBJH[shape][sz];
+                  s->w = (uint8_t)w; s->h = (uint8_t)h; s->bw = (uint8_t)(dbl ? w * 2 : w); s->bh = (uint8_t)(dbl ? h * 2 : h);
+                  s->oy = (uint8_t)(a0 & 0xFF); { int ox = a1 & 0x1FF; if (ox >= 256) ox -= 512; s->ox = (int16_t)ox; }
+                  s->bpp8 = (a0 >> 13) & 1; s->tile = a2 & 0x3FF; s->p = (a2 >> 10) & 3; s->pb4 = (uint8_t)(a2 >> 12);
+                  s->mode = (uint8_t)mode; s->affine = (uint8_t)affine; s->hflip = (a1 & 0x1000) != 0; s->vflip = (a1 & 0x2000) != 0;
+                  s->pa = 0x100; s->pb = 0; s->pc = 0; s->pd = 0x100;
+                  if (affine) { const uint16_t *g = (const uint16_t *)(g_oam + ((a1 >> 9) & 31) * 32); s->pa = (int16_t)g[3]; s->pb = (int16_t)g[7]; s->pc = (int16_t)g[11]; s->pd = (int16_t)g[15]; }
+              }
+          }
+
+          /* obj line: color (TRANSP = none), priority, semi-transparent flag, OBJ-window mask */
+          static void obj_line(int y, int disp, uint32_t *col, uint8_t *prio, uint8_t *semi, uint8_t *objwin) {
+              memset(col, 0xFF, GBA_W * 4); memset(prio, 4, GBA_W); memset(semi, 0, GBA_W); memset(objwin, 0, GBA_W);
+              if (!g_oamValid || memcmp(g_oamShadow, g_oam, 1024)) { memcpy(g_oamShadow, g_oam, 1024); oam_decode(); g_oamValid = 1; }
+              const int oneD = (disp >> 6) & 1, bitmapMode = (disp & 7) >= 3;
+              const uint16_t *palO = (const uint16_t *)g_pal + 256;
+              for (int i = 0; i < g_nspr; i++) {
+                  const Spr *s = &g_spr[i];
+                  const int ly = (y - s->oy) & 0xFF; if (ly >= s->bh) continue;
+                  const int ox = s->ox, bw = s->bw; if (ox >= GBA_W || ox + bw <= 0) continue;
+                  if (bitmapMode && s->tile < 512) continue;
+                  const int sxs = ox < 0 ? -ox : 0, sxe = (ox + bw > GBA_W) ? GBA_W - ox : bw;
+                  const int w = s->w, h = s->h, p = s->p, mode = s->mode, bpp8 = s->bpp8, step = bpp8 ? 2 : 1, tw = w >> 3;
+                  const uint8_t *vt = g_vram + 0x10000;
+                  const uint16_t *pal4 = palO + s->pb4 * 16;
+                  if (!s->affine) {
+                      const int ty = s->vflip ? h - 1 - ly : ly;
+                      const uint32_t rowTile = oneD ? (uint32_t)s->tile + (uint32_t)(ty >> 3) * tw * step : (uint32_t)s->tile + (uint32_t)(ty >> 3) * 32;
+                      const int iy = ty & 7, hf = s->hflip;
+                      int lastTc = -1; uint32_t row4 = 0; const uint8_t *row8 = 0;
+                      for (int sx = sxs; sx < sxe; sx++) {
+                          const int tx = hf ? w - 1 - sx : sx, tc = tx >> 3;
+                          if (tc != lastTc) {
+                              lastTc = tc; uint32_t tn = (rowTile + (uint32_t)tc * step) & 0x3FF;
+                              if (bpp8) row8 = vt + tn * 32 + iy * 8; else row4 = *(const uint32_t *)(vt + tn * 32 + iy * 4);
+                          }
+                          uint32_t c = bpp8 ? row8[tx & 7] : (row4 >> ((tx & 7) * 4)) & 15;
+                          if (!c) continue;
+                          const int x = ox + sx;
+                          if (mode == 2) { objwin[x] = 1; continue; }
+                          if (p >= prio[x]) continue;
+                          col[x] = (bpp8 ? palO[c] : pal4[c]) & 0x7FFF; prio[x] = (uint8_t)p; semi[x] = (mode == 1); if (mode == 1) g_anySemi = 1;
+                      }
+                  } else {
+                      const int32_t pa = s->pa, pbb = s->pb, pc = s->pc, pd = s->pd;
+                      for (int sx = sxs; sx < sxe; sx++) {
+                          const int dx = sx - bw / 2, dy = ly - s->bh / 2;
+                          const int tx = ((pa * dx + pbb * dy) >> 8) + w / 2, ty = ((pc * dx + pd * dy) >> 8) + h / 2;
+                          if (tx < 0 || ty < 0 || tx >= w || ty >= h) continue;
+                          uint32_t tn = oneD ? (uint32_t)s->tile + (uint32_t)((ty >> 3) * tw + (tx >> 3)) * step : (uint32_t)s->tile + (uint32_t)(ty >> 3) * 32 + (uint32_t)(tx >> 3) * step;
+                          const uint8_t *a = vt + (tn & 0x3FF) * 32; uint32_t c;
+                          if (bpp8) c = a[(ty & 7) * 8 + (tx & 7)]; else c = (a[(ty & 7) * 4 + ((tx & 7) >> 1)] >> ((tx & 1) * 4)) & 15;
+                          if (!c) continue;
+                          const int x = ox + sx;
+                          if (mode == 2) { objwin[x] = 1; continue; }
+                          if (p >= prio[x]) continue;
+                          col[x] = (bpp8 ? palO[c] : pal4[c]) & 0x7FFF; prio[x] = (uint8_t)p; semi[x] = (mode == 1); if (mode == 1) g_anySemi = 1;
+                      }
+                  }
+              }
+          }
+
+          #else
+          /* obj line: color | prio<<16 | flags (bit24 semi-transparent) ; objwin mask separately */
           static void obj_line(int y, int disp, uint32_t *col, uint8_t *prio, uint8_t *semi, uint8_t *objwin) {
               for (int x = 0; x < GBA_W; x++) { col[x] = TRANSP; prio[x] = 4; semi[x] = 0; objwin[x] = 0; }
               int oneD = (disp >> 6) & 1; uint32_t tbase = VRAM_BASE + 0x10000; int bitmapMode = (disp & 7) >= 3;
@@ -425,6 +545,8 @@ jobs:
                   }
               }
           }
+
+          #endif
 
           static inline uint32_t blend(uint32_t a, uint32_t b, int eva, int evb) {
               int r = ((a & 31) * eva + (b & 31) * evb) >> 4, g = (((a >> 5) & 31) * eva + ((b >> 5) & 31) * evb) >> 4, bl = (((a >> 10) & 31) * eva + ((b >> 10) & 31) * evb) >> 4;
@@ -671,7 +793,7 @@ jobs:
 
           TARGET = WL4
           PSP_OPT ?= -O2
-          OBJS = psp_main.o core.o $(PORT)/hal/hal.o $(PORT)/hal/ppu.o $(PORT)/hal/bios.o $(PORT)/hal/memmap.o \
+          OBJS = psp_main.o gpu_psp.o core.o $(PORT)/hal/hal.o $(PORT)/hal/ppu.o $(PORT)/hal/gpu_plan.o $(PORT)/hal/bios.o $(PORT)/hal/memmap.o \
                  $(W2C)/wl4.o $(W2C)/stubs.o $(RT_SRCS:%.c=$(W2C)/%.o)
 
           INCDIR = $(W2C) $(PORT)/hal $(PORT)/psp
@@ -703,6 +825,7 @@ jobs:
               void     (*save_sram)(const uint8_t *sram64k);
               void     (*quit)(void);                                         /* never returns */
               void     (*fatal)(const char *msg);                             /* never returns */
+              void     (*log)(const char *msg);                               /* optional (may be NULL) */
           } Wl4Plat;
           int      wl4_core_init(void);              /* allocate the memory map; 0 = ok */
           uint8_t *wl4_core_rom_buffer(void);        /* read the ROM (WL4_ROM_SIZE bytes) here before wl4_core_run */
@@ -721,7 +844,10 @@ jobs:
           static w2c_wl4 g_inst;
           static struct w2c_env g_env;
           static const Wl4Plat *P;
-          static uint64_t g_tStart; static unsigned g_frames; static int g_skipMode;
+          static uint64_t g_tStart; static unsigned g_frames;
+          static int g_skipLvl;                       /* render 1 of (lvl+1) frames; 0 = every frame */
+          static int32_t g_ema;                       /* moving average of emulation time per frame, us */
+          static uint32_t g_sumR, g_nR, g_sumS, g_nS;   /* perf log: frames with / without PPU work */
           static uint8_t g_saved[GBA_SRAM_SIZE]; static int g_dirty;
 
           int wl4_core_init(void) { return wl4_memmap_init(WL4_STATIC_END - 0x0A000000u + 0x10000u, WL4_ROM_IMAGE_ADDR - 0x0A000000u); }
@@ -764,14 +890,24 @@ jobs:
 
           static void cb_frame(void) {
               uint32_t work = (uint32_t)(P->now_us() - g_tStart);
-              int rendered = !g_hal_skip_render;
+              int rendered = !g_hal_skip_render || g_hal_gpu_done;
               g_frames++;
-              if (rendered) { if (!g_skipMode && work > 16000) g_skipMode = 1; else if (g_skipMode && work < 11000) g_skipMode = 0; }
+              { int32_t w = work > 100000u ? 100000 : (int32_t)work; g_ema = g_ema ? g_ema + (w - g_ema) / 8 : w; }
+              if (rendered) { g_sumR += work > 100000u ? 100000u : work; g_nR++; } else { g_sumS += work > 100000u ? 100000u : work; g_nS++; }
+              if ((g_frames & 15) == 0) {                          /* keep the average emulation time under one 60 Hz frame */
+                  if (g_ema > 15500 && g_skipLvl < 3) g_skipLvl++;
+                  else if (g_ema < 9500 && g_skipLvl > 0) g_skipLvl--;
+              }
+              if ((g_frames % 600) == 0 && P->log) {
+                  char m[160]; snprintf(m, sizeof m, "perf: frames=%u lvl=%d ema=%dus render=%uus(n=%u) skip=%uus(n=%u)", g_frames, g_skipLvl, (int)g_ema,
+                                        g_nR ? g_sumR / g_nR : 0, g_nR, g_nS ? g_sumS / g_nS : 0, g_nS);
+                  P->log(m); g_sumR = g_nR = g_sumS = g_nS = 0;
+              }
               if (P->poll_keys) hal_set_keys(P->poll_keys());
               P->present(hal_framebuffer(), rendered);
               if ((g_frames & 63) == 0) flush_save(0);
               if (P->exit_requested()) { flush_save(1); P->quit(); }
-              g_hal_skip_render = g_skipMode ? (int)(g_frames & 1) : 0;
+              g_hal_skip_render = g_skipLvl ? (int)((g_frames % (unsigned)(g_skipLvl + 1)) != 0) : 0;
               g_tStart = P->now_us();
           }
 
@@ -790,6 +926,267 @@ jobs:
               P->fatal("AgbMain returned");
           }
           WL4EOF
+          cat > port/hal/gpu_plan.h <<'WL4EOF'
+          /* GPU-assisted PPU: turns one simple GBA frame (mode 0, text BGs + regular sprites, no window / blend / HBlank tricks)
+           * into a list of textured quads.  Tiles are expanded once into 8-bit indexed atlases; the PSP GE draws them through
+           * a CLUT (bank = CLUT start offset), index 0 is transparent via alpha test.  Anything else falls back to ppu.c. */
+          #ifndef WL4_GPU_PLAN_H
+          #define WL4_GPU_PLAN_H
+          #include <stdint.h>
+          #define GPU_MAXQ 4096
+          #define GPU_MAXB 512
+          enum { GPU_TEX4 = 0, GPU_TEX8 = 1, GPU_TEX8O = 2 };              /* atlas ids */
+          enum { GPU_CLUT_BG4 = 0, GPU_CLUT_BG8 = 1, GPU_CLUT_OBJ4 = 2, GPU_CLUT_OBJ8 = 3 };
+          typedef struct { int16_t x0, y0, x1, y1, u0, v0, u1, v1; } GpuQuad;       /* GBA pixels (clipped to 240x160); texels (u0>u1 = h-flip) */
+          typedef struct { uint8_t tex, clut, bank; uint16_t first, count; } GpuBatch;
+          typedef struct { int nq, nb; uint16_t backdrop; GpuQuad q[GPU_MAXQ]; GpuBatch b[GPU_MAXB]; } GpuPlan;
+          extern GpuPlan g_gpuPlan;
+          extern uint16_t g_gpuClut[5][256];                                 /* 5551, alpha 0 for transparent indices; row 4 = padding (CLUT loads read 1 KB) */
+          extern uint8_t g_gpuAtlas4[512 * 512], g_gpuAtlas8[512 * 128], g_gpuAtlas8o[512 * 128];
+          extern int g_gpuAtlasDirty[3];                                      /* set when the atlas changed; the platform clears it after cache writeback */
+          extern unsigned g_gpuStat[10];                                      /* 0 = gpu frames, 1.. = fallback reasons */
+          int gpu_plan_build(void);                                           /* 1 = eligible, plan + atlases + CLUTs are ready */
+          #endif
+          WL4EOF
+          cat > port/hal/gpu_plan.c <<'WL4EOF'
+          #ifdef WL4_MEMMAP
+          #include "hal.h"
+          #include "gpu_plan.h"
+          #include <string.h>
+
+          GpuPlan g_gpuPlan;
+          uint16_t g_gpuClut[5][256] __attribute__((aligned(64)));
+          uint8_t g_gpuAtlas4[512 * 512] __attribute__((aligned(64)));
+          uint8_t g_gpuAtlas8[512 * 128] __attribute__((aligned(64)));
+          uint8_t g_gpuAtlas8o[512 * 128] __attribute__((aligned(64)));
+          int g_gpuAtlasDirty[3];
+          unsigned g_gpuStat[10];          /* 0 gpu, 1 mode!=0/blank, 2 window, 3 blend, 4 stat irq, 5 hblank dma, 6 sprite type, 7 too many quads */
+
+          static uint8_t sh4[0x18000], sh8[0x10000], sh8o[0x8000 + 64];
+          static int shInit4, shInit8, shInit8o;
+
+          /* ---- atlases: VRAM tiles -> 1 byte per pixel ---- */
+          static void exp4(int t) {
+              const uint32_t *s = (const uint32_t *)(g_vram + t * 32); uint8_t *d = g_gpuAtlas4 + ((t >> 6) * 8) * 512 + (t & 63) * 8;
+              for (int r = 0; r < 8; r++, d += 512) { uint32_t w = s[r]; for (int k = 0; k < 8; k++) d[k] = (uint8_t)((w >> (k * 4)) & 15); }
+          }
+          static void exp8(uint8_t *atlas, const uint8_t *src, int t) {
+              uint8_t *d = atlas + ((t >> 6) * 8) * 512 + (t & 63) * 8;
+              for (int r = 0; r < 8; r++, d += 512) memcpy(d, src + r * 8, 8);
+          }
+          static void upd4(void) {
+              for (int t = 0; t < 0x18000 / 32; t++) {
+                  const uint32_t *s = (const uint32_t *)(g_vram + t * 32); uint32_t *h = (uint32_t *)(sh4 + t * 32);
+                  if (shInit4 && s[0] == h[0] && s[1] == h[1] && s[2] == h[2] && s[3] == h[3] && s[4] == h[4] && s[5] == h[5] && s[6] == h[6] && s[7] == h[7]) continue;
+                  memcpy(h, s, 32); exp4(t); g_gpuAtlasDirty[GPU_TEX4] = 1;
+              }
+              shInit4 = 1;
+          }
+          static void upd8(void) {
+              for (int t = 0; t < 1024; t++) {
+                  const uint8_t *s = g_vram + t * 64; uint8_t *h = sh8 + t * 64;
+                  if (shInit8 && !memcmp(s, h, 64)) continue;
+                  memcpy(h, s, 64); exp8(g_gpuAtlas8, s, t); g_gpuAtlasDirty[GPU_TEX8] = 1;
+              }
+              shInit8 = 1;
+          }
+          static void upd8o(void) {                       /* 8bpp OBJ tile n lives at 0x10000 + n*32 and is 64 bytes long (tiles overlap) */
+              static uint8_t dirty[1024];
+              for (int n = 0; n < 1024; n++) dirty[n] = !shInit8o || memcmp(g_vram + 0x10000 + n * 32, sh8o + n * 32, 64) != 0;
+              memcpy(sh8o, g_vram + 0x10000, 0x8000 + 32);
+              for (int n = 0; n < 1024; n++) if (dirty[n]) { exp8(g_gpuAtlas8o, g_vram + 0x10000 + n * 32, n); g_gpuAtlasDirty[GPU_TEX8O] = 1; }
+              shInit8o = 1;
+          }
+
+          static void build_clut(void) {
+              const uint16_t *pal = (const uint16_t *)g_pal;
+              for (int i = 0; i < 256; i++) {
+                  uint16_t bg = (uint16_t)((pal[i] & 0x7FFF) | 0x8000), ob = (uint16_t)((pal[256 + i] & 0x7FFF) | 0x8000);
+                  g_gpuClut[GPU_CLUT_BG4][i] = (i & 15) ? bg : 0;  g_gpuClut[GPU_CLUT_OBJ4][i] = (i & 15) ? ob : 0;
+                  g_gpuClut[GPU_CLUT_BG8][i] = i ? bg : 0;         g_gpuClut[GPU_CLUT_OBJ8][i] = i ? ob : 0;
+              }
+          }
+
+          /* ---- plan ---- */
+          static GpuPlan *P;
+          static int overflow;
+          static void batch(int tex, int clut, int bank) {
+              if (P->nb) { GpuBatch *l = &P->b[P->nb - 1]; if (l->tex == tex && l->clut == clut && l->bank == bank && l->first + l->count == P->nq) return; }
+              if (P->nb >= GPU_MAXB) { overflow = 1; return; }
+              GpuBatch *b = &P->b[P->nb++]; b->tex = (uint8_t)tex; b->clut = (uint8_t)clut; b->bank = (uint8_t)bank; b->first = (uint16_t)P->nq; b->count = 0;
+          }
+          /* one 8x8 tile at screen (x0,y0); (u,v) = its origin in the atlas */
+          static void tile(int x0, int y0, int u, int v, int hf, int vf) {
+              int cx0 = x0 < 0 ? 0 : x0, cy0 = y0 < 0 ? 0 : y0, cx1 = x0 + 8 > GBA_W ? GBA_W : x0 + 8, cy1 = y0 + 8 > GBA_H ? GBA_H : y0 + 8;
+              if (cx0 >= cx1 || cy0 >= cy1) return;
+              if (P->nq >= GPU_MAXQ || !P->nb) { overflow = 1; return; }
+              int a = cx0 - x0, b = cx1 - x0, c = cy0 - y0, d = cy1 - y0;
+              GpuQuad *q = &P->q[P->nq++]; P->b[P->nb - 1].count++;
+              q->x0 = (int16_t)cx0; q->y0 = (int16_t)cy0; q->x1 = (int16_t)cx1; q->y1 = (int16_t)cy1;
+              if (!hf) { q->u0 = (int16_t)(u + a); q->u1 = (int16_t)(u + b); } else { q->u0 = (int16_t)(u + 8 - a); q->u1 = (int16_t)(u + 8 - b); }
+              if (!vf) { q->v0 = (int16_t)(v + c); q->v1 = (int16_t)(v + d); } else { q->v0 = (int16_t)(v + 8 - c); q->v1 = (int16_t)(v + 8 - d); }
+          }
+
+          static void bg_layer(int n, int *used8) {
+              const uint16_t cnt = rd16(IO_BG0CNT + n * 2);
+              const uint32_t cbase = ((cnt >> 2) & 3) * 0x4000, sbase = ((cnt >> 8) & 0x1F) * 0x800;
+              const int bpp8 = (cnt >> 7) & 1, size = cnt >> 14;
+              const int hofs = rd16(IO_BG0HOFS + n * 4) & 0x1FF, vofs = rd16(IO_BG0HOFS + n * 4 + 2) & 0x1FF;
+              const int wm = ((size & 1) ? 511 : 255) >> 3, hm = ((size & 2) ? 511 : 255) >> 3;
+              static uint16_t cell[21 * 31]; uint32_t banks = 0;
+              for (int ry = 0; ry < 21; ry++) {
+                  const int ty = ((vofs >> 3) + ry) & hm;
+                  for (int rx = 0; rx < 31; rx++) {
+                      const int tx = ((hofs >> 3) + rx) & wm;
+                      const int sb = (size == 1) ? (tx >> 5) : (size == 2) ? (ty >> 5) : (size == 3) ? ((tx >> 5) + ((ty >> 5) << 1)) : 0;
+                      const uint16_t e = *(const uint16_t *)(g_vram + sbase + sb * 0x800 + (((ty & 31) << 5) + (tx & 31)) * 2);
+                      cell[ry * 31 + rx] = e; banks |= 1u << (bpp8 ? 0 : (e >> 12));
+                  }
+              }
+              if (bpp8) *used8 = 1;
+              for (int bank = 0; bank < 16; bank++) {
+                  if (!(banks & (1u << bank))) continue;
+                  int started = 0;
+                  for (int ry = 0; ry < 21; ry++) for (int rx = 0; rx < 31; rx++) {
+                      const uint16_t e = cell[ry * 31 + rx];
+                      if (!bpp8 && (e >> 12) != bank) continue;
+                      const uint32_t g = bpp8 ? (cbase >> 6) + (e & 0x3FF) : (cbase >> 5) + (e & 0x3FF);
+                      if (g * (bpp8 ? 64u : 32u) >= 0x10000) continue;                 /* BG tiles cannot reach the OBJ area */
+                      const int x0 = rx * 8 - (hofs & 7), y0 = ry * 8 - (vofs & 7);
+                      if (x0 >= GBA_W || y0 >= GBA_H) continue;
+                      if (!started) { batch(bpp8 ? GPU_TEX8 : GPU_TEX4, bpp8 ? GPU_CLUT_BG8 : GPU_CLUT_BG4, bpp8 ? 0 : bank); started = 1; }
+                      tile(x0, y0, (int)(g & 63) * 8, (int)(g >> 6) * 8, (e & 0x400) != 0, (e & 0x800) != 0);
+                  }
+              }
+          }
+
+          static const uint8_t OW[3][4] = {{8,16,32,64},{16,32,32,64},{8,8,16,32}};
+          static const uint8_t OH[3][4] = {{8,16,32,64},{8,8,16,32},{16,32,32,64}};
+          typedef struct { int ox, oy, w, h, bpp8, tile, p, pb4, hf, vf; } Sp;
+          /* returns 0 = skip sprite, 1 = ok, -1 = unsupported (affine / semi-transparent / OBJ window) */
+          static int sprite_decode(int i, int oneDunused, Sp *s) {
+              (void)oneDunused;
+              const uint16_t *o = (const uint16_t *)(g_oam + i * 8); const uint16_t a0 = o[0], a1 = o[1], a2 = o[2];
+              const int affine = (a0 >> 8) & 1;
+              if (!affine && ((a0 >> 9) & 1)) return 0;
+              const int mode = (a0 >> 10) & 3; if (mode == 3) return 0;
+              const int shape = a0 >> 14, sz = a1 >> 14; if (shape == 3) return 0;
+              const int dbl = affine && ((a0 >> 9) & 1);
+              const int w = OW[shape][sz], h = OH[shape][sz], bw = dbl ? w * 2 : w, bh = dbl ? h * 2 : h;
+              int ox = a1 & 0x1FF; if (ox >= 256) ox -= 512;
+              const int oy = a0 & 0xFF;
+              if (ox >= GBA_W || ox + bw <= 0) return 0;
+              if (!(oy < GBA_H || oy + bh > 256)) return 0;                              /* never intersects the screen */
+              if (affine || mode != 0) return -1;
+              s->ox = ox; s->oy = (oy + bh > 256) ? oy - 256 : oy; s->w = w; s->h = h; s->bpp8 = (a0 >> 13) & 1; s->tile = a2 & 0x3FF;
+              s->p = (a2 >> 10) & 3; s->pb4 = a2 >> 12; s->hf = (a1 & 0x1000) != 0; s->vf = (a1 & 0x2000) != 0;
+              return 1;
+          }
+          static void sprite_quads(const Sp *s, int oneD) {
+              const int tw = s->w >> 3, th = s->h >> 3, step = s->bpp8 ? 2 : 1;
+              batch(s->bpp8 ? GPU_TEX8O : GPU_TEX4, s->bpp8 ? GPU_CLUT_OBJ8 : GPU_CLUT_OBJ4, s->bpp8 ? 0 : s->pb4);
+              for (int ty = 0; ty < th; ty++) for (int tx = 0; tx < tw; tx++) {
+                  const int sr = s->vf ? th - 1 - ty : ty, sc = s->hf ? tw - 1 - tx : tx;
+                  const uint32_t tn = (oneD ? (uint32_t)s->tile + (uint32_t)(sr * tw + sc) * step : (uint32_t)s->tile + (uint32_t)sr * 32 + (uint32_t)sc * step) & 0x3FF;
+                  const int g = s->bpp8 ? (int)tn : 2048 + (int)tn;
+                  tile(s->ox + tx * 8, s->oy + ty * 8, (g & 63) * 8, (g >> 6) * 8, s->hf, s->vf);
+              }
+          }
+
+          int gpu_plan_build(void) {
+              const uint16_t disp = rd16(IO_DISPCNT);
+              if ((disp & 7) != 0 || (disp & 0x80)) { g_gpuStat[1]++; return 0; }
+              if (disp & 0xE000) { g_gpuStat[2]++; return 0; }
+              if ((rd16(IO_BLDCNT) >> 6) & 3) { g_gpuStat[3]++; return 0; }
+              if (rd16(IO_DISPSTAT) & 0x30) { g_gpuStat[4]++; return 0; }
+              if (hal_hdma_active()) { g_gpuStat[5]++; return 0; }
+              const int oneD = (disp >> 6) & 1, objOn = (disp >> 12) & 1;
+              static Sp sp[128]; static uint8_t spi[128]; int nsp = 0, any8o = 0;
+              if (objOn) for (int i = 0; i < 128; i++) {
+                  int r = sprite_decode(i, oneD, &sp[nsp]); if (r < 0) { g_gpuStat[6]++; return 0; }
+                  if (r) { spi[nsp] = (uint8_t)i; if (sp[nsp].bpp8) any8o = 1; nsp++; }
+              }
+              P = &g_gpuPlan; P->nq = P->nb = 0; overflow = 0;
+              int used8 = 0;
+              for (int p = 3; p >= 0; p--) {
+                  for (int n = 3; n >= 0; n--) if (((disp >> (8 + n)) & 1) && (rd16(IO_BG0CNT + n * 2) & 3) == p) bg_layer(n, &used8);
+                  for (int k = nsp - 1; k >= 0; k--) if (sp[k].p == p) sprite_quads(&sp[k], oneD);   /* lower OAM index ends up on top */
+                  if (overflow) { g_gpuStat[7]++; return 0; }
+              }
+              upd4(); if (used8) upd8(); if (any8o) upd8o();
+              build_clut();
+              P->backdrop = (uint16_t)(((const uint16_t *)g_pal)[0] & 0x7FFF);
+              g_gpuStat[0]++;
+              return 1;
+          }
+          #endif
+          WL4EOF
+          cat > port/psp/gpu_psp.c <<'WL4EOF'
+          /* PSP side of the GPU PPU: draws the quad plan from gpu_plan.c with the GE (T8 atlases + CLUT, alpha test for index 0). */
+          #include <pspkernel.h>
+          #include <pspdisplay.h>
+          #include <pspgu.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include "hal.h"
+          #include "gpu_plan.h"
+
+          typedef struct { int16_t u, v, x, y, z; } V16;
+          typedef struct { uint32_t c; float x, y, z; } VC;
+          static unsigned int __attribute__((aligned(16))) gl[49152];
+
+          /* GBA 240x160 -> 408x272 centred on the 480x272 screen */
+          #define SX(x) (36 + ((x) * 17) / 10)
+          #define SY(y) (((y) * 17) / 10)
+
+          static int gpu_begin(void) { return gpu_plan_build(); }
+          static void gpu_submit(void) {
+              const GpuPlan *P = &g_gpuPlan;
+              static uint8_t *const atl[3] = { g_gpuAtlas4, g_gpuAtlas8, g_gpuAtlas8o };
+              static const int szb[3] = { 512 * 512, 512 * 128, 512 * 128 }, th[3] = { 512, 128, 128 };
+              for (int i = 0; i < 3; i++) if (g_gpuAtlasDirty[i]) { sceKernelDcacheWritebackRange(atl[i], szb[i]); g_gpuAtlasDirty[i] = 0; }
+              sceKernelDcacheWritebackRange(g_gpuClut, sizeof g_gpuClut);
+
+              sceGuStart(GU_DIRECT, gl);
+              sceGuClearColor(0xFF000000); sceGuClear(GU_COLOR_BUFFER_BIT);
+              { /* backdrop colour inside the game rectangle */
+                  const uint32_t b = P->backdrop, r = b & 31, g = (b >> 5) & 31, bl = (b >> 10) & 31;
+                  const uint32_t abgr = 0xFF000000u | ((bl << 3 | bl >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (r << 3 | r >> 2);
+                  VC *c = (VC *)sceGuGetMemory(2 * sizeof(VC));
+                  c[0].c = abgr; c[0].x = 36; c[0].y = 0; c[0].z = 0; c[1].c = abgr; c[1].x = 444; c[1].y = 272; c[1].z = 0;
+                  sceGuDisable(GU_TEXTURE_2D); sceGuDisable(GU_ALPHA_TEST);
+                  sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, c);
+              }
+              if (P->nq) {
+                  V16 *v = (V16 *)sceGuGetMemory((unsigned)(P->nq * 2) * sizeof(V16));
+                  for (int i = 0; i < P->nq; i++) {
+                      const GpuQuad *q = &P->q[i];
+                      v[2 * i].u = q->u0; v[2 * i].v = q->v0; v[2 * i].x = (int16_t)SX(q->x0); v[2 * i].y = (int16_t)SY(q->y0); v[2 * i].z = 0;
+                      v[2 * i + 1].u = q->u1; v[2 * i + 1].v = q->v1; v[2 * i + 1].x = (int16_t)SX(q->x1); v[2 * i + 1].y = (int16_t)SY(q->y1); v[2 * i + 1].z = 0;
+                  }
+                  sceGuEnable(GU_TEXTURE_2D); sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+                  sceGuTexFilter(GU_NEAREST, GU_NEAREST); sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+                  sceGuEnable(GU_ALPHA_TEST); sceGuAlphaFunc(GU_GREATER, 0, 0xFF);
+                  int curTex = -1, curClut = -1;
+                  for (int i = 0; i < P->nb; i++) {
+                      const GpuBatch *b = &P->b[i];
+                      if (b->tex != curTex) { curTex = b->tex; sceGuTexMode(GU_PSM_T8, 0, 0, 0); sceGuTexImage(0, 512, th[curTex], 512, atl[curTex]); }
+                      sceGuClutMode(GU_PSM_5551, 0, 0xFF, b->bank);          /* start offset = palette bank * 16 */
+                      if (b->clut != curClut) { curClut = b->clut; sceGuClutLoad(32, g_gpuClut[curClut]); }
+                      sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2 * b->count, 0, v + 2 * b->first);
+                  }
+                  sceGuDisable(GU_ALPHA_TEST);
+              }
+              sceGuFinish(); sceGuSync(0, 0);
+          }
+          static const HalGpu g_ops = { gpu_begin, gpu_submit };
+          void gpu_psp_install(void) { hal_set_gpu(&g_ops); }
+          void gpu_psp_log_stats(void (*lg)(const char *)) {
+              char m[160]; snprintf(m, sizeof m, "gpu: frames=%u fallback: mode/blank=%u window=%u blend=%u stat-irq=%u hblank-dma=%u sprite=%u quads=%u",
+                                    g_gpuStat[0], g_gpuStat[1], g_gpuStat[2], g_gpuStat[3], g_gpuStat[4], g_gpuStat[5], g_gpuStat[6], g_gpuStat[7]);
+              lg(m); memset(g_gpuStat, 0, sizeof g_gpuStat);
+          }
+          WL4EOF
           cat > port/psp/psp_main.c <<'WL4EOF'
           /* PSP front end: video (GU), input, audio, save files, exit callback. */
           #include <pspkernel.h>
@@ -804,6 +1201,9 @@ jobs:
           #include <stdlib.h>
           #include "layout.h"
           #include "core.h"
+          void gpu_psp_install(void);                         /* gpu_psp.c */
+          void gpu_psp_log_stats(void (*lg)(const char *));
+          extern volatile int g_hal_gpu_done;                 /* hal.c: this frame was drawn by the GE */
 
           PSP_MODULE_INFO("WL4", PSP_MODULE_USER, 1, 0);
           PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
@@ -833,6 +1233,8 @@ jobs:
               sceGuFinish(); sceGuSync(0, 0); sceDisplayWaitVblankStart(); sceGuDisplay(GU_TRUE);
           }
           static void plat_present(const uint32_t *fb, int rendered) {
+              static unsigned n; if (++n % 600 == 0) gpu_psp_log_stats(logf_);
+              if (g_hal_gpu_done) { g_hal_gpu_done = 0; sceDisplayWaitVblankStart(); sceGuSwapBuffers(); return; }   /* already drawn by the GE */
               if (rendered) {
                   for (int y = 0; y < 160; y++) {
                       uint32_t *d = g_tex + y * 256; const uint32_t *s = fb + y * 240;
@@ -944,9 +1346,11 @@ jobs:
 
               sceCtrlSetSamplingCycle(0); sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
               video_init();
+              { char q[300]; snprintf(q, sizeof q, "%snogpu.txt", g_dir); FILE *nf = fopen(q, "rb");
+                if (nf) { fclose(nf); logf_("gpu: disabled by nogpu.txt"); } else { gpu_psp_install(); logf_("gpu: PPU acceleration on"); } }
               { int t = sceKernelCreateThread("audio", audio_thread, 0x12, 0x4000, 0, NULL); if (t >= 0) sceKernelStartThread(t, 0, NULL); }
               logf_("start");
-              static const Wl4Plat plat = { plat_present, plat_keys, plat_now, plat_exit_req, plat_audio_push, plat_save, plat_quit, plat_fatal };
+              static const Wl4Plat plat = { plat_present, plat_keys, plat_now, plat_exit_req, plat_audio_push, plat_save, plat_quit, plat_fatal, logf_ };
               wl4_core_run(&plat, save);
               return 0;
           }
