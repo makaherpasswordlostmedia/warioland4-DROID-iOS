@@ -5,6 +5,7 @@ name: Build Wario Land 4 Android x86 port
 # the extra 32-bit host test and the x86 checks differ.
 #
 # Single-file port: drop this .yml into .github/workflows/ - nothing else to copy.
+# Targets Android 4.4.4 (API 19) and newer.
 #
 # ROM: the build needs YOUR OWN US ROM (md5 5fe47355a33e3fabec2a1607af88a404).  Either
 #   - commit baserom_us.gba to a PRIVATE repo, or
@@ -46,7 +47,7 @@ env:
   WASI_SDK_VERSION: "24"
   WABT_VERSION: "1.0.36"
   ROM_MD5_US: "5fe47355a33e3fabec2a1607af88a404"
-  NDK_VERSION: "26.3.11579264"
+  NDK_VERSION: "25.2.9519653"   # r25 = last NDK that supports minSdk 19 (Android 4.4.4)
 
 jobs:
   build:
@@ -63,32 +64,159 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Everything the x86 port needs is applied here, so this .yml is the only file to add to the repo.
-      - name: Apply x86 patches (gradle ABIs, CMake flag, keyboard keys)
+      # Everything the port needs is applied here, so this .yml is the only file to add to the repo:
+      # Android 4.4.4 (minSdk 19, NDK r25, OpenSL ES audio, no AndroidX, clock_nanosleep fallback) + x86 ABIs/keys.
+      - name: Apply patches (Android 4.4 / API 19 support, x86 ABIs, keyboard keys)
         run: |
           python3 - <<'PY'
-          def edit(path, old, new):
-              s = open(path).read()
-              if new in s:
+          import os
+
+          def rd(p):
+              with open(p, encoding="utf-8") as f: return f.read()
+          def wr(p, s):
+              with open(p, "w", encoding="utf-8", newline="\n") as f: f.write(s)
+
+          def edit(path, old, new, marker=None):
+              s = rd(path)
+              if (marker or new) in s:
                   print("already patched:", path); return
-              assert s.count(old) == 1, "pattern not found in " + path
-              open(path, "w").write(s.replace(old, new))
+              assert s.count(old) == 1, "pattern not found in " + path + ": " + old[:60]
+              wr(path, s.replace(old, new)); print("patched:", path)
 
-          edit("android/app/build.gradle.kts",
-               '?: "arm64-v8a,x86_64").split(",")',
-               '?: "arm64-v8a,x86_64,x86").split(",").map { it.trim() }.filter { it.isNotEmpty() }')
+          # ---------- Gradle: Android 4.4.4 (API 19), NDK r25, no AndroidX, x86 ABIs ----------
+          G = "android/app/build.gradle.kts"
+          edit(G, 'ndkVersion = "26.3.11579264"', 'ndkVersion = "25.2.9519653"   // r25 = last NDK that can target API 19')
+          edit(G, 'minSdk = 26;', 'minSdk = 19;')
+          edit(G, '?: "arm64-v8a,x86_64").split(",")',
+                  '?: "arm64-v8a,x86_64,x86").split(",").map { it.trim() }.filter { it.isNotEmpty() }')
+          edit(G, 'dependencies { implementation("androidx.appcompat:appcompat:1.7.0") }',
+                  '// no AndroidX: appcompat 1.7 needs minSdk 21')
 
+          wr("android/app/src/main/res/values/themes.xml",
+             '<resources><style name="Theme.WL4" parent="@android:style/Theme.Holo.NoActionBar">'
+             '<item name="android:windowFullscreen">true</item></style></resources>\n')
+
+          # ---------- CMake: OpenSL ES instead of AAudio, 32-bit x86 stack alignment ----------
           edit("android/app/src/main/cpp/CMakeLists.txt",
                "target_link_libraries(wl4 log m aaudio)",
-               "# 32-bit x86 only guarantees 4-byte stack alignment\n"
                "if(ANDROID_ABI STREQUAL \"x86\")\n  target_compile_options(wl4 PRIVATE -mstackrealign)\nendif()\n"
-               "target_link_libraries(wl4 log m aaudio)")
+               "target_link_libraries(wl4 log m OpenSLES)",
+               marker="OpenSLES")
 
-          edit("android/app/src/main/java/com/wl4/port/GameActivity.kt",
-               "KeyEvent.KEYCODE_ENTER -> Key.START",
+          # ---------- Kotlin: plain Activity, immersive mode, keyboard keys ----------
+          K = "android/app/src/main/java/com/wl4/port/"
+          for f in ("GameActivity.kt", "MainActivity.kt"):
+              s = rd(K + f)
+              if "AppCompatActivity" in s:
+                  s = s.replace("import androidx.appcompat.app.AppCompatActivity\n", "import android.app.Activity\n").replace("AppCompatActivity()", "Activity()")
+                  wr(K + f, s); print("patched:", K + f)
+          edit(K + "GameActivity.kt", "import android.os.Bundle\n", "import android.os.Build\nimport android.os.Bundle\n")
+          edit(K + "GameActivity.kt", "KeyEvent.KEYCODE_ENTER -> Key.START",
                "KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> Key.START\n"
                "        KeyEvent.KEYCODE_A -> Key.L; KeyEvent.KEYCODE_S -> Key.R\n"
-               "        KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_SHIFT_RIGHT -> Key.SELECT")
+               "        KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_SHIFT_RIGHT -> Key.SELECT",
+               marker="KEYCODE_NUMPAD_ENTER")
+          edit(K + "GameActivity.kt",
+               "    override fun onResume() { super.onResume(); Native.pause(false); view.start() }",
+               "    override fun onResume() { super.onResume(); Native.pause(false); view.start(); hideBars() }\n"
+               "    override fun onWindowFocusChanged(f: Boolean) { super.onWindowFocusChanged(f); if (f) hideBars() }\n"
+               "    @Suppress(\"DEPRECATION\")\n"
+               "    private fun hideBars() {   // immersive sticky exists since API 19\n"
+               "        if (Build.VERSION.SDK_INT >= 19) window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or\n"
+               "            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY\n"
+               "    }",
+               marker="hideBars")
+
+          # ---------- host.c: clock_nanosleep needs API 21 ----------
+          H = "port/host/host.c"
+          edit(H, "#include <unistd.h>\n", "#include <unistd.h>\n#include <errno.h>\n", marker="#include <errno.h>")
+          edit(H, "static void cb_frame(void) {",
+          """/* clock_nanosleep() exists in bionic only since API 21; Android 4.4 needs the relative nanosleep() form */
+          static void sleep_until(const struct timespec *t) {
+              struct timespec now, d; clock_gettime(CLOCK_MONOTONIC, &now);
+              d.tv_sec = t->tv_sec - now.tv_sec; d.tv_nsec = t->tv_nsec - now.tv_nsec;
+              if (d.tv_nsec < 0) { d.tv_nsec += 1000000000L; d.tv_sec--; }
+              if (d.tv_sec < 0) return;
+              while (nanosleep(&d, &d) == -1 && errno == EINTR) {}
+          }
+          static void cb_frame(void) {""", marker="sleep_until(const")
+          edit(H, "    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);", "    sleep_until(&next);")
+
+          # ---------- audio.c: AAudio (API 26) -> OpenSL ES (API 9) ----------
+          A = "port/host/audio.c"
+          s = rd(A)
+          if "OpenSL ES buffer-queue" in s:
+              print("already patched:", A)
+          else:
+              s = s.replace("#ifdef __ANDROID__\n#include <aaudio/AAudio.h>\n#endif\n", "", 1)
+              a = s.index("#ifdef __ANDROID__\n#include <android/log.h>")
+              b = s.index("#else\nvoid wl4_audio_start(void) {}")
+              s = s[:a] + r'''#ifdef __ANDROID__
+          /* OpenSL ES buffer-queue output (API 9+).  AAudio needs API 26 and would stop the lib from loading on Android 4.4. */
+          #include <android/log.h>
+          #include <SLES/OpenSLES.h>
+          #include <SLES/OpenSLES_Android.h>
+
+          #define OUT_RATE   44100                         /* the one rate every Android audio HAL must support */
+          #define BUF_FRAMES 512                           /* ~11.6 ms per buffer */
+          #define NBUF       4
+
+          static SLObjectItf g_engineObj, g_mixObj, g_playerObj;
+          static SLPlayItf g_play;
+          static SLAndroidSimpleBufferQueueItf g_bq;
+          static int16_t g_buf[NBUF][BUF_FRAMES * 2];
+          static int g_cur;
+
+          /* OpenSL audio thread: the oldest queued buffer has finished playing -> refill it and queue it again. */
+          static void bq_cb(SLAndroidSimpleBufferQueueItf bq, void *ctx) {
+              (void)ctx;
+              int16_t *b = g_buf[g_cur]; g_cur = (g_cur + 1) % NBUF;
+              render(b, BUF_FRAMES, OUT_RATE);
+              (*bq)->Enqueue(bq, b, sizeof g_buf[0]);
+          }
+          static void close_stream(void) {
+              if (g_play) (*g_play)->SetPlayState(g_play, SL_PLAYSTATE_STOPPED);
+              if (g_bq) (*g_bq)->Clear(g_bq);
+              if (g_playerObj) (*g_playerObj)->Destroy(g_playerObj);
+              if (g_mixObj) (*g_mixObj)->Destroy(g_mixObj);
+              if (g_engineObj) (*g_engineObj)->Destroy(g_engineObj);
+              g_playerObj = g_mixObj = g_engineObj = NULL; g_play = NULL; g_bq = NULL;
+          }
+          #define SL_CHECK(call, what) do { SLresult r_ = (call); if (r_ != SL_RESULT_SUCCESS) { \
+              fprintf(stderr, "wl4: audio: %s failed (0x%x)\n", what, (unsigned)r_); close_stream(); return; } } while (0)
+          static void open_stream(void) {
+              SLEngineItf eng;
+              SL_CHECK(slCreateEngine(&g_engineObj, 0, NULL, 0, NULL, NULL), "slCreateEngine");
+              SL_CHECK((*g_engineObj)->Realize(g_engineObj, SL_BOOLEAN_FALSE), "engine Realize");
+              SL_CHECK((*g_engineObj)->GetInterface(g_engineObj, SL_IID_ENGINE, &eng), "engine GetInterface");
+              SL_CHECK((*eng)->CreateOutputMix(eng, &g_mixObj, 0, NULL, NULL), "CreateOutputMix");
+              SL_CHECK((*g_mixObj)->Realize(g_mixObj, SL_BOOLEAN_FALSE), "mix Realize");
+
+              SLDataLocator_AndroidSimpleBufferQueue locBq = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, NBUF };
+              SLDataFormat_PCM fmt = { SL_DATAFORMAT_PCM, 2, SL_SAMPLINGRATE_44_1, SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16,
+                                       SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT, SL_BYTEORDER_LITTLEENDIAN };
+              SLDataSource src = { &locBq, &fmt };
+              SLDataLocator_OutputMix locOm = { SL_DATALOCATOR_OUTPUTMIX, g_mixObj };
+              SLDataSink snk = { &locOm, NULL };
+              const SLInterfaceID ids[1] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE };
+              const SLboolean req[1] = { SL_BOOLEAN_TRUE };
+              SL_CHECK((*eng)->CreateAudioPlayer(eng, &g_playerObj, &src, &snk, 1, ids, req), "CreateAudioPlayer");
+              SL_CHECK((*g_playerObj)->Realize(g_playerObj, SL_BOOLEAN_FALSE), "player Realize");
+              SL_CHECK((*g_playerObj)->GetInterface(g_playerObj, SL_IID_PLAY, &g_play), "player GetInterface(PLAY)");
+              SL_CHECK((*g_playerObj)->GetInterface(g_playerObj, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &g_bq), "player GetInterface(BQ)");
+              SL_CHECK((*g_bq)->RegisterCallback(g_bq, bq_cb, NULL), "RegisterCallback");
+
+              atomic_store(&g_flush, 1);
+              memset(g_buf, 0, sizeof g_buf); g_cur = 0;
+              for (int i = 0; i < NBUF; i++) SL_CHECK((*g_bq)->Enqueue(g_bq, g_buf[i], sizeof g_buf[0]), "initial Enqueue");
+              SL_CHECK((*g_play)->SetPlayState(g_play, SL_PLAYSTATE_PLAYING), "SetPlayState(PLAYING)");
+              fprintf(stderr, "wl4: audio: OpenSL ES %d Hz, %d frames/buffer x %d\n", OUT_RATE, BUF_FRAMES, NBUF);
+          }
+          void wl4_audio_start(void) { atomic_store(&g_w, 0); atomic_store(&g_r, 0); g_pos = 0; g_primed = 0; atomic_store(&g_paused, 0); open_stream(); }
+          void wl4_audio_stop(void) { close_stream(); }
+          void wl4_audio_poll(void) {}                     /* OpenSL ES has no route-change error callback */
+          ''' + s[b:]
+              wr(A, s); print("patched:", A)
           PY
           git diff --stat || true
 
