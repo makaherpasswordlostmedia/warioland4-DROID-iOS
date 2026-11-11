@@ -237,6 +237,50 @@ jobs:
         with:
           gradle-version: "8.7"
 
+      # ── wide-screen patch: stretch the 240x160 frame over the whole display (edits GameActivity.kt in place) ──
+      - name: Apply wide-screen (fill screen) patch
+        run: |
+          python3 - <<'PY'
+          p = "android/app/src/main/java/com/wl4/port/GameActivity.kt"
+          s = open(p, encoding="utf-8").read()
+          if "WL4_WIDESCREEN" in s:
+              print("already patched"); raise SystemExit(0)
+
+          def rep(old, new):
+              global s
+              assert s.count(old) == 1, "pattern not found exactly once: " + old[:60]
+              s = s.replace(old, new)
+
+          # 1) stretch flag
+          rep("    @Volatile private var go = false;",
+              "    // WL4_WIDESCREEN: true = fill the whole screen, false = original 3:2 letterbox\n"
+              "    @Volatile var stretch = true\n"
+              "    @Volatile private var go = false;")
+
+          # 2) draw the frame over the full surface
+          rep("                val s = minOf(width / 240f, height / 160f); val w = 240 * s; val h = 160 * s\n"
+              "                c.drawBitmap(bmp, null, RectF((width - w) / 2, (height - h) / 2, (width + w) / 2, (height + h) / 2), paint)",
+              "                if (stretch) {\n"
+              "                    c.drawBitmap(bmp, null, RectF(0f, 0f, width.toFloat(), height.toFloat()), paint)\n"
+              "                } else {\n"
+              "                    val s = minOf(width / 240f, height / 160f); val w = 240 * s; val h = 160 * s\n"
+              "                    c.drawBitmap(bmp, null, RectF((width - w) / 2, (height - h) / 2, (width + w) / 2, (height + h) / 2), paint)\n"
+              "                }")
+
+          # 3) immersive mode + draw under the notch
+          rep("        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)\n",
+              "        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)\n"
+              "        if (android.os.Build.VERSION.SDK_INT >= 28)\n"
+              "            window.attributes = window.attributes.apply { layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES }\n"
+              "        @Suppress(\"DEPRECATION\")\n"
+              "        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or\n"
+              "            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY\n")
+
+          open(p, "w", encoding="utf-8").write(s)
+          print("wide-screen patch applied")
+          PY
+          grep -n "stretch" android/app/src/main/java/com/wl4/port/GameActivity.kt
+
       - name: Build debug APK
         env:
           ABIS: ${{ inputs.abis }}
