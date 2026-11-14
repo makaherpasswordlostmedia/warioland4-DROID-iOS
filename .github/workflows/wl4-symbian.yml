@@ -1699,6 +1699,13 @@ jobs:
           #define ULLONG_MAX 18446744073709551615ULL
           #endif
           WL4_EOF
+          cat > symbian/shim/threads.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_THREADS_H
+          #define WL4_SHIM_THREADS_H
+          /* single-threaded runtime on this target: no TLS */
+          #define thread_local
+          #endif
+          WL4_EOF
           cat > symbian/shim/string.h <<'WL4_EOF'
           #ifndef WL4_SHIM_STRING_H
           #define WL4_SHIM_STRING_H
@@ -1735,19 +1742,22 @@ jobs:
 
 
           def proto(name):
-              m = re.search(r"([\w\s\*]*?)\b%s\s*\(([^)]*)\)\s*;" % name, hdr)
-              if not m:
-                  sys.exit("prototype of %s not found in wasm-rt.h" % name)
-              words = [t for t in m.group(1).split() if t not in ("extern", "static", "inline")]
-              ret = " ".join(words) or "void"
-              params = []
-              for p in m.group(2).split(","):
-                  p = p.strip()
-                  toks = re.findall(r"\w+|\*", p)
-                  if len(toks) >= 2 and re.match(r"\w+$", toks[-1]) and toks[-2] != "const":
-                      p = p[: p.rfind(toks[-1])].rstrip()
-                  params.append(p)
-              return ret, params
+              # skip doc-comment usage examples: the real declaration has a wasm_rt_memory_t* first parameter
+              for m in re.finditer(r"([^\n;{}]*?)\b%s\s*\(([^)]*)\)\s*;" % name, hdr):
+                  if "wasm_rt_memory_t" not in m.group(2).split(",")[0]:
+                      continue
+                  words = [t for t in m.group(1).replace("*", " * ").split() if t not in ("extern", "static", "inline", "*")]
+                  ret = " ".join(w for w in words if re.match(r"\w+$", w)) or "void"
+                  ret = ret.split()[-1] if ret.split()[-1] != "t" else ret
+                  params = []
+                  for q in m.group(2).split(","):
+                      q = q.strip()
+                      toks = re.findall(r"\w+|\*", q)
+                      if len(toks) >= 2 and re.match(r"\w+$", toks[-1]) and toks[-2] != "const":
+                          q = q[: q.rfind(toks[-1])].rstrip()
+                      params.append(q)
+                  return ret, params
+              sys.exit("declaration of %s not found in wasm-rt.h" % name)
 
 
           rA, pA = proto("wasm_rt_allocate_memory")
