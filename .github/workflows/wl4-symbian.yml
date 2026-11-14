@@ -1,0 +1,1849 @@
+name: Build Wario Land 4 Symbian^3 SIS
+
+# SELF-CONTAINED: this single file carries the whole Symbian port (shim, host, audio, Avkon app, mmp/pkg)
+# and writes it at build time. Drop it into .github/workflows/ of the decomp repo that already has port/.
+#
+# Pipeline
+#   job 1 (ubuntu):  ROM -> make extract -> portify -> wasm32 -> wasm2c  (same as wl4-android.yml)
+#   job 2 (macOS):   symbian3-toolchain (GCC 14.2 arm-none-symbianelf + Symbian^3 SDK, cached)
+#                    -> cross-compile the C core into wl4core.lib -> abld (Avkon app) -> signed .sisx
+#
+# ROM: needs YOUR OWN US ROM (md5 5fe47355a33e3fabec2a1607af88a404), secret WL4_ROM_ID (gdown) or a committed
+# baserom_us.gba in a PRIVATE repo. The .sisx embeds ROM-derived data, so public repos are refused by default.
+# On the phone the app also needs the ROM file itself: copy the same .gba to E:\wl4\ (any *.gba of 4-16 MB there).
+#
+# Memory model: the game addresses GBA memory at its real addresses (up to 0x0E010000). On Symbian that range is
+# reserved as a sparse RChunk and only the used regions are committed (EWRAM/IWRAM/VRAM/IO/ROM/data/SRAM).
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_public_repo:
+        description: "I understand the SIS embeds ROM-derived data and is downloadable from a public repo"
+        type: boolean
+        default: false
+      wabt_version:
+        description: "Override wabt version (blank = default)"
+        default: ""
+      wasm_opt:
+        description: "Clang -O level for the wasm32 compile (0/1/2)"
+        default: "2"
+      core_opt:
+        description: "GCC -O level for the ARM compile of the game core (1 = faster build, 2 = faster game)"
+        default: "1"
+      commit_mb:
+        description: "MB of wasm data/bss/stack committed at 0x0A000000 (raise if the game crashes on start)"
+        default: "48"
+
+env:
+  WASI_SDK_VERSION: "24"
+  WABT_VERSION: "1.0.36"
+  ROM_MD5_US: "5fe47355a33e3fabec2a1607af88a404"
+  TOOLCHAIN_REPO: fieldops-dev/symbian3-toolchain
+  TOOLCHAIN_REF: a96f917e6c8f02fe4f7c2186f8df760d3d9d832a
+  SYMBIAN_VOL: /Volumes/Symbian
+  GNUPOC_COMMIT: d3ddaf58c734ad3ab34dc60a012f9d4768a9ed3e
+  GCC4SYMBIAN_COMMIT: fe1b15a1c25716d5c515f12593080d58f14d4c3f
+
+jobs:
+  w2c:
+    name: ROM -> wasm -> wasm2c C
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - name: Refuse public repos unless overridden
+        if: ${{ github.event.repository.private == false && inputs.allow_public_repo != true }}
+        run: |
+          echo "::error::Public repo: the SIS embeds data extracted from your ROM. Rerun with allow_public_repo=true only if you accept that."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve tool versions
+        run: |
+          WABT_EFF="${{ inputs.wabt_version }}"
+          echo "WABT_EFF=${WABT_EFF:-${{ env.WABT_VERSION }}}" >> "$GITHUB_ENV"
+          OPT="${{ inputs.wasm_opt }}"
+          echo "OPT_LEVEL=${OPT:-2}" >> "$GITHUB_ENV"
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build python3 python3-venv python3-pip curl ca-certificates git unzip
+
+      - name: Get ROM
+        env:
+          ROM_ID: ${{ secrets.WL4_ROM_ID }}
+        run: |
+          if [ ! -f baserom_us.gba ]; then
+            if [ -z "$ROM_ID" ]; then
+              echo "::error::Secret WL4_ROM_ID not set. Add your Google Drive file ID as a repo secret."
+              exit 1
+            fi
+            pip install --quiet gdown
+            gdown "$ROM_ID" -O baserom_us.gba
+          fi
+          ls -l baserom_us.gba
+          echo "${ROM_MD5_US}  baserom_us.gba" | md5sum -c - || { echo "::error::baserom_us.gba MD5 mismatch"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract assets from ROM (make extract)
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet pyyaml
+          make extract VERSION=us
+
+      - name: Cache wasi-sdk
+        id: cache-wasi
+        uses: actions/cache@v4
+        with:
+          path: ~/wasi-sdk
+          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}
+
+      - name: Install wasi-sdk
+        if: steps.cache-wasi.outputs.cache-hit != 'true'
+        run: |
+          ARCH=$(uname -m)
+          VER="${{ env.WASI_SDK_VERSION }}"
+          BASE="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${VER}"
+          if ! curl -fsSL -o /tmp/wasi.tgz "${BASE}/wasi-sdk-${VER}.0-${ARCH}-linux.tar.gz"; then
+            curl -fsSL -o /tmp/wasi.tgz "${BASE}/wasi-sdk-${VER}.0+m-${ARCH}-linux.tar.gz"
+          fi
+          mkdir -p ~/wasi-sdk
+          tar -xzf /tmp/wasi.tgz -C ~/wasi-sdk --strip-components=1
+          ~/wasi-sdk/bin/clang --version
+
+      - name: Cache wabt
+        id: cache-wabt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/wabt-install
+            ~/wabt-src
+          key: wabt-${{ env.WABT_EFF }}
+
+      - name: Build wabt (wasm2c) from source
+        if: steps.cache-wabt.outputs.cache-hit != 'true'
+        run: |
+          VER="${{ env.WABT_EFF }}"
+          if ! git clone --recursive --depth 1 --branch "${VER}" https://github.com/WebAssembly/wabt ~/wabt-src 2>/dev/null; then
+            git clone --recursive --depth 1 --branch "v${VER}" https://github.com/WebAssembly/wabt ~/wabt-src
+          fi
+          cmake -S ~/wabt-src -B ~/wabt-src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$HOME/wabt-install"
+          cmake --build ~/wabt-src/build -j"$(nproc)"
+          cmake --install ~/wabt-src/build
+          ~/wabt-install/bin/wasm2c --version
+
+      - name: portify -> wasm32 -> wasm2c
+        env:
+          WASI_SDK: /home/runner/wasi-sdk
+          WABT: /home/runner/wabt-install
+          WABT_SRC: /home/runner/wabt-src
+          OPT_LEVEL: ${{ env.OPT_LEVEL }}
+        run: |
+          set -o pipefail
+          chmod +x port/build_wasm.sh
+          ./port/build_wasm.sh us 2>&1 | tee port-build.log
+          echo "--- failed C files (expected: none)";   cat port/build/FAILED.txt
+          echo "--- unported asm sites (expected: none)"; cat port/build/ASM_SITES.txt
+          echo "--- audit (expected: empty)";            cat port/build/p/AUDIT.txt
+          test -s port/build/wasm2c/wl4.c
+          ls -l port/build/wl4.wasm port/build/wasm2c/
+
+      - name: Stage inputs for the Symbian job
+        run: |
+          set -e
+          W=port/build/wasm2c
+          mkdir -p w2c-out/wasm2c w2c-out/hal
+          cp "$W"/* w2c-out/wasm2c/
+          cp port/hal/*.c port/hal/*.h w2c-out/hal/
+          python3 port/tools/gen_stubs.py "$W/wl4.h" w2c-out/wasm2c/wl4_stubs.c
+          python3 - <<'PY'
+          import re
+          src = open("port/build/wasm2c/wl4.c", errors="replace").read()
+          end = 0
+          for m in re.finditer(r"LOAD_DATA\([^,]+,\s*(\d+)u?,[^,]+,\s*(\d+)\)", src):
+              end = max(end, int(m.group(1)) + int(m.group(2)))
+          print("data segments end at 0x%X (%.1f MB above 0x0A000000)" % (end, (end - 0x0A000000) / 1048576.0 if end else 0))
+          open("w2c-out/data_end.txt", "w").write(str(end))
+          PY
+          du -sh w2c-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wl4-w2c
+          path: w2c-out
+          retention-days: 1
+
+  sis:
+    name: Build wl4.sisx
+    needs: w2c
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-latest' }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wl4-w2c
+          path: w2c
+
+      - name: Check out symbian3-toolchain
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TOOLCHAIN_REPO }}
+          ref: ${{ env.TOOLCHAIN_REF }}
+          path: toolchain
+
+      - name: Create case-sensitive APFS volume
+        run: |
+          hdiutil create -size 24g -fs "Case-sensitive APFS" -volname Symbian -type SPARSE "$RUNNER_TEMP/symbian"
+          hdiutil attach "$RUNNER_TEMP/symbian.sparseimage" -mountpoint "$SYMBIAN_VOL"
+          sudo chown "$(id -u):$(id -g)" "$SYMBIAN_VOL"
+
+      - name: Install Homebrew dependencies and Rosetta
+        run: |
+          brew install perl openssl@3 unshield make gmp mpfr libmpc isl gnu-sed
+          brew unlink perl
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Restore toolchain cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /Volumes/Symbian/toolchain
+            /Volumes/Symbian/sdks
+            /Volumes/Symbian/gnupoc
+          key: symbian3-toolchain-${{ env.TOOLCHAIN_REF }}-${{ env.GNUPOC_COMMIT }}-${{ env.GCC4SYMBIAN_COMMIT }}
+
+      - name: Build toolchain and install SDK (cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          JOBS: 4
+        run: |
+          set -eo pipefail
+          cd toolchain
+          source Scripts/env.sh
+          mkdir -p "$N8_SRC"
+          git clone https://github.com/mstorsjo/gnupoc-package "$N8_SRC/gnupoc-package"
+          git -C "$N8_SRC/gnupoc-package" checkout "$GNUPOC_COMMIT"
+          git clone https://github.com/fedor4ever/GCC4Symbian "$N8_SRC/GCC4Symbian"
+          git -C "$N8_SRC/GCC4Symbian" checkout "$GCC4SYMBIAN_COMMIT"
+          Scripts/fetch-sdk.sh
+          Scripts/build-host-tools.sh
+          Scripts/build-gcc.sh
+          Scripts/install-sdk.sh
+
+      - name: Save toolchain cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Volumes/Symbian/toolchain
+            /Volumes/Symbian/sdks
+            /Volumes/Symbian/gnupoc
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Write port sources (symbian/)
+        run: |
+          set -e
+          mkdir -p symbian/app/data
+          cat > symbian/app/data/wl4.rss <<'WL4_EOF'
+          NAME WL4A
+
+          #include <eikon.rh>
+          #include <avkon.rh>
+          #include <avkon.rsg>
+          #include <appinfo.rh>
+
+          RESOURCE RSS_SIGNATURE { }
+
+          RESOURCE TBUF r_default_document_name { buf = ""; }
+
+          RESOURCE EIK_APP_INFO
+              {
+              }
+
+          RESOURCE LOCALISABLE_APP_INFO r_localisable_app_info
+              {
+              short_caption = "WL4";
+              caption_and_icon = CAPTION_AND_ICON_INFO
+                  {
+                  caption = "Wario Land 4";
+                  number_of_icons = 0;
+                  };
+              }
+          WL4_EOF
+          mkdir -p symbian/app/data
+          cat > symbian/app/data/wl4_reg.rss <<'WL4_EOF'
+          #include <appinfo.rh>
+          #include <wl4.rsg>
+
+          UID2 KUidAppRegistrationResourceFile
+          UID3 0xE1A5B0CE
+
+          RESOURCE APP_REGISTRATION_INFO
+              {
+              app_file = "wl4";
+              localisable_resource_file = "\\resource\\apps\\wl4";
+              localisable_resource_id = R_LOCALISABLE_APP_INFO;
+              embeddability = KAppNotEmbeddable;
+              newfile = KAppDoesNotSupportNewFile;
+              }
+          WL4_EOF
+          mkdir -p symbian/app/group
+          cat > symbian/app/group/bld.inf <<'WL4_EOF'
+          PRJ_PLATFORMS
+          DEFAULT
+
+          PRJ_MMPFILES
+          wl4.mmp
+          WL4_EOF
+          mkdir -p symbian/app/group
+          cat > symbian/app/group/wl4.mmp <<'WL4_EOF'
+          // Wario Land 4 for Symbian^3 (wasm2c core + Avkon front end).
+          #include <platform_paths.hrh>
+
+          TARGET          wl4.exe
+          TARGETTYPE      exe
+          UID             0x100039CE 0xE1A5B0CE
+          SECUREID        0xE1A5B0CE
+          VENDORID        0
+          CAPABILITY      NONE
+
+          EPOCSTACKSIZE   0x14000
+          EPOCHEAPSIZE    0x100000 0x4000000
+
+          SOURCEPATH      ../src
+          SOURCE          wl4_app.cpp
+          SOURCE          wl4_container.cpp
+          SOURCE          wl4_audio.cpp
+          SOURCE          wl4_plat.cpp
+
+          USERINCLUDE     ../inc
+          USERINCLUDE     ../../core
+          APP_LAYER_SYSTEMINCLUDE
+
+          SOURCEPATH      ../data
+          START RESOURCE  wl4.rss
+          HEADER
+          TARGETPATH      /resource/apps
+          END
+
+          START RESOURCE  wl4_reg.rss
+          TARGETPATH      /private/10003a3f/import/apps
+          END
+
+          LIBRARY         euser.lib apparc.lib cone.lib eikcore.lib avkon.lib eikcoctl.lib
+          LIBRARY         fbscli.lib bitgdi.lib gdi.lib ws32.lib efsrv.lib
+          LIBRARY         mediaclientaudiostream.lib bafl.lib
+
+          // the C game core is cross-compiled separately into wl4core.lib (see workflow)
+          STATICLIBRARY   wl4core.lib
+
+          OPTION          GCCE -O2
+          WL4_EOF
+          mkdir -p symbian/app/inc
+          cat > symbian/app/inc/wl4_app.h <<'WL4_EOF'
+          // wl4_app.h - Symbian^3 front end for the wasm2c Wario Land 4 port.
+          #ifndef WL4_APP_H
+          #define WL4_APP_H
+          #include <aknapp.h>
+          #include <akndoc.h>
+          #include <aknappui.h>
+          #include <coecntrl.h>
+          #include <e32base.h>
+          #include <f32file.h>
+          #include <fbs.h>
+          #include <w32std.h>
+          #include <mdaaudiooutputstream.h>
+          #include "host_api.h"
+
+          const TUid KUidWl4 = { (TInt32)0xE1A5B0CE };
+
+          // Callback-driven MMF output: pulls 22.05 kHz mono PCM16 from wl4_audio_render().
+          class CWl4Audio : public CBase, public MMdaAudioOutputStreamCallback
+              {
+          public:
+              static CWl4Audio* NewL();
+              ~CWl4Audio();
+              void Suspend();
+              void Resume();
+              void MaoscOpenComplete(TInt aError);
+              void MaoscBufferCopied(TInt aError, const TDesC8& aBuffer);
+              void MaoscPlayComplete(TInt aError);
+          private:
+              CWl4Audio();
+              void ConstructL();
+              void OpenStream();
+              void Fill(TInt aSlot);
+              enum { KSlots = 3, KFrames = 441 };
+              CMdaAudioOutputStream* iStream;
+              TBool iReady;
+              TBool iSuspended;
+              TBuf8<KFrames * 2> iSlot[KSlots];
+              };
+
+          class CWl4Container : public CCoeControl
+              {
+          public:
+              static CWl4Container* NewL(const TRect& aRect);
+              ~CWl4Container();
+              void SetForeground(TBool aForeground);
+              void Shutdown();
+              void Draw(const TRect& aRect) const;
+              void SizeChanged();
+              void HandlePointerEventL(const TPointerEvent& aEvent);
+              TKeyResponse OfferKeyEventL(const TKeyEvent& aKeyEvent, TEventCode aType);
+          private:
+              enum TMode { EPlay, EMenu, EMsg };
+              enum { KMaxPtr = 4, KMenuItems = 4 };
+              CWl4Container();
+              void ConstructL(const TRect& aRect);
+              TBool FindRom();
+              TBool LoadRom();
+              void StartGame();
+              void StopGame();
+              void SaveBattery();
+              void WriteLog();
+              static TInt TickCb(TAny* aPtr);
+              void Tick();
+              void Msg(const TDesC& aLine1, const TDesC& aLine2);
+              TRect GameRect() const;
+              void ComputeLayout();
+              TUint PadMask() const;
+              void PushKeys();
+              void MenuAction(TInt aIndex);
+              TRect MenuRow(TInt aIndex) const;
+              void DrawPad(CWindowGc& aGc) const;
+              void DrawMenu(CWindowGc& aGc) const;
+              void DrawMsg(CWindowGc& aGc) const;
+              void Ring(CWindowGc& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const;
+
+              RFs iFs;
+              CFbsBitmap* iBitmap;
+              CPeriodic* iTimer;
+              CWl4Audio* iAudio;
+              RThread iThread;
+              TBool iThreadOpen;
+              TBool iStarted;
+              TMode iMode;
+              TUint8* iRom;
+              TInt iRomSize;
+              TFileName iRomPath;
+              TFileName iSavePath;
+              TUint8 iSave[65536];
+              TUint8 iLastSave[65536];
+              TBuf<96> iMsg1;
+              TBuf<96> iMsg2;
+              TInt iLastFrame;
+              TInt iTicks;
+              TInt iFrameskip;   // -1 auto
+              TBool iSound;
+              TUint iKeyMask;
+              TBool iPtrDown[KMaxPtr];
+              TPoint iPtrPos[KMaxPtr];
+              TPoint iDpad;
+              TInt iDpadR;
+              TRect iBtnA, iBtnB, iBtnL, iBtnR, iBtnSel, iBtnStart, iBtnMenu;
+              };
+
+          class CWl4AppUi : public CAknAppUi
+              {
+          public:
+              void ConstructL();
+              ~CWl4AppUi();
+              void HandleCommandL(TInt aCommand);
+              void HandleForegroundEventL(TBool aForeground);
+              void HandleResourceChangeL(TInt aType);
+          private:
+              CWl4Container* iContainer;
+              };
+
+          class CWl4Document : public CAknDocument
+              {
+          public:
+              CWl4Document(CEikApplication& aApp) : CAknDocument(aApp) {}
+          private:
+              CEikAppUi* CreateAppUiL();
+              };
+
+          class CWl4Application : public CAknApplication
+              {
+          private:
+              CApaDocument* CreateDocumentL();
+              TUid AppDllUid() const;
+              };
+          #endif
+          WL4_EOF
+          mkdir -p symbian/app/sis
+          cat > symbian/app/sis/wl4.pkg <<'WL4_EOF'
+          ; Wario Land 4 for Symbian^3 - install package (paths are expanded by package-sis.sh)
+          &EN
+          #{"Wario Land 4"},(0xE1A5B0CE),1,0,0
+          %{"wasm2c Symbian port"}
+          :"Symbian port"
+          [0x20022E6D], 0, 0, 0, {"S60ProductID"}
+          [0x1028315F], 0, 0, 0, {"S60ProductID"}
+          [0x102752AE], 0, 0, 0, {"S60ProductID"}
+          [0x102032BE], 0, 0, 0, {"S60ProductID"}
+          [0x101F7961], 0, 0, 0, {"S60ProductID"}
+          "$(epocroot)epoc32/release/$(platform)/$(target)/wl4.exe"-"!:\sys\bin\wl4.exe"
+          "$(epocroot)epoc32/data/z/resource/apps/wl4.rsc"-"!:\resource\apps\wl4.rsc"
+          "$(epocroot)epoc32/data/z/private/10003a3f/import/apps/wl4_reg.rsc"-"!:\private\10003a3f\import\apps\wl4_reg.rsc"
+          WL4_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/wl4_app.cpp <<'WL4_EOF'
+          // wl4_app.cpp - application / document / AppUi / entry point.
+          #include <eikstart.h>
+          #include <avkon.hrh>
+          #include <eikon.hrh>
+          #include <eikenv.h>
+          #include <eikspane.h>
+          #include <eikbtgpc.h>
+          #include "wl4_app.h"
+
+          CApaDocument* CWl4Application::CreateDocumentL() { return new (ELeave) CWl4Document(*this); }
+          TUid CWl4Application::AppDllUid() const { return KUidWl4; }
+          CEikAppUi* CWl4Document::CreateAppUiL() { return new (ELeave) CWl4AppUi; }
+
+          void CWl4AppUi::ConstructL()
+              {
+              BaseConstructL(CAknAppUi::EAknEnableSkin);
+              SetOrientationL(CAknAppUiBase::EAppUiOrientationLandscape);
+              CEikStatusPane* sp = StatusPane();
+              if (sp) { sp->MakeVisible(EFalse); }
+              CEikButtonGroupContainer* cba = Cba();
+              if (cba) { cba->MakeVisible(EFalse); }
+              iContainer = CWl4Container::NewL(ApplicationRect());
+              AddToStackL(iContainer);
+              }
+
+          CWl4AppUi::~CWl4AppUi()
+              {
+              if (iContainer)
+                  {
+                  iContainer->Shutdown();
+                  RemoveFromStack(iContainer);
+                  delete iContainer;
+                  iContainer = NULL;
+                  }
+              }
+
+          void CWl4AppUi::HandleCommandL(TInt aCommand)
+              {
+              switch (aCommand)
+                  {
+                  case EEikCmdExit:
+                  case EAknSoftkeyExit:
+                  case EAknCmdExit:
+                      Exit();
+                      break;
+                  default:
+                      break;
+                  }
+              }
+
+          void CWl4AppUi::HandleForegroundEventL(TBool aForeground)
+              {
+              CAknAppUi::HandleForegroundEventL(aForeground);
+              if (iContainer) { iContainer->SetForeground(aForeground); }
+              }
+
+          void CWl4AppUi::HandleResourceChangeL(TInt aType)
+              {
+              CAknAppUi::HandleResourceChangeL(aType);
+              if (iContainer && aType == KEikDynamicLayoutVariantSwitch) { iContainer->SetRect(ApplicationRect()); }
+              }
+
+          LOCAL_C CApaApplication* NewApplication() { return new CWl4Application; }
+
+          GLDEF_C TInt E32Main() { return EikStart::RunApplication(NewApplication); }
+          WL4_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/wl4_audio.cpp <<'WL4_EOF'
+          // wl4_audio.cpp - MMF PCM16 mono 22.05 kHz output; refills a slot as soon as it was played.
+          #include <e32std.h>
+          #include <mda/common/audio.h>
+          #include "wl4_app.h"
+
+          CWl4Audio::CWl4Audio() : iStream(NULL), iReady(EFalse), iSuspended(EFalse) {}
+
+          CWl4Audio* CWl4Audio::NewL()
+              {
+              CWl4Audio* a = new (ELeave) CWl4Audio;
+              CleanupStack::PushL(a);
+              a->ConstructL();
+              CleanupStack::Pop(a);
+              return a;
+              }
+
+          void CWl4Audio::ConstructL()
+              {
+              iStream = CMdaAudioOutputStream::NewL(*this);
+              OpenStream();
+              }
+
+          CWl4Audio::~CWl4Audio()
+              {
+              iSuspended = ETrue;
+              if (iStream) { iStream->Stop(); delete iStream; }
+              }
+
+          void CWl4Audio::OpenStream()
+              {
+              iReady = EFalse;
+              iStream->Open(NULL);
+              }
+
+          void CWl4Audio::Fill(TInt aSlot)
+              {
+              iSlot[aSlot].SetLength(KFrames * 2);
+              wl4_audio_render((short*)iSlot[aSlot].Ptr(), KFrames);
+              TRAP_IGNORE(iStream->WriteL(iSlot[aSlot]));
+              }
+
+          void CWl4Audio::MaoscOpenComplete(TInt aError)
+              {
+              if (aError != KErrNone) { return; }
+              iStream->SetAudioPropertiesL(TMdaAudioDataSettings::ESampleRate22050Hz, TMdaAudioDataSettings::EChannelsMono);
+              iStream->SetVolume(iStream->MaxVolume() * 3 / 4);
+              iReady = ETrue;
+              if (!iSuspended) { for (TInt i = 0; i < KSlots; i++) { Fill(i); } }
+              }
+
+          void CWl4Audio::MaoscBufferCopied(TInt aError, const TDesC8& aBuffer)
+              {
+              if (aError != KErrNone || iSuspended || !iReady) { return; }
+              for (TInt i = 0; i < KSlots; i++)
+                  {
+                  if (iSlot[i].Ptr() == aBuffer.Ptr()) { Fill(i); return; }
+                  }
+              }
+
+          void CWl4Audio::MaoscPlayComplete(TInt aError)
+              {
+              if (aError != KErrNone && aError != KErrCancel && !iSuspended) { OpenStream(); }
+              }
+
+          void CWl4Audio::Suspend()
+              {
+              iSuspended = ETrue;
+              if (iStream) { iStream->Stop(); }
+              iReady = EFalse;
+              }
+
+          void CWl4Audio::Resume()
+              {
+              if (!iSuspended) { return; }
+              iSuspended = EFalse;
+              OpenStream();
+              }
+          WL4_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/wl4_container.cpp <<'WL4_EOF'
+          // wl4_container.cpp - ROM lookup, game thread control, scaled blit, multi-touch pad, overlay menu.
+          #include <e32std.h>
+          #include <e32keys.h>
+          #include <eikenv.h>
+          #include <coemain.h>
+          #include <gdi.h>
+          #include <bitdev.h>
+          #include "wl4_app.h"
+
+          #define GBA_W 240
+          #define GBA_H 160
+          enum { KA = 1, KB = 2, KSel = 4, KStart = 8, KRight = 16, KLeft = 32, KUp = 64, KDown = 128, KR = 256, KL = 512 };
+
+          static TInt GameThreadEntry(TAny*)
+              {
+              wl4_thread_main(0);
+              return 0;
+              }
+
+          CWl4Container::CWl4Container() : iFrameskip(-1), iSound(ETrue) {}
+
+          CWl4Container* CWl4Container::NewL(const TRect& aRect)
+              {
+              CWl4Container* c = new (ELeave) CWl4Container;
+              CleanupStack::PushL(c);
+              c->ConstructL(aRect);
+              CleanupStack::Pop(c);
+              return c;
+              }
+
+          void CWl4Container::ConstructL(const TRect& aRect)
+              {
+              CreateWindowL();
+              SetExtentToWholeScreen();
+              EnableDragEvents();
+              Window().EnableAdvancedPointers();
+              User::LeaveIfError(iFs.Connect());
+              iBitmap = new (ELeave) CFbsBitmap;
+              User::LeaveIfError(iBitmap->Create(TSize(GBA_W, GBA_H), EColor16MU));
+              iTimer = CPeriodic::NewL(CActive::EPriorityStandard);
+              ComputeLayout();
+              ActivateL();
+              iMode = EMsg;
+              Msg(_L("Loading ROM..."), _L(""));
+              if (!FindRom())
+                  {
+                  Msg(_L("ROM not found. Put the US ROM (.gba)"), _L("into E:\\wl4\\ and restart."));
+                  }
+              else if (LoadRom())
+                  {
+                  StartGame();
+                  }
+              DrawNow();
+              }
+
+          CWl4Container::~CWl4Container()
+              {
+              Shutdown();
+              delete iTimer;
+              delete iBitmap;
+              iFs.Close();
+              }
+
+          void CWl4Container::Msg(const TDesC& a, const TDesC& b)
+              {
+              iMode = EMsg;
+              iMsg1.Copy(a.Left(iMsg1.MaxLength()));
+              iMsg2.Copy(b.Left(iMsg2.MaxLength()));
+              }
+
+          // ---- ROM lookup -----------------------------------------------------------
+          TBool CWl4Container::FindRom()
+              {
+              TDriveList dl;
+              iFs.DriveList(dl);
+              _LIT(KD1, "\\wl4\\");
+              _LIT(KD2, "\\roms\\");
+              _LIT(KD3, "\\gba\\");
+              _LIT(KD4, "\\");
+              const TDesC* dirs[] = { &KD1, &KD2, &KD3, &KD4 };
+              const TInt order[] = { EDriveE, EDriveF, EDriveD, EDriveC, EDriveG, EDriveH };
+              for (TInt di = 0; di < 6; di++)
+                  {
+                  if (dl[order[di]] == 0) { continue; }
+                  for (TInt k = 0; k < 4; k++)
+                      {
+                      TFileName path;
+                      path.Append(TChar('A' + order[di]));
+                      path.Append(TChar(':'));
+                      path.Append(*dirs[k]);
+                      CDir* list = NULL;
+                      if (iFs.GetDir(path, KEntryAttNormal, ESortByName, list) != KErrNone || !list) { continue; }
+                      for (TInt i = 0; i < list->Count(); i++)
+                          {
+                          const TEntry& e = (*list)[i];
+                          if (e.iName.Length() > 4 && e.iName.Right(4).CompareF(_L(".gba")) == 0 &&
+                              e.iSize >= 0x400000 && e.iSize <= 0x1000000 && path.Length() + e.iName.Length() <= KMaxFileName)
+                              {
+                              iRomPath = path;
+                              iRomPath.Append(e.iName);
+                              delete list;
+                              return ETrue;
+                              }
+                          }
+                      delete list;
+                      }
+                  }
+              return EFalse;
+              }
+
+          TBool CWl4Container::LoadRom()
+              {
+              RFile f;
+              if (f.Open(iFs, iRomPath, EFileRead | EFileShareReadersOnly) != KErrNone)
+                  {
+                  Msg(_L("Cannot open ROM"), iRomPath);
+                  return EFalse;
+                  }
+              TInt size = 0;
+              f.Size(size);
+              iRom = (TUint8*)User::Alloc(size);
+              if (!iRom)
+                  {
+                  f.Close();
+                  Msg(_L("Out of memory loading ROM"), _L(""));
+                  return EFalse;
+                  }
+              TPtr8 p(iRom, 0, size);
+              TInt err = f.Read(p);
+              f.Close();
+              if (err != KErrNone || p.Length() != size)
+                  {
+                  Msg(_L("ROM read error"), _L(""));
+                  return EFalse;
+                  }
+              iRomSize = size;
+              if (size < 0xB0 || iRom[0xAC] != 'A' || iRom[0xAD] != 'W' || iRom[0xAE] != 'A' || iRom[0xAF] != 'E')
+                  {
+                  Msg(_L("Wrong ROM: need Wario Land 4 (US,"), _L("game code AWAE)."));
+                  return EFalse;
+                  }
+              iSavePath = iRomPath;
+              iSavePath.SetLength(iSavePath.Length() - 4);
+              iSavePath.Append(_L(".sav"));
+              Mem::Fill(iSave, sizeof(iSave), 0xFF);
+              RFile s;
+              if (s.Open(iFs, iSavePath, EFileRead) == KErrNone)
+                  {
+                  TPtr8 sp(iSave, 0, sizeof(iSave));
+                  s.Read(sp);
+                  s.Close();
+                  }
+              Mem::Copy(iLastSave, iSave, sizeof(iSave));
+              wl4_load_save(iSave, sizeof(iSave));
+              return ETrue;
+              }
+
+          // ---- game thread ----------------------------------------------------------
+          void CWl4Container::StartGame()
+              {
+              if (wl4_prepare(iRom, (unsigned)iRomSize) != 0) { Msg(_L("Game already running"), _L("")); return; }
+              wl4_set_frameskip(iFrameskip);
+              TInt err = iThread.Create(_L("wl4game"), GameThreadEntry, 0x200000, (RAllocator*)NULL, NULL, EOwnerThread);
+              if (err != KErrNone)
+                  {
+                  TBuf<40> m;
+                  m.Format(_L("Thread create error %d"), err);
+                  Msg(m, _L(""));
+                  return;
+                  }
+              iThreadOpen = ETrue;
+              iThread.SetPriority(EPriorityNormal);
+              iThread.Resume();
+              iStarted = ETrue;
+              TRAPD(aerr, iAudio = CWl4Audio::NewL());
+              (void)aerr;
+              iMode = EPlay;
+              iLastFrame = -1;
+              iTimer->Start(0, 16000, TCallBack(TickCb, this));
+              }
+
+          void CWl4Container::StopGame()
+              {
+              if (!iStarted) { return; }
+              iTimer->Cancel();
+              SaveBattery();
+              wl4_request_stop();
+              for (TInt i = 0; i < 300 && wl4_running(); i++) { User::After(10000); }
+              if (iThreadOpen)
+                  {
+                  if (iThread.ExitType() == EExitPending) { iThread.Kill(KErrNone); }
+                  iThread.Close();
+                  iThreadOpen = EFalse;
+                  }
+              delete iAudio;
+              iAudio = NULL;
+              WriteLog();
+              plat_mem_release();
+              iStarted = EFalse;
+              }
+
+          void CWl4Container::Shutdown()
+              {
+              StopGame();
+              User::Free(iRom);
+              iRom = NULL;
+              }
+
+          void CWl4Container::SaveBattery()
+              {
+              if (!iStarted || !iSavePath.Length()) { return; }
+              wl4_read_save(iSave);
+              if (Mem::Compare(iSave, sizeof(iSave), iLastSave, sizeof(iLastSave)) == 0) { return; }
+              RFile f;
+              if (f.Replace(iFs, iSavePath, EFileWrite) == KErrNone)
+                  {
+                  f.Write(TPtrC8(iSave, sizeof(iSave)));
+                  f.Close();
+                  Mem::Copy(iLastSave, iSave, sizeof(iSave));
+                  }
+              }
+
+          void CWl4Container::WriteLog()
+              {
+              if (!iRomPath.Length()) { return; }
+              TBuf8<2600> buf;
+              buf.SetLength(wl4_dump_log((char*)buf.Ptr(), 2500));
+              TFileName p = iRomPath;
+              p.SetLength(p.Length() - 4);
+              p.Append(_L(".log"));
+              RFile f;
+              if (f.Replace(iFs, p, EFileWrite) == KErrNone) { f.Write(buf); f.Close(); }
+              }
+
+          void CWl4Container::SetForeground(TBool aFg)
+              {
+              if (!iStarted) { return; }
+              if (aFg)
+                  {
+                  if (iMode == EPlay) { wl4_pause(0); iTimer->Start(0, 16000, TCallBack(TickCb, this)); }
+                  if (iAudio) { iAudio->Resume(); }
+                  }
+              else
+                  {
+                  iTimer->Cancel();
+                  wl4_pause(1);
+                  if (iAudio) { iAudio->Suspend(); }
+                  SaveBattery();
+                  }
+              }
+
+          // ---- tick -----------------------------------------------------------------
+          TInt CWl4Container::TickCb(TAny* p)
+              {
+              ((CWl4Container*)p)->Tick();
+              return 0;
+              }
+
+          void CWl4Container::Tick()
+              {
+              if ((++iTicks & 127) == 0) { User::ResetInactivityTime(); }
+              if ((iTicks % 1800) == 0) { SaveBattery(); }
+              if (!wl4_running())
+                  {
+                  iTimer->Cancel();
+                  WriteLog();
+                  TBuf<64> m;
+                  m.Format(_L("Game stopped (trap %d). See .log"), wl4_trap_code());
+                  Msg(m, _L("Tap to exit."));
+                  DrawNow();
+                  return;
+                  }
+              TInt f = wl4_frame_counter();
+              if (f == iLastFrame || iMode == EMsg) { return; }
+              iLastFrame = f;
+              iBitmap->LockHeap();
+              wl4_copy_frame((unsigned*)iBitmap->DataAddress());
+              iBitmap->UnlockHeap();
+              DrawNow();
+              }
+
+          // ---- layout / drawing -----------------------------------------------------
+          TRect CWl4Container::GameRect() const
+              {
+              TRect r = Rect();
+              TInt h = r.Height(), w = h * 3 / 2;
+              if (w > r.Width()) { w = r.Width(); h = w * 2 / 3; }
+              TInt x = r.iTl.iX + (r.Width() - w) / 2, y = r.iTl.iY + (r.Height() - h) / 2;
+              return TRect(x, y, x + w, y + h);
+              }
+
+          void CWl4Container::SizeChanged() { ComputeLayout(); }
+
+          void CWl4Container::ComputeLayout()
+              {
+              TRect r = Rect();
+              TInt W = r.Width(), H = r.Height();
+              TInt u = H / 8;
+              iDpadR = u * 2;
+              iDpad = TPoint(iDpadR + u / 2, H - iDpadR - u / 2);
+              iBtnA = TRect(W - u * 2 - u / 2, H - u * 4, W - u / 2, H - u * 2);
+              iBtnB = TRect(W - u * 5, H - u * 3, W - u * 3, H - u);
+              iBtnL = TRect(0, 0, u * 3, u * 2);
+              iBtnR = TRect(W - u * 3, 0, W, u * 2);
+              iBtnSel = TRect(W / 2 - u * 3, H - u, W / 2 - u / 4, H);
+              iBtnStart = TRect(W / 2 + u / 4, H - u, W / 2 + u * 3, H);
+              iBtnMenu = TRect(W / 2 - u * 2, 0, W / 2 + u * 2, u);
+              }
+
+          TUint CWl4Container::PadMask() const
+              {
+              TUint m = 0;
+              for (TInt i = 0; i < KMaxPtr; i++)
+                  {
+                  if (!iPtrDown[i]) { continue; }
+                  const TPoint& p = iPtrPos[i];
+                  TInt dx = p.iX - iDpad.iX, dy = p.iY - iDpad.iY;
+                  TInt lim = iDpadR * 3 / 2;
+                  if (dx * dx + dy * dy < lim * lim * 2 && p.iX < Rect().Width() / 2)
+                      {
+                      TInt t = iDpadR / 3;
+                      if (dx > t) { m |= KRight; }
+                      if (dx < -t) { m |= KLeft; }
+                      if (dy > t) { m |= KDown; }
+                      if (dy < -t) { m |= KUp; }
+                      }
+                  if (iBtnA.Contains(p)) { m |= KA; }
+                  if (iBtnB.Contains(p)) { m |= KB; }
+                  if (iBtnL.Contains(p)) { m |= KL; }
+                  if (iBtnR.Contains(p)) { m |= KR; }
+                  if (iBtnSel.Contains(p)) { m |= KSel; }
+                  if (iBtnStart.Contains(p)) { m |= KStart; }
+                  }
+              return m;
+              }
+
+          void CWl4Container::PushKeys() { wl4_set_keys((unsigned short)(iKeyMask | PadMask())); }
+
+          void CWl4Container::Ring(CWindowGc& gc, const TRect& r, const TDesC& label, TBool down) const
+              {
+              gc.SetPenSize(TSize(down ? 4 : 2, down ? 4 : 2));
+              gc.DrawEllipse(r);
+              const CFont* font = CEikonEnv::Static()->NormalFont();
+              gc.UseFont(font);
+              gc.DrawText(label, r, r.Height() / 2 + font->AscentInPixels() / 2, CGraphicsContext::ECenter, 0);
+              gc.DiscardFont();
+              }
+
+          void CWl4Container::DrawPad(CWindowGc& gc) const
+              {
+              TUint m = PadMask() | iKeyMask;
+              gc.SetBrushStyle(CGraphicsContext::ENullBrush);
+              gc.SetPenStyle(CGraphicsContext::ESolidPen);
+              gc.SetPenColor(KRgbWhite);
+              TRect d(iDpad.iX - iDpadR, iDpad.iY - iDpadR, iDpad.iX + iDpadR, iDpad.iY + iDpadR);
+              gc.SetPenSize(TSize(2, 2));
+              gc.DrawEllipse(d);
+              gc.DrawLine(TPoint(d.iTl.iX, iDpad.iY), TPoint(d.iBr.iX, iDpad.iY));
+              gc.DrawLine(TPoint(iDpad.iX, d.iTl.iY), TPoint(iDpad.iX, d.iBr.iY));
+              Ring(gc, iBtnA, _L("A"), m & KA);
+              Ring(gc, iBtnB, _L("B"), m & KB);
+              Ring(gc, iBtnL, _L("L"), m & KL);
+              Ring(gc, iBtnR, _L("R"), m & KR);
+              Ring(gc, iBtnSel, _L("Select"), m & KSel);
+              Ring(gc, iBtnStart, _L("Start"), m & KStart);
+              Ring(gc, iBtnMenu, _L("Menu"), EFalse);
+              }
+
+          TRect CWl4Container::MenuRow(TInt i) const
+              {
+              TRect r = Rect();
+              TInt w = Min(r.Width() - 40, 360), rh = Min(r.Height() / 6, 56);
+              TInt x = (r.Width() - w) / 2, y = (r.Height() - rh * KMenuItems) / 2;
+              return TRect(x, y + i * rh, x + w, y + (i + 1) * rh);
+              }
+
+          void CWl4Container::DrawMenu(CWindowGc& gc) const
+              {
+              TBuf<32> fs, snd;
+              if (iFrameskip < 0) { fs.Copy(_L("Frameskip: auto")); } else { fs.Format(_L("Frameskip: %d"), iFrameskip); }
+              snd.Copy(iSound ? _L("Sound: on") : _L("Sound: off"));
+              TPtrC items[KMenuItems] = { _L("Resume"), fs, snd, _L("Exit") };
+              const CFont* font = CEikonEnv::Static()->NormalFont();
+              gc.UseFont(font);
+              gc.SetPenStyle(CGraphicsContext::ESolidPen);
+              gc.SetPenColor(KRgbWhite);
+              gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              gc.SetBrushColor(TRgb(0x202020));
+              for (TInt i = 0; i < KMenuItems; i++)
+                  {
+                  TRect r = MenuRow(i);
+                  gc.DrawRect(r);
+                  gc.DrawText(items[i], r, r.Height() / 2 + font->AscentInPixels() / 2, CGraphicsContext::ECenter, 0);
+                  }
+              gc.DiscardFont();
+              }
+
+          void CWl4Container::DrawMsg(CWindowGc& gc) const
+              {
+              const CFont* font = CEikonEnv::Static()->NormalFont();
+              gc.UseFont(font);
+              gc.SetPenColor(KRgbWhite);
+              TRect r = Rect();
+              TInt h = font->HeightInPixels() * 2;
+              TRect a(r.iTl.iX, r.Height() / 2 - h, r.iBr.iX, r.Height() / 2);
+              TRect b(r.iTl.iX, r.Height() / 2, r.iBr.iX, r.Height() / 2 + h);
+              gc.DrawText(iMsg1, a, h / 2 + font->AscentInPixels() / 2, CGraphicsContext::ECenter, 0);
+              gc.DrawText(iMsg2, b, h / 2 + font->AscentInPixels() / 2, CGraphicsContext::ECenter, 0);
+              gc.DiscardFont();
+              }
+
+          void CWl4Container::Draw(const TRect& aRect) const
+              {
+              CWindowGc& gc = SystemGc();
+              gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              gc.SetBrushColor(KRgbBlack);
+              gc.Clear(aRect);
+              if (iMode == EMsg) { DrawMsg(gc); return; }
+              gc.DrawBitmap(GameRect(), iBitmap);
+              DrawPad(gc);
+              if (iMode == EMenu) { DrawMenu(gc); }
+              }
+
+          // ---- input ----------------------------------------------------------------
+          void CWl4Container::MenuAction(TInt i)
+              {
+              switch (i)
+                  {
+                  case 0:
+                      iMode = EPlay;
+                      wl4_pause(0);
+                      iLastFrame = -1;
+                      break;
+                  case 1:
+                      iFrameskip = (iFrameskip >= 3) ? -1 : iFrameskip + 1;
+                      wl4_set_frameskip(iFrameskip);
+                      break;
+                  case 2:
+                      iSound = !iSound;
+                      wl4_audio_set_enabled(iSound);
+                      break;
+                  case 3:
+                      CEikonEnv::Static()->EikAppUi()->HandleCommandL(EEikCmdExit);
+                      return;
+                  }
+              DrawNow();
+              }
+
+          void CWl4Container::HandlePointerEventL(const TPointerEvent& e)
+              {
+              if (iMode == EMsg)
+                  {
+                  if (e.iType == TPointerEvent::EButton1Down && !wl4_running()) { CEikonEnv::Static()->EikAppUi()->HandleCommandL(EEikCmdExit); }
+                  return;
+                  }
+              TInt n = 0;
+              const TAdvancedPointerEvent* ae = e.AdvancedPointerEvent();
+              if (ae) { n = ae->PointerNumber(); }
+              if (n < 0 || n >= KMaxPtr) { n = 0; }
+              switch (e.iType)
+                  {
+                  case TPointerEvent::EButton1Down:
+                      iPtrDown[n] = ETrue;
+                      iPtrPos[n] = e.iPosition;
+                      if (iMode == EMenu)
+                          {
+                          iPtrDown[n] = EFalse;
+                          for (TInt i = 0; i < KMenuItems; i++) { if (MenuRow(i).Contains(e.iPosition)) { MenuAction(i); break; } }
+                          }
+                      else if (iBtnMenu.Contains(e.iPosition))
+                          {
+                          iPtrDown[n] = EFalse;
+                          iMode = EMenu;
+                          wl4_pause(1);
+                          wl4_set_keys(0);
+                          DrawNow();
+                          }
+                      break;
+                  case TPointerEvent::EDrag:
+                  case TPointerEvent::EMove:
+                      iPtrPos[n] = e.iPosition;
+                      break;
+                  case TPointerEvent::EButton1Up:
+                      iPtrDown[n] = EFalse;
+                      break;
+                  default:
+                      break;
+                  }
+              if (iMode == EPlay) { PushKeys(); }
+              }
+
+          TKeyResponse CWl4Container::OfferKeyEventL(const TKeyEvent& k, TEventCode type)
+              {
+              if (type != EEventKeyDown && type != EEventKeyUp) { return EKeyWasConsumed; }
+              TUint bit = 0;
+              switch (k.iScanCode)
+                  {
+                  case EStdKeyRightArrow: bit = KRight; break;
+                  case EStdKeyLeftArrow: bit = KLeft; break;
+                  case EStdKeyUpArrow: bit = KUp; break;
+                  case EStdKeyDownArrow: bit = KDown; break;
+                  case 'X': bit = KA; break;
+                  case 'Z': bit = KB; break;
+                  case 'A': bit = KL; break;
+                  case 'S': bit = KR; break;
+                  case EStdKeyEnter: case EStdKeyDevice3: bit = KStart; break;
+                  case EStdKeySpace: case EStdKeyBackspace: bit = KSel; break;
+                  case EStdKeyDevice0:
+                      if (type == EEventKeyDown && iMode == EPlay)
+                          {
+                          iMode = EMenu;
+                          wl4_pause(1);
+                          DrawNow();
+                          }
+                      return EKeyWasConsumed;
+                  default: break;
+                  }
+              if (bit)
+                  {
+                  if (type == EEventKeyDown) { iKeyMask |= bit; } else { iKeyMask &= ~bit; }
+                  if (iMode == EPlay) { PushKeys(); }
+                  }
+              return EKeyWasConsumed;
+              }
+          WL4_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/wl4_plat.cpp <<'WL4_EOF'
+          // wl4_plat.cpp - platform hooks used by the C game core (allocation, sparse chunk, timing, thread exit).
+          #include <e32std.h>
+          #include <e32base.h>
+          #include "host_api.h"
+
+          static RChunk gChunk;
+          static TBool gChunkOpen = EFalse;
+
+          extern "C" {
+
+          void* plat_malloc(unsigned n) { return User::Alloc(n ? n : 1); }
+          void plat_free(void* p) { User::Free(p); }
+          void* plat_realloc(void* p, unsigned n) { return User::ReAlloc(p, n ? n : 1); }
+
+          // Reserve the whole GBA-shaped address range, commit only the regions the game touches.
+          void* plat_mem_reserve(unsigned bytes)
+              {
+              if (gChunkOpen) { return gChunk.Base(); }
+              if (gChunk.CreateDisconnectedLocal(0, 0, (TInt)bytes) != KErrNone) { return 0; }
+              gChunkOpen = ETrue;
+              return gChunk.Base();
+              }
+
+          int plat_mem_commit(unsigned off, unsigned len)
+              {
+              if (!gChunkOpen) { return -1; }
+              return gChunk.Commit((TInt)off, (TInt)len);
+              }
+
+          void plat_mem_release(void)
+              {
+              if (gChunkOpen) { gChunk.Close(); gChunkOpen = EFalse; }
+              }
+
+          void plat_exit_thread(void)
+              {
+              RThread().Kill(KErrNone);
+              for (;;) {}
+              }
+
+          unsigned plat_now_ms(void) { return (unsigned)User::NTickCount(); }
+
+          void plat_sleep_us(unsigned us)
+              {
+              if (us >= 500) { User::After(TTimeIntervalMicroSeconds32((TInt)us)); }
+              }
+
+          }  // extern "C"
+          WL4_EOF
+          mkdir -p symbian/core
+          cat > symbian/core/audio_sym.c <<'WL4_EOF'
+          /* audio_sym.c - game thread pushes s8 stereo frames; the UI thread pulls 22050 Hz mono s16 (integer resampler). */
+          #include "host_api.h"
+          #include <stdint.h>
+          #include <string.h>
+          #define RING 16384u
+          #define MASK (RING - 1)
+          #define OUTRATE 22050
+          static short g_ring[RING];
+          static volatile unsigned g_w, g_r;
+          static volatile int g_rate = 13379, g_en = 1, g_paused, g_flush, g_primed;
+          static unsigned g_pos; static short g_last;
+          #define BARRIER() __asm__ volatile("" ::: "memory")
+          void wl4_audio_start(void) { g_w = g_r = 0; g_pos = 0; g_primed = 0; g_paused = 0; g_flush = 1; }
+          void wl4_audio_stop(void) { g_paused = 1; }
+          void wl4_audio_pause(int p) { g_paused = p; if (!p) g_flush = 1; }
+          void wl4_audio_poll(void) {}
+          void wl4_audio_set_enabled(int on) { g_en = on; if (on) g_flush = 1; }
+          void wl4_audio_push(const int8_t *right, const int8_t *left, int count, int rate) {
+              if (g_paused || !g_en) return;
+              g_rate = rate > 4000 ? rate : 13379;
+              unsigned w = g_w, r = g_r, used = w - r, cap = (unsigned)g_rate / 8;
+              if (cap > RING) cap = RING;
+              unsigned room = used < cap ? cap - used : 0;
+              if ((unsigned)count > room) count = (int)room;
+              for (int i = 0; i < count; i++) g_ring[(w + (unsigned)i) & MASK] = (short)((left[i] + right[i]) * 128);
+              BARRIER(); g_w = w + (unsigned)count;
+          }
+          void wl4_audio_render(short *out, int frames) {
+              if (g_paused || !g_en) { memset(out, 0, (size_t)frames * 2); g_primed = 0; return; }
+              unsigned w = g_w, r = g_r; BARRIER();
+              if (g_flush) { r = w; g_pos = 0; g_primed = 0; g_flush = 0; }
+              int rate = g_rate; unsigned target = (unsigned)rate * 40u / 1000u;
+              if (!g_primed) {
+                  if (w - r >= target) g_primed = 1;
+                  else { memset(out, 0, (size_t)frames * 2); g_r = r; return; }
+              }
+              int step = (int)(((unsigned)rate << 16) / OUTRATE);
+              int err = (int)(w - r) - (int)target;
+              int adj = err * (step / 50) / (int)target, lim = step / 100;
+              if (adj > lim) adj = lim; if (adj < -lim) adj = -lim;
+              step += adj;
+              for (int i = 0; i < frames; i++) {
+                  if (w - r < 2) { g_last = (short)(g_last / 2); out[i] = g_last; g_primed = 0; continue; }
+                  int a = g_ring[r & MASK], b = g_ring[(r + 1) & MASK];
+                  g_last = (short)(a + (((b - a) * (int)(g_pos & 0xFFFF)) >> 16));
+                  out[i] = g_last;
+                  g_pos += (unsigned)step; r += g_pos >> 16; g_pos &= 0xFFFF;
+              }
+              BARRIER(); g_r = r;
+          }
+          WL4_EOF
+          mkdir -p symbian/core
+          cat > symbian/core/host_api.h <<'WL4_EOF'
+          /* host_api.h - C API shared by the C game core and the Symbian C++ front end (plain types only). */
+          #ifndef WL4_HOST_API_H
+          #define WL4_HOST_API_H
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          /* ---- game core (host_sym.c / audio_sym.c) ---- */
+          int   wl4_prepare(const unsigned char *rom, unsigned size);  /* keeps the pointer: caller owns the buffer until stop */
+          int   wl4_thread_main(void *arg);                            /* run on a dedicated thread */
+          void  wl4_request_stop(void);
+          void  wl4_pause(int paused);
+          void  wl4_set_keys(unsigned short keys);   /* bit0 A,1 B,2 Select,3 Start,4 Right,5 Left,6 Up,7 Down,8 R,9 L */
+          void  wl4_set_frameskip(int n);            /* -1 auto, 0..3 fixed */
+          void  wl4_load_save(const unsigned char *d, unsigned n);
+          int   wl4_read_save(unsigned char *out64k);
+          int   wl4_running(void);
+          int   wl4_frame_counter(void);
+          int   wl4_copy_frame(unsigned *out240x160);
+          int   wl4_trap_code(void);                 /* 0 = none */
+          int   wl4_dump_log(char *out, int max);
+          void  wl4_audio_set_enabled(int on);
+          void  wl4_audio_render(short *out, int frames);   /* 22050 Hz mono, any thread */
+          /* ---- platform hooks implemented in C++ (wl4_plat.cpp) ---- */
+          void *plat_malloc(unsigned n);
+          void  plat_free(void *p);
+          void *plat_realloc(void *p, unsigned n);
+          void *plat_mem_reserve(unsigned bytes);
+          int   plat_mem_commit(unsigned off, unsigned len);
+          void  plat_mem_release(void);
+          void  plat_exit_thread(void);
+          unsigned plat_now_ms(void);
+          void  plat_sleep_us(unsigned us);
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          WL4_EOF
+          mkdir -p symbian/core
+          cat > symbian/core/host_sym.c <<'WL4_EOF'
+          /* host_sym.c - Symbian host for the wasm2c-converted game (replaces port/host/host.c: no pthreads/signals/libc). */
+          #include "wl4.h"
+          #include "hal.h"
+          #include "host_api.h"
+          #include <stdarg.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          struct w2c_env { w2c_wl4 *inst; };
+          void wl4_audio_start(void); void wl4_audio_stop(void); void wl4_audio_pause(int);
+          void wl4_audio_poll(void); void wl4_audio_push(const int8_t *, const int8_t *, int, int);
+
+          static w2c_wl4 g_inst; static struct w2c_env g_env;
+          static uint32_t g_buf[2][GBA_W * GBA_H];
+          static volatile int g_idx, g_presented, g_frames, g_stop, g_running, g_paused, g_trap, g_skipNow, g_fs = -1, g_ready;
+          static const unsigned char *g_rom; static unsigned g_romSize;
+          static uint8_t g_save[GBA_SRAM_SIZE]; static int g_haveSave;
+
+          /* ---- tiny log ring (dumped to a file by the UI on stop/trap) ---- */
+          static char g_log[24][100]; static unsigned g_logN;
+          static void wl4_logf(const char *fmt, ...) {
+              va_list ap; va_start(ap, fmt); vsnprintf(g_log[g_logN % 24], 100, fmt, ap); va_end(ap); g_logN++;
+          }
+          int wl4_dump_log(char *out, int max) {
+              int o = 0; unsigned n = g_logN, first = n > 24 ? n - 24 : 0;
+              for (unsigned i = first; i < n; i++) { const char *l = g_log[i % 24]; while (*l && o < max - 2) out[o++] = *l++; out[o++] = 10; }
+              if (o < max) out[o] = 0;
+              return o;
+          }
+          unsigned wl4_rom_commit_size(void) { return g_romSize ? ((g_romSize + 0xFFFu) & ~0xFFFu) : 0x800000u; }
+
+          /* ---- frame skipping: hal.c is built with -Dppu_render_scanline=wl4_ppu_line ---- */
+          void ppu_render_scanline(int y, uint32_t *dst240);
+          void wl4_ppu_line(int y, uint32_t *dst) { if (!g_skipNow) ppu_render_scanline(y, dst); }
+
+          void wl4_trap(wasm_rt_trap_t code) {
+              g_trap = (int)code + 1;
+              wl4_logf("wasm trap %d (game thread stopped)", (int)code);
+              g_running = 0; plat_exit_thread();
+          }
+
+          /* ---- imports the wasm module expects (same as the Android host) ---- */
+          void w2c_env_hal_dma_set(struct w2c_env *e, u32 ch, u32 src, u32 dst, u32 ctl) { (void)e; hal_dma_set((int)ch, src, dst, ctl); }
+          void w2c_env_hal_audio_push(struct w2c_env *e, u32 right, u32 left, u32 n, u32 rate) {
+              (void)e; size_t sz = g_inst.w2c_memory.size;
+              if (!g_mem || n > 4096 || (size_t)right + n > sz || (size_t)left + n > sz) return;
+              wl4_audio_push((const int8_t *)(g_mem + right), (const int8_t *)(g_mem + left), (int)n, (int)rate);
+          }
+          void w2c_env_LZ77UnCompVram(struct w2c_env *e, u32 src, u32 dst) { (void)e; bios_LZ77UnComp(src, dst); }
+          void w2c_env_hal_trace_val(struct w2c_env *e, u32 tag, u32 val) { (void)e; (void)tag; (void)val; }
+          void w2c_env_hal_unported_asm(struct w2c_env *e, u32 site) { (void)e; wl4_logf("UNPORTED asm site #%u", site); }
+          u32  w2c_env_hal_poll_vcount(struct w2c_env *e) { (void)e; return hal_poll_vcount(); }
+          void w2c_env_CPUSet(struct w2c_env *e, u32 s, u32 d, u32 c) { (void)e; bios_CpuSet(s, d, c); }
+          void w2c_env_CpuFastSet(struct w2c_env *e, u32 s, u32 d, u32 c) { (void)e; bios_CpuFastSet(s, d, c); }
+          void w2c_env_LZ77UnCompWram(struct w2c_env *e, u32 s, u32 d) { (void)e; bios_LZ77UnComp(s, d); }
+          void w2c_env_RLUnCompWram(struct w2c_env *e, u32 s, u32 d) { (void)e; bios_RLUnComp(s, d); }
+          void w2c_env_RLUnCompVram(struct w2c_env *e, u32 s, u32 d) { (void)e; bios_RLUnComp(s, d); }
+          void w2c_env_BgAffineSet(struct w2c_env *e, u32 s, u32 d, u32 n) { (void)e; bios_BgAffineSet(s, d, (int32_t)n); }
+          void w2c_env_ObjAffineSet(struct w2c_env *e, u32 s, u32 d, u32 n, u32 o) { (void)e; bios_ObjAffineSet(s, d, (int32_t)n, (int32_t)o); }
+          void w2c_env_irq_handler(struct w2c_env *e) { (void)e; }
+          void w2c_env_hal_syscall(struct w2c_env *e, u32 num) { (void)e; if (num == 2 || num == 5) hal_run_frame(); }
+
+          static void cb_vblank(void) { w2c_wl4_InterruptCallbackCallVBlank(&g_inst); }
+          static void cb_hblank(void) { w2c_wl4_InterruptCallbackCallHBlank(&g_inst); }
+          static void cb_vcount(void) { w2c_wl4_InterruptCallbackCallVCount(&g_inst); }
+          static void cb_frame(void) {
+              static unsigned next, acc; static int init, run, fsc;
+              wl4_audio_poll();
+              if (!g_skipNow) { int i = g_idx ^ 1; memcpy(g_buf[i], hal_framebuffer(), sizeof g_buf[0]); g_idx = i; g_presented++; }
+              g_frames++;
+              if (g_stop) { g_running = 0; plat_exit_thread(); }
+              while (g_paused && !g_stop) { plat_sleep_us(16000); init = 0; }
+              if (g_stop) { g_running = 0; plat_exit_thread(); }
+              unsigned now = plat_now_ms();
+              if (!init || (int)(now - next) > 100 || (int)(next - now) > 100) { next = now; acc = 0; init = 1; }
+              next += 16; acc += 743; if (acc >= 1000) { acc -= 1000; next++; }          /* 59.7275 Hz */
+              int ahead = (int)(next - now);
+              if (ahead > 1) plat_sleep_us((unsigned)(ahead - 1) * 1000u);
+              int behind = (int)(plat_now_ms() - next);
+              if (g_fs < 0) { if (behind > 12 && run < 3) { g_skipNow = 1; run++; } else { g_skipNow = 0; run = 0; } }
+              else g_skipNow = (fsc++ % (g_fs + 1)) != 0;
+          }
+
+          int wl4_thread_main(void *arg) {
+              (void)arg;
+              wl4_logf("game thread start, rom=%u bytes", g_romSize);
+              wasm_rt_init();
+              g_env.inst = &g_inst;
+              wasm2c_wl4_instantiate(&g_inst, &g_env);
+              hal_init(g_inst.w2c_memory.data, g_inst.w2c_memory.size);
+              HalCallbacks cb = { cb_vblank, cb_hblank, cb_vcount, cb_frame }; hal_set_callbacks(&cb);
+              if (g_haveSave) memcpy(hal_sram(), g_save, GBA_SRAM_SIZE);
+              if (hal_load_rom(g_rom, g_romSize, g_inst.w2c_rom_image) != 0) { wl4_logf("ROM does not fit"); g_trap = 1000; g_running = 0; return 0; }
+              g_ready = 1;
+              wl4_logf("entering AgbMain");
+              w2c_wl4_AgbMain(&g_inst);
+              wl4_logf("AgbMain returned");
+              g_running = 0; return 0;
+          }
+          int  wl4_prepare(const unsigned char *rom, unsigned size) {
+              if (g_running) return -1;
+              g_rom = rom; g_romSize = size; g_stop = 0; g_paused = 0; g_frames = 0; g_trap = 0; g_ready = 0; g_skipNow = 0; g_running = 1;
+              wl4_audio_start(); return 0;
+          }
+          void wl4_request_stop(void) { g_stop = 1; wl4_audio_stop(); }
+          void wl4_pause(int p) { g_paused = p; wl4_audio_pause(p); }
+          void wl4_set_keys(unsigned short k) { hal_set_keys(k); }
+          void wl4_set_frameskip(int n) { g_fs = n; }
+          void wl4_load_save(const unsigned char *d, unsigned n) { memset(g_save, 0xFF, sizeof g_save); memcpy(g_save, d, n > sizeof g_save ? sizeof g_save : n); g_haveSave = 1; }
+          int  wl4_read_save(unsigned char *out) { if (g_ready) memcpy(out, hal_sram(), GBA_SRAM_SIZE); else memcpy(out, g_save, GBA_SRAM_SIZE); return GBA_SRAM_SIZE; }
+          int  wl4_running(void) { return g_running; }
+          int  wl4_frame_counter(void) { return g_presented; }
+          int  wl4_copy_frame(unsigned *out) { memcpy(out, g_buf[g_idx], sizeof g_buf[0]); return g_presented; }
+          int  wl4_trap_code(void) { return g_trap; }
+          WL4_EOF
+          mkdir -p symbian/core
+          cat > symbian/core/shim.c <<'WL4_EOF'
+          /* shim.c - the few libc functions the wasm2c runtime and the HAL need (no libc on this target). */
+          #include <stddef.h>
+          #include <stdarg.h>
+          #include "host_api.h"
+          #define W __attribute__((weak))
+          int errno;
+          W void *memcpy(void *d, const void *s, size_t n) {
+              unsigned char *dd = d; const unsigned char *ss = s;
+              if ((((unsigned)dd | (unsigned)ss) & 3) == 0) {
+                  unsigned *d4 = (unsigned *)dd; const unsigned *s4 = (const unsigned *)ss;
+                  while (n >= 4) { *d4++ = *s4++; n -= 4; }
+                  dd = (unsigned char *)d4; ss = (const unsigned char *)s4;
+              }
+              while (n--) *dd++ = *ss++;
+              return d;
+          }
+          W void *memmove(void *d, const void *s, size_t n) {
+              unsigned char *dd = d; const unsigned char *ss = s;
+              if (dd < ss || dd >= ss + n) return memcpy(d, s, n);
+              dd += n; ss += n; while (n--) *--dd = *--ss;
+              return d;
+          }
+          W void *memset(void *d, int c, size_t n) {
+              unsigned char *dd = d; unsigned v = (unsigned char)c;
+              if (((unsigned)dd & 3) == 0) {
+                  unsigned w = v * 0x01010101u; unsigned *d4 = (unsigned *)dd;
+                  while (n >= 4) { *d4++ = w; n -= 4; }
+                  dd = (unsigned char *)d4;
+              }
+              while (n--) *dd++ = (unsigned char)v;
+              return d;
+          }
+          W int memcmp(const void *a, const void *b, size_t n) {
+              const unsigned char *x = a, *y = b;
+              while (n--) { if (*x != *y) return *x - *y; x++; y++; }
+              return 0;
+          }
+          W size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
+          W int strcmp(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return (unsigned char)*a - (unsigned char)*b; }
+          W void *malloc(size_t n) { return plat_malloc((unsigned)n); }
+          W void *calloc(size_t a, size_t b) { size_t n = a * b; void *p = plat_malloc((unsigned)n); if (p) memset(p, 0, n); return p; }
+          W void *realloc(void *p, size_t n) { return plat_realloc(p, (unsigned)n); }
+          W void free(void *p) { if (p) plat_free(p); }
+          W void abort(void) { plat_exit_thread(); for (;;) {} }
+          W void exit(int c) { (void)c; plat_exit_thread(); for (;;) {} }
+          W int abs(int x) { return x < 0 ? -x : x; }
+          /* stdio is a no-op sink except vsnprintf (used by the host logger) */
+          struct wl4_file { int dummy; };
+          static struct wl4_file g_so, g_se;
+          struct wl4_file *stdout = &g_so, *stderr = &g_se;
+          W int fprintf(struct wl4_file *f, const char *fmt, ...) { (void)f; (void)fmt; return 0; }
+          W int printf(const char *fmt, ...) { (void)fmt; return 0; }
+          W int fputs(const char *s, struct wl4_file *f) { (void)s; (void)f; return 0; }
+          W int puts(const char *s) { (void)s; return 0; }
+          W int fflush(struct wl4_file *f) { (void)f; return 0; }
+          W int vsnprintf(char *out, size_t max, const char *fmt, va_list ap) {
+              size_t o = 0;
+          #define PUT(ch) do { if (o + 1 < max) out[o] = (char)(ch); o++; } while (0)
+              for (; *fmt; fmt++) {
+                  if (*fmt != 0x25) { PUT(*fmt); continue; }
+                  fmt++; int zero = 0, width = 0;
+                  if (*fmt == 0x30) { zero = 1; fmt++; }
+                  while (*fmt >= 0x30 && *fmt <= 0x39) { width = width * 10 + (*fmt - 0x30); fmt++; }
+                  while (*fmt == 0x6C || *fmt == 0x7A || *fmt == 0x68) fmt++;
+                  char tmp[16]; int n = 0; unsigned v; int neg = 0; const char *s;
+                  switch (*fmt) {
+                  case 0x64: case 0x69: { int i = va_arg(ap, int); if (i < 0) { neg = 1; v = (unsigned)-i; } else v = (unsigned)i; goto num10; }
+                  case 0x75: v = va_arg(ap, unsigned);
+                  num10: do { tmp[n++] = (char)(0x30 + v % 10); v /= 10; } while (v);
+                      if (neg) tmp[n++] = 0x2D;
+                      while (width > n) { PUT(zero ? 0x30 : 0x20); width--; }
+                      while (n) PUT(tmp[--n]);
+                      break;
+                  case 0x78: case 0x58: case 0x70: v = va_arg(ap, unsigned);
+                      do { unsigned d = v & 15; tmp[n++] = (char)(d < 10 ? 0x30 + d : 0x57 + d); v >>= 4; } while (v);
+                      while (width > n) { PUT(zero ? 0x30 : 0x20); width--; }
+                      while (n) PUT(tmp[--n]);
+                      break;
+                  case 0x73: s = va_arg(ap, const char *); if (!s) s = "(null)"; while (*s) PUT(*s++); break;
+                  case 0x63: PUT(va_arg(ap, int)); break;
+                  case 0x25: PUT(0x25); break;
+                  default: PUT(0x3F); break;
+                  }
+              }
+              if (max) out[o < max ? o : max - 1] = 0;
+              return (int)o;
+          }
+          W int snprintf(char *out, size_t max, const char *fmt, ...) { va_list ap; va_start(ap, fmt); int r = vsnprintf(out, max, fmt, ap); va_end(ap); return r; }
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/assert.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_ASSERT_H
+          #define WL4_SHIM_ASSERT_H
+          #define assert(x) ((void)0)
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/errno.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_ERRNO_H
+          #define WL4_SHIM_ERRNO_H
+          extern int errno;
+          #define ENOMEM 12
+          #define EINVAL 22
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/inttypes.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_INTTYPES_H
+          #define WL4_SHIM_INTTYPES_H
+          #include <stdint.h>
+          #define PRId32 "d"
+          #define PRIu32 "u"
+          #define PRIx32 "x"
+          #define PRId64 "lld"
+          #define PRIu64 "llu"
+          #define PRIx64 "llx"
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/math.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_MATH_H
+          #define WL4_SHIM_MATH_H
+          #define fabs(x) __builtin_fabs(x)
+          #define fabsf(x) __builtin_fabsf(x)
+          #define ceil(x) __builtin_ceil(x)
+          #define ceilf(x) __builtin_ceilf(x)
+          #define floor(x) __builtin_floor(x)
+          #define floorf(x) __builtin_floorf(x)
+          #define trunc(x) __builtin_trunc(x)
+          #define truncf(x) __builtin_truncf(x)
+          #define nearbyint(x) __builtin_nearbyint(x)
+          #define nearbyintf(x) __builtin_nearbyintf(x)
+          #define sqrt(x) __builtin_sqrt(x)
+          #define sqrtf(x) __builtin_sqrtf(x)
+          #define copysign(a,b) __builtin_copysign(a,b)
+          #define copysignf(a,b) __builtin_copysignf(a,b)
+          #define fmin(a,b) __builtin_fmin(a,b)
+          #define fminf(a,b) __builtin_fminf(a,b)
+          #define fmax(a,b) __builtin_fmax(a,b)
+          #define fmaxf(a,b) __builtin_fmaxf(a,b)
+          #define isnan(x) __builtin_isnan(x)
+          #define isinf(x) __builtin_isinf(x)
+          #define signbit(x) __builtin_signbit(x)
+          #define NAN __builtin_nanf("")
+          #define INFINITY __builtin_inff()
+          #define HUGE_VAL __builtin_huge_val()
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/setjmp.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_SETJMP_H
+          #define WL4_SHIM_SETJMP_H
+          /* traps never unwind in this port: the trap handler ends the game thread */
+          typedef int jmp_buf[1];
+          #define setjmp(b) (0)
+          #define _setjmp(b) (0)
+          static inline void longjmp(jmp_buf b, int v) { (void)b; (void)v; for (;;) {} }
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/signal.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_SIGNAL_H
+          #define WL4_SHIM_SIGNAL_H
+          typedef int sig_atomic_t;
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/stdio.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_STDIO_H
+          #define WL4_SHIM_STDIO_H
+          #include <stddef.h>
+          #include <stdarg.h>
+          #define EOF (-1)
+          typedef struct wl4_file FILE;
+          extern FILE *stdout, *stderr;
+          int fprintf(FILE *, const char *, ...);
+          int printf(const char *, ...);
+          int snprintf(char *, size_t, const char *, ...);
+          int vsnprintf(char *, size_t, const char *, va_list);
+          int fputs(const char *, FILE *);
+          int puts(const char *);
+          int fflush(FILE *);
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/stdlib.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_STDLIB_H
+          #define WL4_SHIM_STDLIB_H
+          #include <stddef.h>
+          void *malloc(size_t);
+          void *calloc(size_t, size_t);
+          void *realloc(void *, size_t);
+          void  free(void *);
+          void  abort(void) __attribute__((noreturn));
+          void  exit(int) __attribute__((noreturn));
+          int   abs(int);
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/string.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_STRING_H
+          #define WL4_SHIM_STRING_H
+          #include <stddef.h>
+          void *memcpy(void *, const void *, size_t);
+          void *memmove(void *, const void *, size_t);
+          void *memset(void *, int, size_t);
+          int   memcmp(const void *, const void *, size_t);
+          size_t strlen(const char *);
+          int   strcmp(const char *, const char *);
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim
+          cat > symbian/shim/unistd.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_UNISTD_H
+          #define WL4_SHIM_UNISTD_H
+          #endif
+          WL4_EOF
+          mkdir -p symbian/shim/sys
+          cat > symbian/shim/sys/mman.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_UNISTD_H
+          #define WL4_SHIM_UNISTD_H
+          #endif
+          WL4_EOF
+          mkdir -p symbian/tools
+          cat > symbian/tools/gen_mem.py <<'WL4_EOF'
+          #!/usr/bin/env python3
+          """Generate wl4_mem.c: wasm_rt_allocate/grow/free_memory backed by a sparse Symbian chunk.
+          Prototypes are read from the staged wasm-rt.h so the file matches the wabt version that produced it.
+          usage: gen_mem.py wasm-rt.h out.c"""
+          import re, sys
+
+          hdr = open(sys.argv[1]).read()
+
+
+          def proto(name):
+              m = re.search(r"([\w\s\*]*?)\b%s\s*\(([^)]*)\)\s*;" % name, hdr)
+              if not m:
+                  sys.exit("prototype of %s not found in wasm-rt.h" % name)
+              words = [t for t in m.group(1).split() if t not in ("extern", "static", "inline")]
+              ret = " ".join(words) or "void"
+              params = []
+              for p in m.group(2).split(","):
+                  p = p.strip()
+                  toks = re.findall(r"\w+|\*", p)
+                  if len(toks) >= 2 and re.match(r"\w+$", toks[-1]) and toks[-2] != "const":
+                      p = p[: p.rfind(toks[-1])].rstrip()
+                  params.append(p)
+              return ret, params
+
+
+          rA, pA = proto("wasm_rt_allocate_memory")
+          rG, pG = proto("wasm_rt_grow_memory")
+          rF, pF = proto("wasm_rt_free_memory")
+
+          o = []
+          o += ['#include "wasm-rt.h"', '#include "host_api.h"',
+                'unsigned wl4_rom_commit_size(void);', 'int wl4_mem_error;',
+                '#ifndef WL4_DATA_COMMIT', '#define WL4_DATA_COMMIT 0x3000000u', '#endif',
+                'static void wl4_mem_alloc(wasm_rt_memory_t *m, unsigned long long ip, unsigned long long mp, int is64) {',
+                '  static const unsigned R[][2] = {{0x02000000u,0x40000u},{0x03000000u,0x8000u},{0x04000000u,0x1000u},',
+                '    {0x05000000u,0x1000u},{0x06000000u,0x20000u},{0x07000000u,0x1000u},{0x0E000000u,0x10000u}};',
+                '  unsigned bytes = (unsigned)(ip * 65536ull); unsigned i;',
+                '  unsigned char *base = (unsigned char *)plat_mem_reserve(bytes);',
+                '  if (!base) { wl4_mem_error = 1; m->data = 0; m->size = 0; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  for (i = 0; i < sizeof R / sizeof R[0]; i++)',
+                '    if (plat_mem_commit(R[i][0], R[i][1])) { wl4_mem_error = 2; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  if (plat_mem_commit(0x08000000u, wl4_rom_commit_size())) { wl4_mem_error = 3; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  if (plat_mem_commit(0x0A000000u, WL4_DATA_COMMIT)) { wl4_mem_error = 4; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  m->data = base; m->size = bytes; m->pages = ip; m->max_pages = mp;']
+          o.append('  m->is64 = is64;' if len(pA) >= 4 else '  (void)is64;')
+          o.append('}')
+          args = ", ".join("%s p%d" % (t, i) for i, t in enumerate(pA))
+          call = "p0, (unsigned long long)p1, (unsigned long long)p2, %s" % ("p3" if len(pA) >= 4 else "0")
+          o.append("%s wasm_rt_allocate_memory(%s) { wl4_mem_alloc(%s); }" % (rA, args, call))
+          o.append("%s wasm_rt_grow_memory(%s) { return (%s)-1; }" % (rG, ", ".join("%s p%d" % (t, i) for i, t in enumerate(pG)), rG))
+          o.append("%s wasm_rt_free_memory(%s) { plat_mem_release(); p0->data = 0; }" % (rF, ", ".join("%s p%d" % (t, i) for i, t in enumerate(pF))))
+          open(sys.argv[2], "w").write("\n".join(o) + "\n")
+          print("gen_mem: allocate=%s grow=%s" % (pA, pG))
+          WL4_EOF
+          mkdir -p symbian/tools
+          cat > symbian/tools/patch_bios.py <<'WL4_EOF'
+          #!/usr/bin/env python3
+          """Replace the libm-based sin16() in hal/bios.c with a 256-entry integer table (no libm on Symbian).
+          usage: patch_bios.py bios.c"""
+          import re, sys, math
+
+          p = sys.argv[1]
+          s = open(p).read()
+          tab = ",".join(str(int(round(math.sin(i * 2 * math.pi / 256) * 16384.0))) for i in range(256))
+          new = ("static const int16_t wl4_sintab[256] = {%s};\n"
+                 "static int32_t sin16(uint16_t a) { return wl4_sintab[a >> 8]; }" % tab)
+          s2, n = re.subn(r"static int32_t sin16\(uint16_t a\) \{[^\n]*\}", new, s)
+          if n != 1:
+              print("patch_bios: sin16 not found, showing math users:")
+              for i, l in enumerate(s.splitlines(), 1):
+                  if "sin" in l or "cos" in l or "math" in l or "lround" in l:
+                      print(i, l)
+              sys.exit(1)
+          s2 = s2.replace("#include <math.h>", "")
+          open(p, "w").write(s2)
+          print("patch_bios: ok")
+          WL4_EOF
+
+      - name: Cross-compile the C game core into wl4core.lib
+        env:
+          CORE_OPT: ${{ inputs.core_opt }}
+          COMMIT_MB: ${{ inputs.commit_mb }}
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          env | grep -i -E 'N8_|EPOC|SYMBIAN|GCCE' | sort || true
+          CC="$(command -v arm-none-symbianelf-gcc || find "$SYMBIAN_VOL" -type f -name arm-none-symbianelf-gcc | head -1)"
+          test -x "$CC" || { echo "::error::arm-none-symbianelf-gcc not found"; exit 1; }
+          AR="${CC%gcc}ar"; NM="${CC%gcc}nm"
+          echo "CC=$CC"; "$CC" --version | head -1
+          EPOC="${EPOCROOT:-}"
+          if [ -z "$EPOC" ] || [ ! -d "$EPOC/epoc32" ]; then
+            EPOC="$(dirname "$(dirname "$(find "$SYMBIAN_VOL" -type d -path '*epoc32/release' | head -1)")")/"
+          fi
+          echo "EPOCROOT=$EPOC"; test -d "$EPOC/epoc32" || { echo "::error::epoc32 not found"; exit 1; }
+
+          ROOT="$PWD"; W="$ROOT/w2c/wasm2c"; H="$ROOT/w2c/hal"; S="$ROOT/symbian"; B="$ROOT/build-core"
+          mkdir -p "$B"
+
+          # ---- prepare generated sources ----
+          python3 - "$W" <<'PY'
+          import re, sys, glob
+          w = sys.argv[1]
+          # no TLS on this target; drop runtime .c files that wl4.c pulls in by #include (they are built separately below)
+          for f in glob.glob(w + "/*.c") + glob.glob(w + "/*.h") + glob.glob(w + "/*.inc"):
+              s = open(f, errors="replace").read()
+              s2 = re.sub(r"\b_Thread_local\b|\b__thread\b", "", s)
+              if f.endswith("/wl4.c"):
+                  s2 = re.sub(r'^\s*#\s*include\s+"wasm-rt-[\w\-]+\.c"\s*$', "", s2, flags=re.M)
+              if s2 != s:
+                  open(f, "w").write(s2)
+          PY
+          python3 "$S/tools/patch_bios.py" "$H/bios.c"
+          python3 "$S/tools/gen_mem.py" "$W/wasm-rt.h" "$B/wl4_mem.c"
+
+          # ---- commit size: max(input, data end + 8 MB) ----
+          DATA_END=$(cat w2c/data_end.txt 2>/dev/null || echo 0)
+          NEED_MB=$(( ( (DATA_END > 167772160 ? DATA_END - 167772160 : 0) / 1048576 ) + 10 ))
+          MB="${COMMIT_MB:-48}"; [ "$NEED_MB" -gt "$MB" ] && MB="$NEED_MB"
+          echo "commit at 0x0A000000: ${MB} MB (data segments need ~${NEED_MB} MB)"
+
+          GCCINC="$("$CC" -print-file-name=include)"
+          FLAGS="-march=armv5t -marm -mthumb-interwork -mfloat-abi=soft -ffreestanding -nostdinc -fno-strict-aliasing -fwrapv -fno-exceptions -w -D__SYMBIAN32__ -D__GCCE__ -D__EPOC32__ -D__MARM__ -D__EABI__"
+          INC="-I $S/shim -isystem $GCCINC -isystem $GCCINC-fixed -I $W -I $S/core -I $H"
+          RTDEF="-DWASM_RT_USE_MMAP=0 -DWASM_RT_TRAP_HANDLER=wl4_trap"
+          O="${CORE_OPT:-1}"
+
+          cc1() { out="$1"; shift; echo "CC $out"; "$CC" $FLAGS $INC "$@" -c -o "$B/$out.o" ; }
+          PIDS=()
+          bg() { "$@" & PIDS+=($!); }
+          bg cc1 shim        -O2 -fno-tree-loop-distribute-patterns "$S/core/shim.c"
+          bg cc1 audio_sym   -O2 "$S/core/audio_sym.c"
+          bg cc1 host_sym    -O2 $RTDEF "$S/core/host_sym.c"
+          for f in "$H"/*.c; do
+            n="hal_$(basename "$f" .c)"
+            if [ "$(basename "$f")" = "ppu.c" ]; then bg cc1 "$n" -O2 "$f"; else bg cc1 "$n" -O2 -Dppu_render_scanline=wl4_ppu_line "$f"; fi
+          done
+          bg cc1 wl4_stubs   -O1 $RTDEF "$W/wl4_stubs.c"
+          bg cc1 wl4_mem     -O2 $RTDEF -DWL4_DATA_COMMIT=$((MB*1024*1024))u "$B/wl4_mem.c"
+          for f in "$W"/wasm-rt-*.c; do
+            case "$f" in *-win.c|*os-unix.c|*os-win.c) continue;; esac
+            bg cc1 "rt_$(basename "$f" .c)" -O2 $RTDEF \
+              -Dwasm_rt_allocate_memory=wl4_orig_allocate_memory -Dwasm_rt_grow_memory=wl4_orig_grow_memory \
+              -Dwasm_rt_free_memory=wl4_orig_free_memory "$f"
+          done
+          for p in "${PIDS[@]}"; do wait "$p" || { echo "::error::a compile job failed"; FAIL=1; }; done
+          [ -z "$FAIL" ] || exit 1
+          # the big one (several minutes)
+          time cc1 wl4 -O"$O" $RTDEF "$W/wl4.c"
+
+          rm -f "$B/wl4core.a"
+          "$AR" rcs "$B/wl4core.a" "$B"/*.o
+          ls -l "$B/wl4core.a"
+          echo "--- undefined symbols still to resolve at link (expect only plat_* / wl4_* / compiler helpers):"
+          "$NM" -u "$B/wl4core.a" 2>/dev/null | grep -v '^$' | grep ' U ' | sort -u | head -60 || true
+          for d in release/gcce/urel release/armv5/urel release/gcce/lib release/armv5/lib; do
+            mkdir -p "$EPOC/epoc32/$d"; cp "$B/wl4core.a" "$EPOC/epoc32/$d/wl4core.lib"
+          done
+
+      - name: Build wl4.exe (abld)
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          cd symbian/app/group
+          bldmake bldfiles
+          abld build -keepgoing gcce urel 2>&1 | tee "$GITHUB_WORKSPACE/abld.log"
+
+      - name: Package signed SIS
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          "$N8_REPO/Scripts/package-sis.sh" symbian/app/sis/wl4.pkg "$GITHUB_WORKSPACE/dist"
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wl4-symbian3
+          path: dist/wl4.sisx
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wl4-build-logs
+          path: |
+            abld.log
+            build-core/*.o
+          if-no-files-found: ignore
+          retention-days: 3
