@@ -1716,6 +1716,12 @@ jobs:
           static inline void mtx_destroy(mtx_t *m) { (void)m; }
           #endif
           WL4_EOF
+          cat > symbian/shim/alloca.h <<'WL4_EOF'
+          #ifndef WL4_SHIM_ALLOCA_H
+          #define WL4_SHIM_ALLOCA_H
+          #define alloca(n) __builtin_alloca(n)
+          #endif
+          WL4_EOF
           cat > symbian/shim/string.h <<'WL4_EOF'
           #ifndef WL4_SHIM_STRING_H
           #define WL4_SHIM_STRING_H
