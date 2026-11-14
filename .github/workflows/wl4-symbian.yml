@@ -1586,9 +1586,12 @@ jobs:
           #define WL4_SHIM_SETJMP_H
           /* traps never unwind in this port: the trap handler ends the game thread */
           typedef int jmp_buf[1];
+          typedef int sigjmp_buf[1];
           #define setjmp(b) (0)
           #define _setjmp(b) (0)
+          #define sigsetjmp(b, m) (0)
           static inline void longjmp(jmp_buf b, int v) { (void)b; (void)v; for (;;) {} }
+          static inline void siglongjmp(sigjmp_buf b, int v) { (void)b; (void)v; for (;;) {} }
           #endif
           WL4_EOF
           mkdir -p symbian/shim
@@ -1702,8 +1705,15 @@ jobs:
           cat > symbian/shim/threads.h <<'WL4_EOF'
           #ifndef WL4_SHIM_THREADS_H
           #define WL4_SHIM_THREADS_H
-          /* single-threaded runtime on this target: no TLS */
+          /* single-threaded runtime on this target: no TLS, mutexes are no-ops */
           #define thread_local
+          typedef int mtx_t;
+          enum { thrd_success = 0, thrd_error = 2 };
+          enum { mtx_plain = 0, mtx_recursive = 1 };
+          static inline int mtx_init(mtx_t *m, int t) { (void)t; *m = 0; return thrd_success; }
+          static inline int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
+          static inline int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
+          static inline void mtx_destroy(mtx_t *m) { (void)m; }
           #endif
           WL4_EOF
           cat > symbian/shim/string.h <<'WL4_EOF'
