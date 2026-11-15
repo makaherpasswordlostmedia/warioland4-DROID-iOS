@@ -413,7 +413,7 @@ jobs:
 
           LIBRARY         euser.lib apparc.lib cone.lib eikcore.lib avkon.lib eikcoctl.lib
           LIBRARY         fbscli.lib bitgdi.lib gdi.lib ws32.lib efsrv.lib
-          LIBRARY         mediaclientaudiostream.lib bafl.lib
+          LIBRARY         mediaclientaudiostream.lib bafl.lib hal.lib
 
           // the C game core is cross-compiled separately into wl4core.lib (see workflow)
           STATICLIBRARY   wl4core.lib
@@ -437,6 +437,8 @@ jobs:
           #include "host_api.h"
 
           void Wl4Log(const TDesC8& aMsg);   // wl4_log.cpp
+          void Wl4LogMem(const TDesC8& aTag);
+          void Wl4InstallExc();
 
           const TUid KUidWl4 = { (TInt32)0xE1A5B0CE };
 
@@ -651,7 +653,9 @@ jobs:
 
           GLDEF_C TInt E32Main()
               {
-              Wl4Log(_L8("---- E32Main: wl4 starting ----"));
+              Wl4Log(_L8("======== E32Main: wl4 starting, build " __DATE__ " " __TIME__ " ========"));
+              Wl4InstallExc();
+              Wl4LogMem(_L8("start"));
               TInt r = EikStart::RunApplication(NewApplication);
               TBuf8<48> b;
               b.Format(_L8("E32Main: exit %d"), r);
@@ -764,6 +768,8 @@ jobs:
 
           static TInt GameThreadEntry(TAny*)
               {
+              Wl4InstallExc();
+              Wl4Log(_L8("game thread: entry"));
               wl4_thread_main(0);
               return 0;
               }
@@ -902,6 +908,7 @@ jobs:
                   return EFalse;
                   }
               iRomSize = size;
+              Wl4LogMem(_L8("after ROM read"));
               {
               TBuf8<80> lb;
               lb.Format(_L8("ROM read %d bytes, code %c%c%c%c"), size, iRom[0xAC], iRom[0xAD], iRom[0xAE], iRom[0xAF]);
@@ -961,6 +968,7 @@ jobs:
               TBuf8<64> lb;
               lb.Format(_L8("wl4.dat read err %d, bind %d"), err, berr);
               Wl4Log(lb);
+              Wl4LogMem(_L8("after wl4.dat"));
               }
               if (err != KErrNone || berr != 0)
                   {
@@ -1087,7 +1095,7 @@ jobs:
               {
               if ((++iTicks & 127) == 0) { User::ResetInactivityTime(); }
               if ((iTicks % 1800) == 0) { SaveBattery(); }
-              if ((iTicks % 300) == 0)
+              if (iTicks == 1 || iTicks == 5 || iTicks == 30 || (iTicks < 1800 && (iTicks % 60) == 0) || (iTicks % 600) == 0)
                   {
                   TBuf8<96> hb;
                   hb.Format(_L8("heartbeat: tick %d, frames shown %d, running %d"), iTicks, wl4_frame_counter(), wl4_running());
@@ -1267,13 +1275,18 @@ jobs:
 
           void CWl4Container::Draw(const TRect& aRect) const
               {
+              static TBool logged = EFalse;
+              if (!logged) { logged = ETrue; TBuf8<64> lb; lb.Format(_L8("Draw: first call, mode %d"), (TInt)iMode); Wl4Log(lb); }
               CWindowGc& gc = SystemGc();
               gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
               gc.SetBrushColor(KRgbBlack);
               gc.Clear(aRect);
               if (iMode == EMsg) { DrawMsg(gc); return; }
               gc.DrawBitmap(GameRect(), iBitmap);
+              static TBool padLogged = EFalse;
+              if (!padLogged) { Wl4Log(_L8("Draw: bitmap done, drawing pad")); }
               DrawPad(gc);
+              if (!padLogged) { padLogged = ETrue; Wl4Log(_L8("Draw: pad done")); }
               if (iMode == EMenu) { DrawMenu(gc); }
               }
 
@@ -1449,6 +1462,7 @@ jobs:
           // Tries E:\wl4\wl4_boot.log, then C:\data\wl4_boot.log, then E:\wl4_boot.log.
           #include <e32std.h>
           #include <f32file.h>
+          #include <hal.h>
           #include "wl4_app.h"
 
           void Wl4Log(const TDesC8& aMsg)
@@ -1487,6 +1501,47 @@ jobs:
               TPtrC8 p((const TUint8*)aMsg);
               Wl4Log(p);
               }
+
+          // ---- memory snapshot: shows OOM / heap pressure at every stage ----
+          void Wl4LogMem(const TDesC8& aTag)
+              {
+              TInt freeRam = 0, totalRam = 0;
+              HAL::Get(HALData::EMemoryRAMFree, freeRam);
+              HAL::Get(HALData::EMemoryRAM, totalRam);
+              TInt heap = User::Heap().Size();
+              TBuf8<160> b;
+              b.Format(_L8("MEM[%S] ramFree=%d KB ramTotal=%d KB heap=%d KB"), &aTag, freeRam / 1024, totalRam / 1024, heap / 1024);
+              Wl4Log(b);
+              }
+
+          extern "C" void plat_log_mem(const char* aTag)
+              {
+              TPtrC8 t((const TUint8*)aTag);
+              Wl4LogMem(t);
+              }
+
+          // ---- per-thread exception handler: logs what killed the thread, then panics ----
+          static void Wl4ExcHandler(TExcType aType)
+              {
+              RThread me;
+              TFullName full = me.FullName();
+              TBuf8<80> nm;
+              nm.Copy(full.Right(70));
+              TBuf8<220> b;
+              b.Format(_L8("!!! EXCEPTION type=%d thread=%S  [20=abort 9=access-violation 8=stack-fault 23=data-abort 24=code-abort 11=alignment 12=page-fault 1=div0 6=bad-opcode]"), (TInt)aType, &nm);
+              Wl4Log(b);
+              me.Panic(_L("WL4-EXC"), (TInt)aType);
+              }
+
+          void Wl4InstallExc()
+              {
+              TInt r = User::SetExceptionHandler(Wl4ExcHandler, 0xFFFFFFFF);
+              TBuf8<64> b;
+              b.Format(_L8("exception handler installed -> %d"), r);
+              Wl4Log(b);
+              }
+
+          extern "C" void plat_install_exc(void) { Wl4InstallExc(); }
           WL4_EOF
           mkdir -p symbian/core
           cat > symbian/core/audio_sym.c <<'WL4_EOF'
@@ -1574,6 +1629,8 @@ jobs:
           int   plat_mem_commit(unsigned off, unsigned len);
           void  plat_mem_release(void);
           void  plat_exit_thread(void);
+          void  plat_log_mem(const char *tag);  /* free RAM / heap snapshot into the log */
+          void  plat_install_exc(void);         /* per-thread exception logger */
           void  plat_log(const char *msg);      /* appended to wl4_boot.log immediately */
           unsigned plat_now_ms(void);
           void  plat_sleep_us(unsigned us);
@@ -1596,6 +1653,7 @@ jobs:
           void wl4_audio_start(void); void wl4_audio_stop(void); void wl4_audio_pause(int);
           void wl4_audio_poll(void); void wl4_audio_push(const int8_t *, const int8_t *, int, int);
 
+          static unsigned g_stackTop, g_stackMax;
           static w2c_wl4 g_inst; static struct w2c_env g_env;
           static uint32_t g_buf[2][GBA_W * GBA_H];
           static volatile int g_idx, g_presented, g_frames, g_stop, g_running, g_paused, g_trap, g_skipNow, g_fs = -1, g_ready;
@@ -1624,6 +1682,7 @@ jobs:
 
           void wl4_trap(wasm_rt_trap_t code) {
               g_trap = (int)code + 1;
+              wl4_logf("stack used at trap=%u max=%u", stack_used(), g_stackMax);
               wl4_logf("WASM TRAP %d (1=oob 2=int_overflow 3=div0 4=conv 5=unreachable 6=call_indirect ...) frame %d", (int)code, g_frames);
               g_running = 0; plat_exit_thread();
           }
@@ -1657,7 +1716,7 @@ jobs:
               wl4_audio_poll();
               if (!g_skipNow) { int i = g_idx ^ 1; memcpy(g_buf[i], hal_framebuffer(), sizeof g_buf[0]); g_idx = i; g_presented++; }
               g_frames++;
-              if (g_frames == 1 || (g_frames % 600) == 0) wl4_logf("frame %d (presented %d) tick %u", g_frames, g_presented, plat_now_ms());
+              if (g_frames == 1 || (g_frames % 600) == 0) wl4_logf("frame %d (presented %d) tick %u stack=%u max=%u", g_frames, g_presented, plat_now_ms(), stack_used(), g_stackMax);
               if (g_stop) { g_running = 0; plat_exit_thread(); }
               while (g_paused && !g_stop) { plat_sleep_us(16000); init = 0; }
               if (g_stop) { g_running = 0; plat_exit_thread(); }
@@ -1671,8 +1730,28 @@ jobs:
               else g_skipNow = (fsc++ % (g_fs + 1)) != 0;
           }
 
+          static void copy_chunked(uint8_t *dst, const unsigned char *src, unsigned n, const char *name) {
+              unsigned off = 0;
+              while (off < n) {
+                  unsigned c = n - off > 0x100000u ? 0x100000u : n - off;
+                  wl4_logf("copy %s off=%x dst=%x", name, off, (unsigned)(uintptr_t)(dst + off));
+                  memcpy(dst + off, src + off, c);
+                  off += c;
+              }
+              wl4_logf("copy %s done", name);
+          }
+
+          static unsigned stack_used(void) {
+              volatile char here; unsigned u = g_stackTop - (unsigned)(uintptr_t)&here;
+              if (u > g_stackMax) g_stackMax = u;
+              return u;
+          }
+
           int wl4_thread_main(void *arg) {
-              (void)arg;
+              volatile char marker; (void)arg;
+              g_stackTop = (unsigned)(uintptr_t)&marker;
+              wl4_logf("thread stack top=%x (2 MB stack), sizeof(instance)=%u", g_stackTop, (unsigned)sizeof(g_inst));
+              plat_log_mem("game thread start");
               wl4_logf("game thread start, rom=%u bytes", g_romSize);
               wasm_rt_init();
               g_env.inst = &g_inst;
@@ -1680,16 +1759,24 @@ jobs:
               wasm2c_wl4_instantiate(&g_inst, &g_env);
               wl4_logf("instantiate: done, mem=%x size=%x rom_image=%x", (unsigned)(uintptr_t)g_inst.w2c_memory.data, (unsigned)g_inst.w2c_memory.size, (unsigned)g_inst.w2c_rom_image);
               hal_init(g_inst.w2c_memory.data, g_inst.w2c_memory.size);
-              wl4_logf("hal_init done");
+              wl4_logf("hal_init done, stack used=%u", stack_used());
+              plat_log_mem("after instantiate+hal_init");
               if ((unsigned)g_inst.w2c_rom_image + g_romSize > wl4_commit_end) {
                   wl4_logf("FATAL: rom_image %x + %x is beyond committed %x (raise commit_mb)", (unsigned)g_inst.w2c_rom_image, g_romSize, wl4_commit_end);
                   g_trap = 1001; g_running = 0; return 0;
               }
+              wl4_logf("step: set callbacks");
               HalCallbacks cb = { cb_vblank, cb_hblank, cb_vcount, cb_frame }; hal_set_callbacks(&cb);
+              wl4_logf("step: restore save (have=%d) sram=%x", g_haveSave, (unsigned)(uintptr_t)hal_sram());
               if (g_haveSave) memcpy(hal_sram(), g_save, GBA_SRAM_SIZE);
-              if (hal_load_rom(g_rom, g_romSize, g_inst.w2c_rom_image) != 0) { wl4_logf("ROM does not fit"); g_trap = 1000; g_running = 0; return 0; }
+              wl4_logf("step: ROM copy, g_mem=%x rom=%x size=%x", (unsigned)(uintptr_t)g_mem, (unsigned)(uintptr_t)g_rom, g_romSize);
+              if (g_romSize > 0x02000000u || GBA_ROM_BASE + g_romSize > g_inst.w2c_memory.size || (unsigned)g_inst.w2c_rom_image + g_romSize > g_inst.w2c_memory.size) {
+                  wl4_logf("ROM does not fit"); g_trap = 1000; g_running = 0; return 0; }
+              copy_chunked(g_mem + GBA_ROM_BASE, g_rom, g_romSize, "rom@08000000");
+              copy_chunked(g_mem + g_inst.w2c_rom_image, g_rom, g_romSize, "rom_image");
               g_ready = 1;
-              wl4_logf("ROM copied, entering AgbMain");
+              plat_log_mem("after ROM copy");
+              wl4_logf("ROM copied, entering AgbMain, stack used=%u", stack_used());
               w2c_wl4_AgbMain(&g_inst);
               wl4_logf("AgbMain returned");
               g_running = 0; return 0;
