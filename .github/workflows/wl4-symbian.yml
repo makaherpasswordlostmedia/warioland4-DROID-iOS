@@ -919,6 +919,7 @@ jobs:
                   return EFalse;
                   }
               iRomSize = size;
+              plat_log_addr("iRom", (unsigned)iRom, (unsigned)size);
               Wl4LogMem(_L8("after ROM read"));
               {
               TBuf8<80> lb;
@@ -979,6 +980,7 @@ jobs:
               TBuf8<64> lb;
               lb.Format(_L8("wl4.dat read err %d, bind %d"), err, berr);
               Wl4Log(lb);
+              plat_log_addr("iData", (unsigned)iData, (unsigned)size);
               Wl4LogMem(_L8("after wl4.dat"));
               }
               if (err != KErrNone || berr != 0)
@@ -1431,6 +1433,11 @@ jobs:
               Wl4Log(b);
               if (err != KErrNone) { return 0; }
               gChunkOpen = ETrue;
+              {
+              TBuf8<120> c;
+              c.Format(_L8("chunk: base=%x end=%x maxsize=%d KB size=%d KB"), (TUint)gChunk.Base(), (TUint)gChunk.Base() + (TUint)gChunk.MaxSize(), gChunk.MaxSize() / 1024, gChunk.Size() / 1024);
+              Wl4Log(c);
+              }
               return gChunk.Base();
               }
 
@@ -1533,6 +1540,16 @@ jobs:
               }
 
           // ---- memory snapshot: shows OOM / heap pressure at every stage ----
+          extern "C" void plat_log_addr(const char* aTag, unsigned aAddr, unsigned aLen)
+              {
+              RHeap& h = User::Heap();
+              TPtrC8 t((const TUint8*)aTag);
+              TBuf8<200> b;
+              b.Format(_L8("ADDR[%S] %x..%x len=%x | this thread heap base=%x size=%x max=%x"),
+                  &t, aAddr, aAddr + aLen, aLen, (TUint)h.Base(), (TUint)h.Size(), (TUint)h.MaxLength());
+              Wl4Log(b);
+              }
+
           extern "C" unsigned plat_free_kb(void)
               {
               TMemoryInfoV1Buf mb;
@@ -1717,6 +1734,7 @@ jobs:
           int   plat_mem_ensure(unsigned off, unsigned len);  /* commit any uncommitted pages in range; returns pages newly committed, <0 on error */
           void  plat_mem_release(void);
           void  plat_exit_thread(void);
+          void plat_log_addr(const char *tag, unsigned addr, unsigned len);  /* logs range + the calling thread's heap range */
           unsigned plat_free_kb(void);  /* real free RAM in KB (UserHal::MemoryInfo) */
           void  plat_log_mem(const char *tag);  /* free RAM / heap snapshot into the log */
           void  plat_install_exc(void);         /* per-thread exception logger */
@@ -1821,19 +1839,24 @@ jobs:
           }
 
           static void copy_chunked(uint8_t *dst, const unsigned char *src, unsigned n, const char *name) {
-              unsigned off = 0;
+              unsigned off = 0, i;
+              volatile unsigned sink = 0;
               while (off < n) {
-                  unsigned c = n - off > 0x100000u ? 0x100000u : n - off;
-                  wl4_logf("copy %s off=%x dst=%x free=%uKB", name, off, (unsigned)(uintptr_t)(dst + off), plat_free_kb());
-                  {
-                      int e = plat_mem_ensure((unsigned)(uintptr_t)(dst + off) - (unsigned)(uintptr_t)g_mem, c);
-                      if (e != 0) wl4_logf("ensure: %d page(s) were NOT committed (neg=error)", e);
-                      if (e < 0) { g_trap = 1002; g_running = 0; return; }
-                  }
+                  unsigned c = n - off > 0x10000u ? 0x10000u : n - off;
+                  /* 64 KB steps; each step logs BEFORE touching memory, so the last log line names the faulting step:
+                     "cp" then no "src ok"  -> source buffer unreadable;  "src ok" then no "dst ok" -> destination chunk unwritable;
+                     "dst ok" then no next "cp" -> memcpy itself */
+                  wl4_logf("cp %s off=%x s=%x d=%x", name, off, (unsigned)(uintptr_t)(src + off), (unsigned)(uintptr_t)(dst + off));
+                  for (i = 0; i < c; i += 0x1000u) sink += *(volatile const unsigned char *)(src + off + i);
+                  sink += *(volatile const unsigned char *)(src + off + c - 1);
+                  wl4_logf("src ok");
+                  for (i = 0; i < c; i += 0x1000u) *(volatile unsigned char *)(dst + off + i) = 0;
+                  *(volatile unsigned char *)(dst + off + c - 1) = 0;
+                  wl4_logf("dst ok");
                   memcpy(dst + off, src + off, c);
                   off += c;
               }
-              wl4_logf("copy %s done free=%uKB", name, plat_free_kb());
+              wl4_logf("copy %s done", name);
           }
 
           static unsigned stack_used(void) {
@@ -1864,6 +1887,8 @@ jobs:
               HalCallbacks cb = { cb_vblank, cb_hblank, cb_vcount, cb_frame }; hal_set_callbacks(&cb);
               wl4_logf("step: restore save (have=%d) sram=%x", g_haveSave, (unsigned)(uintptr_t)hal_sram());
               if (g_haveSave) memcpy(hal_sram(), g_save, GBA_SRAM_SIZE);
+              plat_log_addr("rom buf (game thread view)", (unsigned)(uintptr_t)g_rom, g_romSize);
+              plat_log_addr("wasm mem", (unsigned)(uintptr_t)g_mem, (unsigned)g_inst.w2c_memory.size);
               wl4_logf("step: ROM copy, g_mem=%x rom=%x size=%x", (unsigned)(uintptr_t)g_mem, (unsigned)(uintptr_t)g_rom, g_romSize);
               if (g_romSize > 0x02000000u || GBA_ROM_BASE + g_romSize > g_inst.w2c_memory.size || (unsigned)g_inst.w2c_rom_image + g_romSize > g_inst.w2c_memory.size) {
                   wl4_logf("ROM does not fit"); g_trap = 1000; g_running = 0; return 0; }
