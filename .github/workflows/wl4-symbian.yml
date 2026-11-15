@@ -1702,8 +1702,10 @@ jobs:
               TBuf8<80> nm;
               nm.Copy(full.Right(70));
               TBuf8<220> b;
-              b.Format(_L8("!!! EXCEPTION type=%d thread=%S  [20=abort 9=access-violation 8=stack-fault 23=data-abort 24=code-abort 11=alignment 12=page-fault 1=div0 6=bad-opcode]"), (TInt)aType, &nm);
+              b.Format(_L8("!!! EXCEPTION type=%d thread=%S"), (TInt)aType, &nm);
               Wl4Log(b);
+              Wl4Log(_L8("    (1=div0 6=bad-opcode 8=stack-fault 9=access-violation 11=alignment 12=page-fault 20=abort 23=data-abort 24=code-abort)"));
+              Wl4Log(_L8("    page-fault/access-violation = touched memory that is not committed (see 'chunk commit' lines); last cp/step lines show how far boot got"));
               me.Panic(_L("WL4-EXC"), (TInt)aType);
               }
 
@@ -1918,7 +1920,7 @@ jobs:
                   unsigned c = n - off > 0x10000u ? 0x10000u : n - off;
                   /* the line is written BEFORE touching memory: after a crash the last "cp" line names the faulting step.
                      verbose.flag adds per-phase lines ("src ok"/"dst ok") to tell source / destination / memcpy apart. */
-                  wl4_logf("cp %s %x s=%x d=%x", name, off, (unsigned)(uintptr_t)(src + off), (unsigned)(uintptr_t)(dst + off));
+                  if (verbose || (off & 0xFFFFFu) == 0) wl4_logf("cp %s %x s=%x d=%x", name, off, (unsigned)(uintptr_t)(src + off), (unsigned)(uintptr_t)(dst + off));
                   for (i = 0; i < c; i += 0x1000u) sink += *(volatile const unsigned char *)(src + off + i);
                   sink += *(volatile const unsigned char *)(src + off + c - 1);
                   if (verbose) wl4_logf("  src ok");
@@ -2347,8 +2349,9 @@ jobs:
                 'unsigned wl4_rom_commit_size(void);', 'void wl4_log_kv(const char *, unsigned, int);', 'int wl4_mem_error;',
                 '#ifndef WL4_DATA_COMMIT', '#define WL4_DATA_COMMIT 0x3000000u', '#endif', 'unsigned wl4_commit_end = 0x0A000000u + WL4_DATA_COMMIT;',
                 'static void wl4_mem_alloc(wasm_rt_memory_t *m, unsigned long long ip, unsigned long long mp, int is64) {',
-                '  static const unsigned R[][2] = {{0x02000000u,0x40000u},{0x03000000u,0x8000u},{0x04000000u,0x1000u},',
-                '    {0x05000000u,0x1000u},{0x06000000u,0x20000u},{0x07000000u,0x1000u},{0x0E000000u,0x10000u}};',
+                '  /* 0x00000000..0x003FFFFF: BIOS area + null-pointer region (decomp code reads small/NULL addresses; Android maps all of it, Symbian faults) */',
+                '  static const unsigned R[][2] = {{0x00000000u,0x400000u},{0x02000000u,0x40000u},{0x03000000u,0x10000u},{0x04000000u,0x10000u},',
+                '    {0x05000000u,0x10000u},{0x06000000u,0x20000u},{0x07000000u,0x10000u},{0x0E000000u,0x10000u}};',
                 '  unsigned bytes = (unsigned)(ip * 65536ull); unsigned i;',
                 '  unsigned char *base = (unsigned char *)plat_mem_reserve(bytes);',
                 '  wl4_log_kv("mem alloc: pages", (unsigned)ip, 0);',
