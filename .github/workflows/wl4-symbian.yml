@@ -227,7 +227,7 @@ jobs:
               if b.endswith("-win.c") or "os-win" in b: continue
               if re.search(r'#\s*include\s+"%s"' % re.escape(b), src): continue
               rt.append(f)
-          cmd = ["gcc", "-O0", "-w", "-I", W, "/tmp/wl4_dump.c", W + "/wl4_stubs.c"] + rt + ["-lm", "-Wl,--gc-sections", "-o", "/tmp/wl4_dump"]
+          cmd = ["gcc", "-O0", "-w", "-I", W, "/tmp/wl4_dump.c", W + "/wl4_stubs.c"] + rt + ["-lm", "-Wl,--gc-sections", "-Wl,--unresolved-symbols=ignore-all", "-o", "/tmp/wl4_dump"]
           print(" ".join(cmd[:8]), "...")
           subprocess.check_call(cmd)
           subprocess.check_call(["/tmp/wl4_dump", DAT])
