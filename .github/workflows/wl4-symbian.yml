@@ -438,6 +438,8 @@ jobs:
 
           void Wl4Log(const TDesC8& aMsg);   // wl4_log.cpp
           void Wl4LogMem(const TDesC8& aTag);
+          TBool Wl4Flag(const TDesC8& aName);   // debug switch: file E:\\wl4\\<name> or C:\\data\\<name> exists
+          void Wl4LogRotate();       // move the previous wl4_boot.log to wl4_boot.prev.log so each run starts a clean log
           TBool Wl4RunFlagBegin();   // ETrue if the previous run never reached a clean exit
           void Wl4RunFlagEnd();
           void Wl4InstallExc();
@@ -656,8 +658,16 @@ jobs:
 
           GLDEF_C TInt E32Main()
               {
+              TBool crashed = Wl4RunFlagBegin();
+              Wl4LogRotate();
               Wl4Log(_L8("======== E32Main: wl4 starting, build " __DATE__ " " __TIME__ " ========"));
-              if (Wl4RunFlagBegin()) { Wl4Log(_L8("!!! PREVIOUS RUN DID NOT EXIT CLEANLY (crash, hang, or battery pull) - see lines above this banner")); }
+              Wl4Log(_L8("(timestamps: seconds since this run started; previous run is in wl4_boot.prev.log)"));
+              if (crashed) { Wl4Log(_L8("!!! PREVIOUS RUN DID NOT EXIT CLEANLY (crash, hang, or battery pull) - see wl4_boot.prev.log")); }
+              {
+              TBuf8<120> fb;
+              fb.Format(_L8("debug flags: noaudio=%d yield=%d verbose=%d"), Wl4Flag(_L8("noaudio.flag")), Wl4Flag(_L8("yield.flag")), Wl4Flag(_L8("verbose.flag")));
+              Wl4Log(fb);
+              }
               {
               TInt hv = 0; TBuf8<120> hb;
               HAL::Get(HALData::EMachineUid, hv);
@@ -996,7 +1006,21 @@ jobs:
               {
               if (wl4_prepare(iRom, (unsigned)iRomSize) != 0) { Msg(_L("Game already running"), _L("")); return; }
               wl4_set_frameskip(iFrameskip);
-              TInt err = iThread.Create(_L("wl4game"), GameThreadEntry, 0x200000, 0x20000, 0x400000, NULL, EOwnerThread);
+              // Real devices (Nokia C7: -40 = KErrTooBig) can refuse a 2 MB stack / 4 MB heap: step down until it works.
+              static const TInt KStacks[] = { 0x200000, 0x100000, 0x80000, 0x40000, 0x20000 };
+              static const TInt KHeaps[] = { 0x400000, 0x200000, 0x100000 };
+              TInt err = KErrTooBig;
+              for (TInt si = 0; si < 5 && err != KErrNone; si++)
+                  {
+                  for (TInt hi = 0; hi < 3 && err != KErrNone; hi++)
+                      {
+                      err = iThread.Create(_L("wl4game"), GameThreadEntry, KStacks[si], 0x20000, KHeaps[hi], NULL, EOwnerThread);
+                      TBuf8<96> tb;
+                      tb.Format(_L8("thread create try stack=%x heap=%x -> %d (free RAM %u KB)"), KStacks[si], KHeaps[hi], err, plat_free_kb());
+                      Wl4Log(tb);
+                      if (err != KErrNone && err != KErrTooBig && err != KErrNoMemory) { si = 99; break; }
+                      }
+                  }
               {
               TBuf8<64> lb;
               lb.Format(_L8("game thread create -> %d"), err);
@@ -1013,7 +1037,9 @@ jobs:
               iThread.SetPriority(EPriorityNormal);
               iThread.Resume();
               iStarted = ETrue;
-              TRAPD(aerr, iAudio = CWl4Audio::NewL());
+              TInt aerr = KErrNotSupported;
+              if (plat_flag("noaudio.flag")) { Wl4Log(_L8("audio DISABLED by noaudio.flag")); }
+              else { TRAP(aerr, iAudio = CWl4Audio::NewL()); }
               {
               TBuf8<48> lb;
               lb.Format(_L8("audio create -> %d"), aerr);
@@ -1523,8 +1549,12 @@ jobs:
                   {
                   TInt pos = 0;
                   f.Seek(ESeekEnd, pos);
+                  static TUint t0 = 0;
+                  TUint now = (TUint)User::NTickCount();
+                  if (!t0) { t0 = now; }
+                  TUint dt = now - t0;
                   TBuf8<64> head;
-                  head.Format(_L8("[%u T%u] "), (TUint)User::NTickCount(), (TUint)RThread().Id());
+                  head.Format(_L8("[+%u.%03u T%u] "), dt / 1000, dt % 1000, (TUint)RThread().Id());
                   f.Write(head);
                   f.Write(aMsg.Left(300));
                   f.Write(_L8("\r\n"));
@@ -1588,6 +1618,46 @@ jobs:
               TFileName alt(KF2);
               if (aFs.Entry(alt, e) == KErrNone) { aOut.Copy(alt); return ETrue; }
               return EFalse;
+              }
+
+          void Wl4LogRotate()
+              {
+              RFs fs;
+              if (fs.Connect() != KErrNone) { return; }
+              _LIT(KA, "E:\\wl4\\wl4_boot.log");
+              _LIT(KAp, "E:\\wl4\\wl4_boot.prev.log");
+              _LIT(KB, "C:\\data\\wl4_boot.log");
+              _LIT(KBp, "C:\\data\\wl4_boot.prev.log");
+              _LIT(KC, "E:\\wl4_boot.log");
+              _LIT(KCp, "E:\\wl4_boot.prev.log");
+              const TDesC* from[3] = { &KA, &KB, &KC };
+              const TDesC* to[3] = { &KAp, &KBp, &KCp };
+              TEntry e;
+              for (TInt i = 0; i < 3; i++)
+                  {
+                  if (fs.Entry(*from[i], e) == KErrNone) { fs.Replace(*from[i], *to[i]); }
+                  }
+              fs.Close();
+              }
+
+          TBool Wl4Flag(const TDesC8& aName)
+              {
+              RFs fs;
+              if (fs.Connect() != KErrNone) { return EFalse; }
+              TFileName a, b;
+              TBuf<64> n; n.Copy(aName);
+              a.Copy(_L("E:\\wl4\\")); a.Append(n);
+              b.Copy(_L("C:\\data\\")); b.Append(n);
+              TEntry e;
+              TBool r = (fs.Entry(a, e) == KErrNone) || (fs.Entry(b, e) == KErrNone);
+              fs.Close();
+              return r;
+              }
+
+          extern "C" int plat_flag(const char* aName)
+              {
+              TPtrC8 n((const TUint8*)aName);
+              return Wl4Flag(n) ? 1 : 0;
               }
 
           TBool Wl4RunFlagBegin()
@@ -1735,6 +1805,7 @@ jobs:
           void  plat_mem_release(void);
           void  plat_exit_thread(void);
           void plat_log_addr(const char *tag, unsigned addr, unsigned len);  /* logs range + the calling thread's heap range */
+          int plat_flag(const char *name);  /* 1 if E:\\wl4\\<name> or C:\\data\\<name> exists (debug switches) */
           unsigned plat_free_kb(void);  /* real free RAM in KB (UserHal::MemoryInfo) */
           void  plat_log_mem(const char *tag);  /* free RAM / heap snapshot into the log */
           void  plat_install_exc(void);         /* per-thread exception logger */
@@ -1839,24 +1910,26 @@ jobs:
           }
 
           static void copy_chunked(uint8_t *dst, const unsigned char *src, unsigned n, const char *name) {
-              unsigned off = 0, i;
+              unsigned off = 0, i, t0 = plat_now_ms();
               volatile unsigned sink = 0;
+              int yield = plat_flag("yield.flag"), verbose = plat_flag("verbose.flag");
+              wl4_logf("copy %s: %u KB in 64 KB steps (yield=%d verbose=%d)", name, n >> 10, yield, verbose);
               while (off < n) {
                   unsigned c = n - off > 0x10000u ? 0x10000u : n - off;
-                  /* 64 KB steps; each step logs BEFORE touching memory, so the last log line names the faulting step:
-                     "cp" then no "src ok"  -> source buffer unreadable;  "src ok" then no "dst ok" -> destination chunk unwritable;
-                     "dst ok" then no next "cp" -> memcpy itself */
-                  wl4_logf("cp %s off=%x s=%x d=%x", name, off, (unsigned)(uintptr_t)(src + off), (unsigned)(uintptr_t)(dst + off));
+                  /* the line is written BEFORE touching memory: after a crash the last "cp" line names the faulting step.
+                     verbose.flag adds per-phase lines ("src ok"/"dst ok") to tell source / destination / memcpy apart. */
+                  wl4_logf("cp %s %x s=%x d=%x", name, off, (unsigned)(uintptr_t)(src + off), (unsigned)(uintptr_t)(dst + off));
                   for (i = 0; i < c; i += 0x1000u) sink += *(volatile const unsigned char *)(src + off + i);
                   sink += *(volatile const unsigned char *)(src + off + c - 1);
-                  wl4_logf("src ok");
+                  if (verbose) wl4_logf("  src ok");
                   for (i = 0; i < c; i += 0x1000u) *(volatile unsigned char *)(dst + off + i) = 0;
                   *(volatile unsigned char *)(dst + off + c - 1) = 0;
-                  wl4_logf("dst ok");
+                  if (verbose) wl4_logf("  dst ok");
                   memcpy(dst + off, src + off, c);
                   off += c;
+                  if (yield) plat_sleep_us(2000);
               }
-              wl4_logf("copy %s done", name);
+              wl4_logf("copy %s done: %u ms", name, plat_now_ms() - t0);
           }
 
           static unsigned stack_used(void) {
