@@ -395,6 +395,7 @@ jobs:
           SOURCE          wl4_container.cpp
           SOURCE          wl4_audio.cpp
           SOURCE          wl4_plat.cpp
+          SOURCE          wl4_log.cpp
 
           USERINCLUDE     ../inc
           USERINCLUDE     ../../core
@@ -434,6 +435,8 @@ jobs:
           #include <w32std.h>
           #include <mdaaudiooutputstream.h>
           #include "host_api.h"
+
+          void Wl4Log(const TDesC8& aMsg);   // wl4_log.cpp
 
           const TUid KUidWl4 = { (TInt32)0xE1A5B0CE };
 
@@ -594,8 +597,17 @@ jobs:
               if (sp) { sp->MakeVisible(EFalse); }
               CEikButtonGroupContainer* cba = Cba();
               if (cba) { cba->MakeVisible(EFalse); }
-              iContainer = CWl4Container::NewL(ApplicationRect());
+              Wl4Log(_L8("appui: creating container"));
+              TRAPD(cerr, iContainer = CWl4Container::NewL(ApplicationRect()));
+              if (cerr != KErrNone)
+                  {
+                  TBuf8<48> b;
+                  b.Format(_L8("appui: container leave %d"), cerr);
+                  Wl4Log(b);
+                  User::Leave(cerr);
+                  }
               AddToStackL(iContainer);
+              Wl4Log(_L8("appui: ready"));
               }
 
           CWl4AppUi::~CWl4AppUi()
@@ -637,7 +649,15 @@ jobs:
 
           LOCAL_C CApaApplication* NewApplication() { return new CWl4Application; }
 
-          GLDEF_C TInt E32Main() { return EikStart::RunApplication(NewApplication); }
+          GLDEF_C TInt E32Main()
+              {
+              Wl4Log(_L8("---- E32Main: wl4 starting ----"));
+              TInt r = EikStart::RunApplication(NewApplication);
+              TBuf8<48> b;
+              b.Format(_L8("E32Main: exit %d"), r);
+              Wl4Log(b);
+              return r;
+              }
           WL4_EOF
           mkdir -p symbian/app/src
           cat > symbian/app/src/wl4_audio.cpp <<'WL4_EOF'
@@ -684,9 +704,17 @@ jobs:
 
           void CWl4Audio::MaoscOpenComplete(TInt aError)
               {
-              if (aError != KErrNone) { return; }
-              iStream->SetAudioPropertiesL(TMdaAudioDataSettings::ESampleRate22050Hz, TMdaAudioDataSettings::EChannelsMono);
+              if (aError != KErrNone)
+                  {
+                  TBuf8<48> b;
+                  b.Format(_L8("audio: open error %d"), aError);
+                  Wl4Log(b);
+                  return;
+                  }
+              TRAPD(perr, iStream->SetAudioPropertiesL(TMdaAudioDataSettings::ESampleRate22050Hz, TMdaAudioDataSettings::EChannelsMono));
+              if (perr != KErrNone) { Wl4Log(_L8("audio: SetAudioProperties failed")); return; }
               iStream->SetVolume(iStream->MaxVolume() * 3 / 4);
+              Wl4Log(_L8("audio: stream open, playing"));
               iReady = ETrue;
               if (!iSuspended) { for (TInt i = 0; i < KSlots; i++) { Fill(i); } }
               }
@@ -753,6 +781,7 @@ jobs:
 
           void CWl4Container::ConstructL(const TRect& aRect)
               {
+              Wl4Log(_L8("container: ConstructL"));
               CreateWindowL();
               SetExtentToWholeScreen();
               EnableDragEvents();
@@ -773,6 +802,10 @@ jobs:
                   {
                   StartGame();
                   }
+              else
+                  {
+                  Wl4Log(_L8("container: ROM/data load failed, not starting"));
+                  }
               DrawNow();
               }
 
@@ -789,6 +822,14 @@ jobs:
               iMode = EMsg;
               iMsg1.Copy(a.Left(iMsg1.MaxLength()));
               iMsg2.Copy(b.Left(iMsg2.MaxLength()));
+              TBuf8<220> lg;
+              lg.Copy(iMsg1.Left(100));
+              lg.Insert(0, _L8("MSG: "));
+              lg.Append(_L8(" | "));
+              TBuf8<100> l2;
+              l2.Copy(iMsg2.Left(100));
+              lg.Append(l2);
+              Wl4Log(lg);
               }
 
           // ---- ROM lookup -----------------------------------------------------------
@@ -822,6 +863,10 @@ jobs:
                               iRomPath = path;
                               iRomPath.Append(e.iName);
                               delete list;
+                              TBuf8<280> lb;
+                              lb.Copy(iRomPath);
+                              lb.Insert(0, _L8("ROM found: "));
+                              Wl4Log(lb);
                               return ETrue;
                               }
                           }
@@ -857,6 +902,11 @@ jobs:
                   return EFalse;
                   }
               iRomSize = size;
+              {
+              TBuf8<80> lb;
+              lb.Format(_L8("ROM read %d bytes, code %c%c%c%c"), size, iRom[0xAC], iRom[0xAD], iRom[0xAE], iRom[0xAF]);
+              Wl4Log(lb);
+              }
               if (size < 0xB0 || iRom[0xAC] != 'A' || iRom[0xAD] != 'W' || iRom[0xAE] != 'A' || iRom[0xAF] != 'E')
                   {
                   Msg(_L("Wrong ROM: need Wario Land 4 (US,"), _L("game code AWAE)."));
@@ -894,6 +944,11 @@ jobs:
               f.Size(size);
               iData = (TUint8*)User::Alloc(size);
               TInt err = iData ? KErrNone : KErrNoMemory;
+              {
+              TBuf8<64> lb;
+              lb.Format(_L8("wl4.dat %d bytes, alloc err %d"), size, err);
+              Wl4Log(lb);
+              }
               if (err == KErrNone)
                   {
                   TPtr8 d(iData, 0, size);
@@ -901,7 +956,13 @@ jobs:
                   if (err == KErrNone && d.Length() != size) { err = KErrCorrupt; }
                   }
               f.Close();
-              if (err != KErrNone || wl4_bind_segments(iData, (unsigned)size) != 0)
+              TInt berr = (err == KErrNone) ? wl4_bind_segments(iData, (unsigned)size) : -99;
+              {
+              TBuf8<64> lb;
+              lb.Format(_L8("wl4.dat read err %d, bind %d"), err, berr);
+              Wl4Log(lb);
+              }
+              if (err != KErrNone || berr != 0)
                   {
                   Msg(_L("wl4.dat read/bind error"), _L(""));
                   return EFalse;
@@ -914,7 +975,12 @@ jobs:
               {
               if (wl4_prepare(iRom, (unsigned)iRomSize) != 0) { Msg(_L("Game already running"), _L("")); return; }
               wl4_set_frameskip(iFrameskip);
-              TInt err = iThread.Create(_L("wl4game"), GameThreadEntry, 0x200000, (RAllocator*)NULL, NULL, EOwnerThread);
+              TInt err = iThread.Create(_L("wl4game"), GameThreadEntry, 0x200000, 0x20000, 0x400000, NULL, EOwnerThread);
+              {
+              TBuf8<64> lb;
+              lb.Format(_L8("game thread create -> %d"), err);
+              Wl4Log(lb);
+              }
               if (err != KErrNone)
                   {
                   TBuf<40> m;
@@ -927,7 +993,11 @@ jobs:
               iThread.Resume();
               iStarted = ETrue;
               TRAPD(aerr, iAudio = CWl4Audio::NewL());
-              (void)aerr;
+              {
+              TBuf8<48> lb;
+              lb.Format(_L8("audio create -> %d"), aerr);
+              Wl4Log(lb);
+              }
               iMode = EPlay;
               iLastFrame = -1;
               iTimer->Start(0, 16000, TCallBack(TickCb, this));
@@ -936,6 +1006,7 @@ jobs:
           void CWl4Container::StopGame()
               {
               if (!iStarted) { return; }
+              Wl4Log(_L8("container: StopGame"));
               iTimer->Cancel();
               SaveBattery();
               wl4_request_stop();
@@ -1016,11 +1087,40 @@ jobs:
               {
               if ((++iTicks & 127) == 0) { User::ResetInactivityTime(); }
               if ((iTicks % 1800) == 0) { SaveBattery(); }
+              if ((iTicks % 300) == 0)
+                  {
+                  TBuf8<96> hb;
+                  hb.Format(_L8("heartbeat: tick %d, frames shown %d, running %d"), iTicks, wl4_frame_counter(), wl4_running());
+                  Wl4Log(hb);
+                  }
+              if (iThreadOpen && iThread.ExitType() != EExitPending)
+                  {
+                  // the game thread died (panic/kill) without clearing its running flag
+                  TExitCategoryName cat = iThread.ExitCategory();
+                  TInt reason = iThread.ExitReason();
+                  TInt etype = iThread.ExitType();
+                  iTimer->Cancel();
+                  TBuf8<120> lg;
+                  lg.Format(_L8("GAME THREAD DIED: exit type %d reason %d category "), etype, reason);
+                  TBuf8<32> c8;
+                  c8.Copy(cat);
+                  lg.Append(c8);
+                  Wl4Log(lg);
+                  WriteLog();
+                  TBuf<64> m;
+                  m.Format(_L("Game thread died: %S %d"), &cat, reason);
+                  Msg(m, _L("See wl4_boot.log. Tap to exit."));
+                  DrawNow();
+                  return;
+                  }
               if (!wl4_running())
                   {
                   iTimer->Cancel();
                   WriteLog();
                   TBuf<64> m;
+                  TBuf8<64> tl;
+                  tl.Format(_L8("game stopped, wasm trap code %d, mem error %d"), wl4_trap_code(), 0);
+                  Wl4Log(tl);
                   m.Format(_L("Game stopped (trap %d). See .log"), wl4_trap_code());
                   Msg(m, _L("Tap to exit."));
                   DrawNow();
@@ -1206,7 +1306,7 @@ jobs:
               {
               if (iMode == EMsg)
                   {
-                  if (e.iType == TPointerEvent::EButton1Down && !wl4_running()) { CEikonEnv::Static()->EikAppUi()->HandleCommandL(EEikCmdExit); }
+                  if (e.iType == TPointerEvent::EButton1Down && (!wl4_running() || !iThreadOpen || iThread.ExitType() != EExitPending)) { CEikonEnv::Static()->EikAppUi()->HandleCommandL(EEikCmdExit); }
                   return;
                   }
               TInt n = 0;
@@ -1286,6 +1386,8 @@ jobs:
           #include <e32base.h>
           #include "host_api.h"
 
+          void Wl4Log(const TDesC8& aMsg);
+
           static RChunk gChunk;
           static TBool gChunkOpen = EFalse;
 
@@ -1299,7 +1401,11 @@ jobs:
           void* plat_mem_reserve(unsigned bytes)
               {
               if (gChunkOpen) { return gChunk.Base(); }
-              if (gChunk.CreateDisconnectedLocal(0, 0, (TInt)bytes) != KErrNone) { return 0; }
+              TInt err = gChunk.CreateDisconnectedLocal(0, 0, (TInt)bytes);
+              TBuf8<80> b;
+              b.Format(_L8("chunk reserve %u bytes -> err %d"), bytes, err);
+              Wl4Log(b);
+              if (err != KErrNone) { return 0; }
               gChunkOpen = ETrue;
               return gChunk.Base();
               }
@@ -1307,7 +1413,14 @@ jobs:
           int plat_mem_commit(unsigned off, unsigned len)
               {
               if (!gChunkOpen) { return -1; }
-              return gChunk.Commit((TInt)off, (TInt)len);
+              TInt err = gChunk.Commit((TInt)off, (TInt)len);
+              if (err != KErrNone)
+                  {
+                  TBuf8<80> b;
+                  b.Format(_L8("chunk commit off=0x%x len=0x%x -> err %d"), off, len, err);
+                  Wl4Log(b);
+                  }
+              return err;
               }
 
           void plat_mem_release(void)
@@ -1329,6 +1442,51 @@ jobs:
               }
 
           }  // extern "C"
+          WL4_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/wl4_log.cpp <<'WL4_EOF'
+          // wl4_log.cpp - append-only boot/debug log, written immediately (survives panics).
+          // Tries E:\wl4\wl4_boot.log, then C:\data\wl4_boot.log, then E:\wl4_boot.log.
+          #include <e32std.h>
+          #include <f32file.h>
+          #include "wl4_app.h"
+
+          void Wl4Log(const TDesC8& aMsg)
+              {
+              RFs fs;
+              if (fs.Connect() != KErrNone) { return; }
+              _LIT(KP1, "E:\\wl4\\wl4_boot.log");
+              _LIT(KP2, "C:\\data\\wl4_boot.log");
+              _LIT(KP3, "E:\\wl4_boot.log");
+              const TDesC* paths[3] = { &KP1, &KP2, &KP3 };
+              RFile f;
+              TInt err = KErrNotFound;
+              for (TInt i = 0; i < 3; i++)
+                  {
+                  fs.MkDirAll(*paths[i]);
+                  err = f.Open(fs, *paths[i], EFileWrite | EFileShareAny);
+                  if (err == KErrNotFound) { err = f.Create(fs, *paths[i], EFileWrite | EFileShareAny); }
+                  if (err == KErrNone) { break; }
+                  }
+              if (err == KErrNone)
+                  {
+                  TInt pos = 0;
+                  f.Seek(ESeekEnd, pos);
+                  TBuf8<64> head;
+                  head.Format(_L8("[%u] "), (TUint)User::NTickCount());
+                  f.Write(head);
+                  f.Write(aMsg.Left(300));
+                  f.Write(_L8("\r\n"));
+                  f.Close();
+                  }
+              fs.Close();
+              }
+
+          extern "C" void plat_log(const char* aMsg)
+              {
+              TPtrC8 p((const TUint8*)aMsg);
+              Wl4Log(p);
+              }
           WL4_EOF
           mkdir -p symbian/core
           cat > symbian/core/audio_sym.c <<'WL4_EOF'
@@ -1416,6 +1574,7 @@ jobs:
           int   plat_mem_commit(unsigned off, unsigned len);
           void  plat_mem_release(void);
           void  plat_exit_thread(void);
+          void  plat_log(const char *msg);      /* appended to wl4_boot.log immediately */
           unsigned plat_now_ms(void);
           void  plat_sleep_us(unsigned us);
           #ifdef __cplusplus
@@ -1446,14 +1605,17 @@ jobs:
           /* ---- tiny log ring (dumped to a file by the UI on stop/trap) ---- */
           static char g_log[24][100]; static unsigned g_logN;
           static void wl4_logf(const char *fmt, ...) {
-              va_list ap; va_start(ap, fmt); vsnprintf(g_log[g_logN % 24], 100, fmt, ap); va_end(ap); g_logN++;
+              va_list ap; va_start(ap, fmt); vsnprintf(g_log[g_logN % 24], 100, fmt, ap); va_end(ap);
+              plat_log(g_log[g_logN % 24]); g_logN++;
           }
+          void wl4_log_kv(const char *what, unsigned a, int b) { wl4_logf("%s %x %d", what, a, b); }
           int wl4_dump_log(char *out, int max) {
               int o = 0; unsigned n = g_logN, first = n > 24 ? n - 24 : 0;
               for (unsigned i = first; i < n; i++) { const char *l = g_log[i % 24]; while (*l && o < max - 2) out[o++] = *l++; out[o++] = 10; }
               if (o < max) out[o] = 0;
               return o;
           }
+          extern unsigned wl4_commit_end;
           unsigned wl4_rom_commit_size(void) { return g_romSize ? ((g_romSize + 0xFFFu) & ~0xFFFu) : 0x800000u; }
 
           /* ---- frame skipping: hal.c is built with -Dppu_render_scanline=wl4_ppu_line ---- */
@@ -1462,7 +1624,7 @@ jobs:
 
           void wl4_trap(wasm_rt_trap_t code) {
               g_trap = (int)code + 1;
-              wl4_logf("wasm trap %d (game thread stopped)", (int)code);
+              wl4_logf("WASM TRAP %d (1=oob 2=int_overflow 3=div0 4=conv 5=unreachable 6=call_indirect ...) frame %d", (int)code, g_frames);
               g_running = 0; plat_exit_thread();
           }
 
@@ -1495,6 +1657,7 @@ jobs:
               wl4_audio_poll();
               if (!g_skipNow) { int i = g_idx ^ 1; memcpy(g_buf[i], hal_framebuffer(), sizeof g_buf[0]); g_idx = i; g_presented++; }
               g_frames++;
+              if (g_frames == 1 || (g_frames % 600) == 0) wl4_logf("frame %d (presented %d) tick %u", g_frames, g_presented, plat_now_ms());
               if (g_stop) { g_running = 0; plat_exit_thread(); }
               while (g_paused && !g_stop) { plat_sleep_us(16000); init = 0; }
               if (g_stop) { g_running = 0; plat_exit_thread(); }
@@ -1513,13 +1676,20 @@ jobs:
               wl4_logf("game thread start, rom=%u bytes", g_romSize);
               wasm_rt_init();
               g_env.inst = &g_inst;
+              wl4_logf("instantiate: begin");
               wasm2c_wl4_instantiate(&g_inst, &g_env);
+              wl4_logf("instantiate: done, mem=%x size=%x rom_image=%x", (unsigned)(uintptr_t)g_inst.w2c_memory.data, (unsigned)g_inst.w2c_memory.size, (unsigned)g_inst.w2c_rom_image);
               hal_init(g_inst.w2c_memory.data, g_inst.w2c_memory.size);
+              wl4_logf("hal_init done");
+              if ((unsigned)g_inst.w2c_rom_image + g_romSize > wl4_commit_end) {
+                  wl4_logf("FATAL: rom_image %x + %x is beyond committed %x (raise commit_mb)", (unsigned)g_inst.w2c_rom_image, g_romSize, wl4_commit_end);
+                  g_trap = 1001; g_running = 0; return 0;
+              }
               HalCallbacks cb = { cb_vblank, cb_hblank, cb_vcount, cb_frame }; hal_set_callbacks(&cb);
               if (g_haveSave) memcpy(hal_sram(), g_save, GBA_SRAM_SIZE);
               if (hal_load_rom(g_rom, g_romSize, g_inst.w2c_rom_image) != 0) { wl4_logf("ROM does not fit"); g_trap = 1000; g_running = 0; return 0; }
               g_ready = 1;
-              wl4_logf("entering AgbMain");
+              wl4_logf("ROM copied, entering AgbMain");
               w2c_wl4_AgbMain(&g_inst);
               wl4_logf("AgbMain returned");
               g_running = 0; return 0;
@@ -1892,18 +2062,20 @@ jobs:
 
           o = []
           o += ['#include "wasm-rt.h"', '#include "host_api.h"',
-                'unsigned wl4_rom_commit_size(void);', 'int wl4_mem_error;',
-                '#ifndef WL4_DATA_COMMIT', '#define WL4_DATA_COMMIT 0x3000000u', '#endif',
+                'unsigned wl4_rom_commit_size(void);', 'void wl4_log_kv(const char *, unsigned, int);', 'int wl4_mem_error;',
+                '#ifndef WL4_DATA_COMMIT', '#define WL4_DATA_COMMIT 0x3000000u', '#endif', 'unsigned wl4_commit_end = 0x0A000000u + WL4_DATA_COMMIT;',
                 'static void wl4_mem_alloc(wasm_rt_memory_t *m, unsigned long long ip, unsigned long long mp, int is64) {',
                 '  static const unsigned R[][2] = {{0x02000000u,0x40000u},{0x03000000u,0x8000u},{0x04000000u,0x1000u},',
                 '    {0x05000000u,0x1000u},{0x06000000u,0x20000u},{0x07000000u,0x1000u},{0x0E000000u,0x10000u}};',
                 '  unsigned bytes = (unsigned)(ip * 65536ull); unsigned i;',
                 '  unsigned char *base = (unsigned char *)plat_mem_reserve(bytes);',
-                '  if (!base) { wl4_mem_error = 1; m->data = 0; m->size = 0; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  wl4_log_kv("mem alloc: pages", (unsigned)ip, 0);',
+                '  if (!base) { wl4_mem_error = 1; wl4_log_kv("mem alloc: reserve failed, bytes", bytes, 0); m->data = 0; m->size = 0; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
                 '  for (i = 0; i < sizeof R / sizeof R[0]; i++)',
-                '    if (plat_mem_commit(R[i][0], R[i][1])) { wl4_mem_error = 2; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
-                '  if (plat_mem_commit(0x08000000u, wl4_rom_commit_size())) { wl4_mem_error = 3; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
-                '  if (plat_mem_commit(0x0A000000u, WL4_DATA_COMMIT)) { wl4_mem_error = 4; wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '    if (plat_mem_commit(R[i][0], R[i][1])) { wl4_mem_error = 2; wl4_log_kv("mem alloc: commit failed at", R[i][0], 2); wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  if (plat_mem_commit(0x08000000u, wl4_rom_commit_size())) { wl4_mem_error = 3; wl4_log_kv("mem alloc: ROM commit failed, size", wl4_rom_commit_size(), 3); wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  if (plat_mem_commit(0x0A000000u, WL4_DATA_COMMIT)) { wl4_mem_error = 4; wl4_log_kv("mem alloc: data commit failed, size", WL4_DATA_COMMIT, 4); wasm_rt_trap(WASM_RT_TRAP_OOB); return; }',
+                '  wl4_log_kv("mem alloc: all regions committed, data bytes", WL4_DATA_COMMIT, 0);',
                 '  m->data = base; m->size = bytes; m->pages = ip; m->max_pages = mp;']
           o.append('  m->is64 = is64;' if len(pA) >= 4 else '  (void)is64;')
           o.append('}')
@@ -2050,6 +2222,5 @@ jobs:
           name: wl4-build-logs
           path: |
             abld.log
-            build-core/*.o
           if-no-files-found: ignore
           retention-days: 3
