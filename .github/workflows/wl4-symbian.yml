@@ -173,6 +173,79 @@ jobs:
           PY
           du -sh w2c-out
 
+      - name: Externalize wasm data segments (exe size limit)
+        run: |
+          set -e
+          cat > externalize_data.py <<'WL4_EOF'
+          #!/usr/bin/env python3
+          """Move wasm data-segment arrays out of wl4.c (Symbian exe: text+rodata must stay below the 0x400000 data address).
+          Runs on the Linux job: dumps all segments natively into wl4.dat, rewrites wl4.c to use runtime pointers,
+          and emits wl4_segs.c (wl4_segptr[] + wl4_bind_segments()).
+          usage: externalize_data.py <wasm2c dir> <out wl4.dat>"""
+          import re, subprocess, struct, sys, os, glob
+
+          W, DAT = sys.argv[1], sys.argv[2]
+          src = open(W + "/wl4.c", errors="replace").read()
+          pat = re.compile(r"static\s+const\s+u8\s+(data_segment_data_\w+)\s*\[\s*\]\s*=\s*")
+          res, names, i = [], [], 0
+          while True:
+              m = pat.search(src, i)
+              if not m:
+                  res.append(src[i:]); break
+              res.append(src[i:m.start()])
+              j, in_s = m.end(), False
+              while True:
+                  ch = src[j]
+                  if in_s:
+                      if ch == "\\": j += 2; continue
+                      if ch == '"': in_s = False
+                  else:
+                      if ch == '"': in_s = True
+                      elif ch == ";": break
+                  j += 1
+              res.append("#define %s (wl4_segptr[%d])" % (m.group(1), len(names)))
+              names.append(m.group(1)); i = j + 1
+          print("data segments found:", len(names), "| sizeof() uses:", len(re.findall(r"sizeof\s*\(\s*data_segment", src)))
+          if not names:
+              print("no segments to externalize"); open(W + "/wl4_segs.c", "w").write(
+                  "const unsigned char *wl4_segptr[1];\nint wl4_bind_segments(const unsigned char *b, unsigned n) { (void)b; (void)n; return 0; }\n")
+              open(DAT, "wb").write(struct.pack("<I", 0)); sys.exit(0)
+
+          # --- native dump of the original arrays (format independent) ---
+          dump = ['#include "wl4.c"', "#include <stdio.h>",
+                  "static const struct { const unsigned char *p; unsigned n; } S[] = {"]
+          dump += ["  { (const unsigned char *)%s, (unsigned)sizeof(%s) }," % (n, n) for n in names]
+          dump += ["};", "int main(int c, char **v) { FILE *f = fopen(v[1], \"wb\"); unsigned n = %d, i, off, z = 0;" % len(names),
+                   "  off = 4 + 8 * n; fwrite(&n, 4, 1, f);",
+                   "  for (i = 0; i < n; i++) { fwrite(&off, 4, 1, f); fwrite(&S[i].n, 4, 1, f); off += (S[i].n + 3u) & ~3u; }",
+                   "  for (i = 0; i < n; i++) { fwrite(S[i].p, 1, S[i].n, f); while (ftell(f) & 3) fwrite(&z, 1, 1, f); }",
+                   "  fclose(f); return 0; }"]
+          open("/tmp/wl4_dump.c", "w").write("\n".join(dump))
+          rt = []
+          for f in sorted(glob.glob(W + "/wasm-rt-*.c")):
+              b = os.path.basename(f)
+              if b.endswith("-win.c") or "os-win" in b: continue
+              if re.search(r'#\s*include\s+"%s"' % re.escape(b), src): continue
+              rt.append(f)
+          cmd = ["gcc", "-O0", "-w", "-I", W, "/tmp/wl4_dump.c", W + "/wl4_stubs.c"] + rt + ["-lm", "-Wl,--gc-sections", "-o", "/tmp/wl4_dump"]
+          print(" ".join(cmd[:8]), "...")
+          subprocess.check_call(cmd)
+          subprocess.check_call(["/tmp/wl4_dump", DAT])
+          print("wl4.dat: %d bytes" % os.path.getsize(DAT))
+
+          open(W + "/wl4.c", "w").write("extern const unsigned char *wl4_segptr[];\n" + "".join(res))
+          open(W + "/wl4_segs.c", "w").write(
+              "const unsigned char *wl4_segptr[%d];\n"
+              "int wl4_bind_segments(const unsigned char *b, unsigned n) {\n"
+              "  const unsigned *h = (const unsigned *)b; unsigned i;\n"
+              "  if (n < 4 || h[0] != %du) return -2;\n"
+              "  for (i = 0; i < %du; i++) { if (h[1 + 2 * i] + h[2 + 2 * i] > n) return -3; wl4_segptr[i] = b + h[1 + 2 * i]; }\n"
+              "  return 0;\n}\n" % (len(names), len(names), len(names)))
+          print("wl4.c rewritten")
+          WL4_EOF
+          python3 externalize_data.py w2c-out/wasm2c w2c-out/wl4.dat
+          ls -l w2c-out/wl4.dat
+
       - uses: actions/upload-artifact@v4
         with:
           name: wl4-w2c
@@ -405,6 +478,7 @@ jobs:
               void ConstructL(const TRect& aRect);
               TBool FindRom();
               TBool LoadRom();
+              TBool LoadData();
               void StartGame();
               void StopGame();
               void SaveBattery();
@@ -432,6 +506,7 @@ jobs:
               TBool iStarted;
               TMode iMode;
               TUint8* iRom;
+              TUint8* iData;
               TInt iRomSize;
               TFileName iRomPath;
               TFileName iSavePath;
@@ -494,6 +569,7 @@ jobs:
           "$(epocroot)epoc32/release/$(platform)/$(target)/wl4.exe"-"!:\sys\bin\wl4.exe"
           "$(epocroot)epoc32/data/z/resource/apps/wl4.rsc"-"!:\resource\apps\wl4.rsc"
           "$(epocroot)epoc32/data/z/private/10003a3f/import/apps/wl4_reg.rsc"-"!:\private\10003a3f\import\apps\wl4_reg.rsc"
+          "$(epocroot)epoc32/data/z/private/e1a5b0ce/wl4.dat"-"!:\private\e1a5b0ce\wl4.dat"
           WL4_EOF
           mkdir -p symbian/app/src
           cat > symbian/app/src/wl4_app.cpp <<'WL4_EOF'
@@ -693,7 +769,7 @@ jobs:
                   {
                   Msg(_L("ROM not found. Put the US ROM (.gba)"), _L("into E:\\wl4\\ and restart."));
                   }
-              else if (LoadRom())
+              else if (LoadRom() && LoadData())
                   {
                   StartGame();
                   }
@@ -802,6 +878,37 @@ jobs:
               return ETrue;
               }
 
+          // wl4.dat holds the wasm data segments (extracted assets) that do not fit into the exe
+          TBool CWl4Container::LoadData()
+              {
+              TFileName p;
+              p.Copy(RProcess().FileName().Left(2));
+              p.Append(_L("\\private\\e1a5b0ce\\wl4.dat"));
+              RFile f;
+              if (f.Open(iFs, p, EFileRead | EFileShareReadersOnly) != KErrNone)
+                  {
+                  Msg(_L("wl4.dat missing (reinstall the SIS)"), p);
+                  return EFalse;
+                  }
+              TInt size = 0;
+              f.Size(size);
+              iData = (TUint8*)User::Alloc(size);
+              TInt err = iData ? KErrNone : KErrNoMemory;
+              if (err == KErrNone)
+                  {
+                  TPtr8 d(iData, 0, size);
+                  err = f.Read(d);
+                  if (err == KErrNone && d.Length() != size) { err = KErrCorrupt; }
+                  }
+              f.Close();
+              if (err != KErrNone || wl4_bind_segments(iData, (unsigned)size) != 0)
+                  {
+                  Msg(_L("wl4.dat read/bind error"), _L(""));
+                  return EFalse;
+                  }
+              return ETrue;
+              }
+
           // ---- game thread ----------------------------------------------------------
           void CWl4Container::StartGame()
               {
@@ -851,6 +958,8 @@ jobs:
               StopGame();
               User::Free(iRom);
               iRom = NULL;
+              User::Free(iData);
+              iData = NULL;
               }
 
           void CWl4Container::SaveBattery()
@@ -1283,6 +1392,7 @@ jobs:
           extern "C" {
           #endif
           /* ---- game core (host_sym.c / audio_sym.c) ---- */
+          int   wl4_bind_segments(const unsigned char *blob, unsigned size);  /* wl4.dat: wasm data segments (wl4_segs.c) */
           int   wl4_prepare(const unsigned char *rom, unsigned size);  /* keeps the pointer: caller owns the buffer until stop */
           int   wl4_thread_main(void *arg);                            /* run on a dedicated thread */
           void  wl4_request_stop(void);
@@ -1888,6 +1998,7 @@ jobs:
             n="hal_$(basename "$f" .c)"
             if [ "$(basename "$f")" = "ppu.c" ]; then bg cc1 "$n" -O2 "$f"; else bg cc1 "$n" -O2 -Dppu_render_scanline=wl4_ppu_line "$f"; fi
           done
+          bg cc1 wl4_segs -O1 "$W/wl4_segs.c"
           bg cc1 wl4_stubs   -O1 $RTDEF "$W/wl4_stubs.c"
           bg cc1 wl4_mem     -O2 $RTDEF -DWL4_DATA_COMMIT=$((MB*1024*1024))u "$B/wl4_mem.c"
           for f in "$W"/wasm-rt-*.c; do
@@ -1906,6 +2017,7 @@ jobs:
           ls -l "$B/wl4core.a"
           echo "--- undefined symbols still to resolve at link (expect only plat_* / wl4_* / compiler helpers):"
           "$NM" -u "$B/wl4core.a" 2>/dev/null | grep -v '^$' | grep ' U ' | sort -u | head -60 || true
+          mkdir -p "$EPOC/epoc32/data/z/private/e1a5b0ce"; cp "$ROOT/w2c/wl4.dat" "$EPOC/epoc32/data/z/private/e1a5b0ce/wl4.dat"; ls -l "$EPOC/epoc32/data/z/private/e1a5b0ce/wl4.dat"
           for d in release/gcce/urel release/armv5/urel release/gcce/lib release/armv5/lib; do
             mkdir -p "$EPOC/epoc32/$d"; cp "$B/wl4core.a" "$EPOC/epoc32/$d/wl4core.lib"
           done
