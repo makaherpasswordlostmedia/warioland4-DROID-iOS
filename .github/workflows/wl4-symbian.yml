@@ -438,6 +438,8 @@ jobs:
 
           void Wl4Log(const TDesC8& aMsg);   // wl4_log.cpp
           void Wl4LogMem(const TDesC8& aTag);
+          TBool Wl4RunFlagBegin();   // ETrue if the previous run never reached a clean exit
+          void Wl4RunFlagEnd();
           void Wl4InstallExc();
 
           const TUid KUidWl4 = { (TInt32)0xE1A5B0CE };
@@ -585,6 +587,7 @@ jobs:
           #include <eikenv.h>
           #include <eikspane.h>
           #include <eikbtgpc.h>
+          #include <hal.h>
           #include "wl4_app.h"
 
           CApaDocument* CWl4Application::CreateDocumentL() { return new (ELeave) CWl4Document(*this); }
@@ -654,12 +657,20 @@ jobs:
           GLDEF_C TInt E32Main()
               {
               Wl4Log(_L8("======== E32Main: wl4 starting, build " __DATE__ " " __TIME__ " ========"));
+              if (Wl4RunFlagBegin()) { Wl4Log(_L8("!!! PREVIOUS RUN DID NOT EXIT CLEANLY (crash, hang, or battery pull) - see lines above this banner")); }
+              {
+              TInt hv = 0; TBuf8<120> hb;
+              HAL::Get(HALData::EMachineUid, hv);
+              hb.Format(_L8("device: machineUid=0x%x"), hv);
+              Wl4Log(hb);
+              }
               Wl4InstallExc();
               Wl4LogMem(_L8("start"));
               TInt r = EikStart::RunApplication(NewApplication);
               TBuf8<48> b;
               b.Format(_L8("E32Main: exit %d"), r);
               Wl4Log(b);
+              Wl4RunFlagEnd();
               return r;
               }
           WL4_EOF
@@ -1416,7 +1427,7 @@ jobs:
               if (gChunkOpen) { return gChunk.Base(); }
               TInt err = gChunk.CreateDisconnectedLocal(0, 0, (TInt)bytes);
               TBuf8<80> b;
-              b.Format(_L8("chunk reserve %u bytes -> err %d"), bytes, err);
+              b.Format(_L8("chunk reserve %u bytes -> err %d, free=%u KB"), bytes, err, plat_free_kb());
               Wl4Log(b);
               if (err != KErrNone) { return 0; }
               gChunkOpen = ETrue;
@@ -1427,13 +1438,32 @@ jobs:
               {
               if (!gChunkOpen) { return -1; }
               TInt err = gChunk.Commit((TInt)off, (TInt)len);
-              if (err != KErrNone)
-                  {
-                  TBuf8<80> b;
-                  b.Format(_L8("chunk commit off=0x%x len=0x%x -> err %d"), off, len, err);
-                  Wl4Log(b);
-                  }
+              TBuf8<120> b;
+              b.Format(_L8("chunk commit off=0x%x len=0x%x -> err %d, free=%u KB, chunk size=%d KB"), off, len, err, plat_free_kb(), gChunk.Size() / 1024);
+              Wl4Log(b);
               return err;
+              }
+
+          // Page-by-page: Commit() on a range that is already (partly) committed fails with KErrAlreadyExists
+          // and commits nothing, so walk the range and only count/keep pages that were really missing.
+          int plat_mem_ensure(unsigned off, unsigned len)
+              {
+              if (!gChunkOpen) { return -1; }
+              int added = 0;
+              unsigned end = (off + len + 0xFFFu) & ~0xFFFu;
+              for (unsigned a = off & ~0xFFFu; a < end; a += 0x1000u)
+                  {
+                  TInt err = gChunk.Commit((TInt)a, 0x1000);
+                  if (err == KErrNone) { added++; }
+                  else if (err != KErrAlreadyExists)
+                      {
+                      TBuf8<80> b;
+                      b.Format(_L8("ensure commit off=0x%x -> err %d"), a, err);
+                      Wl4Log(b);
+                      return -2;
+                      }
+                  }
+              return added;
               }
 
           void plat_mem_release(void)
@@ -1487,7 +1517,7 @@ jobs:
                   TInt pos = 0;
                   f.Seek(ESeekEnd, pos);
                   TBuf8<64> head;
-                  head.Format(_L8("[%u] "), (TUint)User::NTickCount());
+                  head.Format(_L8("[%u T%u] "), (TUint)User::NTickCount(), (TUint)RThread().Id());
                   f.Write(head);
                   f.Write(aMsg.Left(300));
                   f.Write(_L8("\r\n"));
@@ -1503,15 +1533,72 @@ jobs:
               }
 
           // ---- memory snapshot: shows OOM / heap pressure at every stage ----
+          extern "C" unsigned plat_free_kb(void)
+              {
+              TMemoryInfoV1Buf mb;
+              if (UserHal::MemoryInfo(mb) != KErrNone) { return 0; }
+              return (unsigned)(mb().iFreeRamInBytes / 1024);
+              }
+
           void Wl4LogMem(const TDesC8& aTag)
               {
-              TInt freeRam = 0, totalRam = 0;
-              HAL::Get(HALData::EMemoryRAMFree, freeRam);
-              HAL::Get(HALData::EMemoryRAM, totalRam);
+              TMemoryInfoV1Buf mb;
+              TInt freeRam = 0, totalRam = 0, maxFree = 0;
+              if (UserHal::MemoryInfo(mb) == KErrNone)
+                  {
+                  freeRam = mb().iFreeRamInBytes; totalRam = mb().iTotalRamInBytes; maxFree = mb().iMaxFreeRamInBytes;
+                  }
+              TInt halFree = 0;
+              HAL::Get(HALData::EMemoryRAMFree, halFree);
+              TInt big = 0;
+              TInt avail = User::Available(big);
               TInt heap = User::Heap().Size();
-              TBuf8<160> b;
-              b.Format(_L8("MEM[%S] ramFree=%d KB ramTotal=%d KB heap=%d KB"), &aTag, freeRam / 1024, totalRam / 1024, heap / 1024);
+              TBuf8<200> b;
+              b.Format(_L8("MEM[%S] free=%d KB maxBlock=%d KB total=%d KB halFree=%d KB | heap size=%d KB avail=%d KB biggest=%d KB"),
+                  &aTag, freeRam / 1024, maxFree / 1024, totalRam / 1024, halFree / 1024, heap / 1024, avail / 1024, big / 1024);
               Wl4Log(b);
+              }
+
+          // ---- crash detector: flag file exists while the app runs; if it is still there at start, the last run died ----
+          static TBool Wl4FlagPath(RFs& aFs, TFileName& aOut, TBool aCreateDir)
+              {
+              _LIT(KF1, "E:\\wl4\\wl4_running.flag");
+              _LIT(KF2, "C:\\data\\wl4_running.flag");
+              aOut.Copy(KF1);
+              if (aCreateDir) { aFs.MkDirAll(aOut); }
+              TEntry e;
+              if (aFs.Entry(aOut, e) == KErrNone) { return ETrue; }
+              TFileName alt(KF2);
+              if (aFs.Entry(alt, e) == KErrNone) { aOut.Copy(alt); return ETrue; }
+              return EFalse;
+              }
+
+          TBool Wl4RunFlagBegin()
+              {
+              RFs fs;
+              if (fs.Connect() != KErrNone) { return EFalse; }
+              TFileName path;
+              TBool existed = Wl4FlagPath(fs, path, ETrue);
+              RFile f;
+              if (f.Replace(fs, path, EFileWrite) != KErrNone)
+                  {
+                  _LIT(KF2, "C:\\data\\wl4_running.flag");
+                  path.Copy(KF2); fs.MkDirAll(path);
+                  f.Replace(fs, path, EFileWrite);
+                  }
+              f.Write(_L8("running"));
+              f.Close();
+              fs.Close();
+              return existed;
+              }
+
+          void Wl4RunFlagEnd()
+              {
+              RFs fs;
+              if (fs.Connect() != KErrNone) { return; }
+              TFileName path;
+              if (Wl4FlagPath(fs, path, EFalse)) { fs.Delete(path); }
+              fs.Close();
               }
 
           extern "C" void plat_log_mem(const char* aTag)
@@ -1627,8 +1714,10 @@ jobs:
           void *plat_realloc(void *p, unsigned n);
           void *plat_mem_reserve(unsigned bytes);
           int   plat_mem_commit(unsigned off, unsigned len);
+          int   plat_mem_ensure(unsigned off, unsigned len);  /* commit any uncommitted pages in range; returns pages newly committed, <0 on error */
           void  plat_mem_release(void);
           void  plat_exit_thread(void);
+          unsigned plat_free_kb(void);  /* real free RAM in KB (UserHal::MemoryInfo) */
           void  plat_log_mem(const char *tag);  /* free RAM / heap snapshot into the log */
           void  plat_install_exc(void);         /* per-thread exception logger */
           void  plat_log(const char *msg);      /* appended to wl4_boot.log immediately */
@@ -1735,15 +1824,20 @@ jobs:
               unsigned off = 0;
               while (off < n) {
                   unsigned c = n - off > 0x100000u ? 0x100000u : n - off;
-                  wl4_logf("copy %s off=%x dst=%x", name, off, (unsigned)(uintptr_t)(dst + off));
+                  wl4_logf("copy %s off=%x dst=%x free=%uKB", name, off, (unsigned)(uintptr_t)(dst + off), plat_free_kb());
+                  {
+                      int e = plat_mem_ensure((unsigned)(uintptr_t)(dst + off) - (unsigned)(uintptr_t)g_mem, c);
+                      if (e != 0) wl4_logf("ensure: %d page(s) were NOT committed (neg=error)", e);
+                      if (e < 0) { g_trap = 1002; g_running = 0; return; }
+                  }
                   memcpy(dst + off, src + off, c);
                   off += c;
               }
-              wl4_logf("copy %s done", name);
+              wl4_logf("copy %s done free=%uKB", name, plat_free_kb());
           }
 
           static unsigned stack_used(void) {
-              volatile char here; unsigned u = g_stackTop - (unsigned)(uintptr_t)&here;
+              volatile char here; unsigned u = g_stackTop - (unsigned)(uintptr_t)&here; if ((int)u < 0) u = 0;
               if (u > g_stackMax) g_stackMax = u;
               return u;
           }
@@ -1774,7 +1868,9 @@ jobs:
               if (g_romSize > 0x02000000u || GBA_ROM_BASE + g_romSize > g_inst.w2c_memory.size || (unsigned)g_inst.w2c_rom_image + g_romSize > g_inst.w2c_memory.size) {
                   wl4_logf("ROM does not fit"); g_trap = 1000; g_running = 0; return 0; }
               copy_chunked(g_mem + GBA_ROM_BASE, g_rom, g_romSize, "rom@08000000");
+              if (!g_running) return 0;
               copy_chunked(g_mem + g_inst.w2c_rom_image, g_rom, g_romSize, "rom_image");
+              if (!g_running) return 0;
               g_ready = 1;
               plat_log_mem("after ROM copy");
               wl4_logf("ROM copied, entering AgbMain, stack used=%u", stack_used());
