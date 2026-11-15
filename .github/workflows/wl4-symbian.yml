@@ -1654,6 +1654,7 @@ jobs:
           void wl4_audio_poll(void); void wl4_audio_push(const int8_t *, const int8_t *, int, int);
 
           static unsigned g_stackTop, g_stackMax;
+          static unsigned stack_used(void);
           static w2c_wl4 g_inst; static struct w2c_env g_env;
           static uint32_t g_buf[2][GBA_W * GBA_H];
           static volatile int g_idx, g_presented, g_frames, g_stop, g_running, g_paused, g_trap, g_skipNow, g_fs = -1, g_ready;
